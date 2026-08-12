@@ -1,0 +1,95 @@
+version: "3.9"
+
+services:
+  prometheus-brain:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: prometheus-causal-brain:latest
+    container_name: prometheus_brain
+    volumes:
+      - ../output:/prometheus/output
+      - ../checkpoints:/prometheus/checkpoints
+      - ../data:/prometheus/data
+      - ../.env:/prometheus/.env:ro
+    environment:
+      - PROMETHEUS_DEVICE=cpu
+      - PYTHONPATH=/prometheus
+      - TORCH_NUM_THREADS=8
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 16G
+
+  prometheus-train:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: prometheus-causal-brain:latest
+    container_name: prometheus_train
+    volumes:
+      - ../output:/prometheus/output
+      - ../checkpoints:/prometheus/checkpoints
+      - ../data:/prometheus/data
+    command: >
+      python scripts/train.py
+      --mode full
+      --n-assets 20
+      --seq-len 64
+      --horizon 5
+      --pretrain-epochs 5
+      --finetune-epochs 20
+      --n-black-swans 500
+      --device cpu
+    deploy:
+      resources:
+        limits:
+          memory: 32G
+
+  prometheus-gpu:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: prometheus-causal-brain:latest
+    container_name: prometheus_gpu
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - PROMETHEUS_DEVICE=cuda
+    volumes:
+      - ../output:/prometheus/output
+      - ../checkpoints:/prometheus/checkpoints
+      - ../data:/prometheus/data
+    command: >
+      python scripts/train.py
+      --mode full
+      --n-assets 50
+      --seq-len 128
+      --horizon 10
+      --d-model 256
+      --n-heads 8
+      --n-layers 6
+      --pretrain-epochs 20
+      --finetune-epochs 100
+      --n-black-swans 5000
+      --device cuda
+    profiles:
+      - gpu
+
+  prometheus-api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: prometheus-causal-brain:latest
+    container_name: prometheus_api
+    volumes:
+      - ../output:/prometheus/output
+      - ../checkpoints:/prometheus/checkpoints
+    command: uvicorn prometheus.api:app --host 0.0.0.0 --port 8000 --reload
+    ports:
+      - "8000:8000"
+    profiles:
+      - api

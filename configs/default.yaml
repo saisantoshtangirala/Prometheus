@@ -1,0 +1,96 @@
+# Prometheus Default Configuration
+# Edit this file to customize the engine for your hardware and data setup.
+
+system:
+  name: "Prometheus – The Causal Brain"
+  version: "1.0.0"
+  device: "cpu"         # "cpu" | "cuda" | "mps"
+  log_level: "INFO"
+  output_dir: "output"
+  checkpoint_dir: "checkpoints"
+
+model:
+  n_assets: 20           # number of assets in the trading universe
+  seq_len: 64            # input sequence length (bars)
+  horizon: 5             # forecast horizon (bars)
+  d_model: 128           # causal transformer hidden dim
+  n_heads: 4             # attention heads (must divide d_model)
+  n_layers: 4            # causal transformer depth
+  d_ff: 512              # feed-forward dim
+  ltc_hidden: [128, 64]  # LTC layer sizes
+  snn_layers: [128, 64]  # SNN layer sizes
+  memory_dim: 64         # graph memory dimension
+
+causal_dag:
+  max_nodes: 500
+  pc_alpha: 0.01         # independence test significance level
+  pc_max_cond_set: 4     # max conditioning set size
+
+diffusion:
+  n_steps: 1000          # DDPM forward diffusion steps
+  beta_start: 0.0001
+  beta_end: 0.02
+
+black_swan:
+  n_per_template: 500    # scenarios per template (reduce for faster testing)
+  n_pure_random: 2000    # pure random extreme scenarios
+
+training:
+  pretrain_epochs: 10    # black-swan pre-training epochs
+  finetune_epochs: 50    # real data fine-tuning epochs
+  meta_epochs: 20        # MAML meta-training tasks
+  batch_size: 32
+  inner_lr: 0.01         # MAML inner loop LR
+  outer_lr: 0.001        # MAML meta LR
+  n_inner_steps: 3       # MAML adaptation steps
+
+neat:
+  population_size: 50
+  n_generations: 20
+  mutation_rate: 0.15
+  crossover_rate: 0.5
+
+loss:
+  alpha: 0.5             # penalty for conservative errors
+  beta: 2.0              # directional error multiplier
+  gamma: 3.0             # exponential magnification
+
+kelly:
+  fraction: 0.5          # fractional Kelly (0.5 = half-Kelly)
+  max_position: 0.15     # max 15% in single position
+  max_portfolio: 1.0     # max total exposure
+
+graph:
+  stability_threshold: 0.60
+  correlation_window: 60
+  n_gat_layers: 3
+  n_heads: 8
+
+sentiment:
+  use_transformer: false  # set true if transformers installed + GPU available
+  bts_history_window: 90
+
+data:
+  symbols:               # default universe (override on CLI)
+    - "SPY"
+    - "QQQ"
+    - "IWM"
+    - "GLD"
+    - "TLT"
+    - "HYG"
+    - "USO"
+    - "AAPL"
+    - "MSFT"
+    - "NVDA"
+    - "JPM"
+    - "GS"
+    - "BTC-USD"
+    - "ETH-USD"
+    - "^VIX"
+  bar_size: "1d"
+  lookback_days: 756     # 3 years
+
+# Hardware guidance:
+# CPU (16-core, 64GB RAM): n_assets=20, seq_len=64, d_model=128 → ~2 days train time
+# GPU (A100 80GB):          n_assets=50, seq_len=256, d_model=512 → ~8 hours train time
+# TPU v4 (cloud):           n_assets=100, seq_len=512, d_model=1024 → ~3 hours train time
