@@ -199,3 +199,66 @@ class TestDIFF03DimensionExplosion:
         sim = MarketDiffusionSimulator(n_assets=5, seq_len=10, n_diffusion_steps=5)
         paths = sim.generate(n_scenarios=3, condition=None)
         assert paths.device.type == "cpu"
+
+
+# ---------------------------------------------------------------------------
+# DIFF-04: Tail Coverage — diffusion model must not suffer synthetic overfitting
+# ---------------------------------------------------------------------------
+
+class TestDIFF04TailCoverage:
+    """
+    Validates that the generated distribution covers fat-tail events.
+
+    The "synthetic overfitting" trap: a generator whose noise schedule or
+    architecture is too narrow produces smooth, near-Gaussian paths and
+    completely misses real crises (1987, 2008, COVID).
+
+    These tests use the untrained model (random weights) to verify the
+    *structural capacity* to produce extreme events, not the trained quality.
+    An untrained diffusion model sampling from pure noise via the reverse
+    process should naturally produce some extreme draws.
+    """
+
+    @pytest.fixture
+    def sim(self):
+        from prometheus.generative.diffusion_simulator import MarketDiffusionSimulator
+        return MarketDiffusionSimulator(n_assets=5, seq_len=20, n_diffusion_steps=10)
+
+    def test_validate_tail_coverage_returns_required_keys(self, sim):
+        result = sim.validate_tail_coverage(n_scenarios=100, sigma_threshold=2.0)
+        for key in ("coverage_pct", "kurtosis", "skewness", "worst_drawdown",
+                    "passes_fat_tail_check"):
+            assert key in result, f"validate_tail_coverage missing key: {key}"
+
+    def test_generator_produces_some_negative_cumulative_returns(self, sim):
+        """At least some scenarios must go negative — a generator of only bullish paths is useless."""
+        result = sim.validate_tail_coverage(n_scenarios=200)
+        assert result["worst_drawdown"] < 0, (
+            f"All 200 scenarios had non-negative cumulative returns: "
+            f"worst_drawdown={result['worst_drawdown']:.4f}. "
+            "Generator cannot simulate market downturns."
+        )
+
+    def test_generator_produces_extreme_moves(self, sim):
+        """Some scenarios must include single-bar moves exceeding 2σ (tail coverage > 0)."""
+        result = sim.validate_tail_coverage(n_scenarios=500, sigma_threshold=2.0)
+        assert result["coverage_pct"] > 0.0, (
+            "Zero scenarios produced a >2σ move — distribution is too narrow to model crises. "
+            "This is the synthetic overfitting trap."
+        )
+
+    def test_distribution_is_not_degenerate(self, sim):
+        """Generated returns must have nonzero variance (distribution not collapsed to constant)."""
+        paths = sim.generate(n_scenarios=100, seed=7)
+        std = float(paths.std().item())
+        assert std > 1e-6, f"Generated distribution has effectively zero variance: std={std}"
+
+    def test_crash_scenarios_exist_in_large_batch(self, sim):
+        """In 500 scenarios, at least one must have a cumulative loss exceeding 5% (crash-class)."""
+        paths = sim.generate(n_scenarios=500, seed=99)
+        cum_returns = paths.cpu().numpy().cumsum(axis=1)   # [N, T, A]
+        crash_scenarios = (cum_returns.min(axis=(1, 2)) < -0.05).sum()
+        assert crash_scenarios > 0, (
+            "No scenario in 500 produced >5% cumulative loss. "
+            "Diffusion model cannot simulate crash-severity events."
+        )

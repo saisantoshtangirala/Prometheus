@@ -202,6 +202,18 @@ class CausalDAGEngine:
             adj_set = self._find_frontdoor_mediators(treatment, outcome)
             method = "frontdoor"
 
+        # Warn when common ancestors exist outside the adjustment set — these
+        # are unblocked back-door paths that can inflate (confound) the effect.
+        if self._has_unblocked_backdoor(treatment, outcome, adj_set or []):
+            logger.warning(
+                "Unblocked back-door path detected for %s → %s. "
+                "Common ancestors outside adjustment set: %s. "
+                "The computed causal_effect may be confounded. "
+                "Consider expanding the adjustment set or using front-door criterion.",
+                treatment, outcome,
+                self._unblocked_common_ancestors(treatment, outcome, adj_set or []),
+            )
+
         # Walk causal paths to compute multiplicative effect
         paths = list(nx.all_simple_paths(self.dag, treatment, outcome, cutoff=5))
         total_effect = 0.0
@@ -330,6 +342,21 @@ class CausalDAGEngine:
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    def _has_unblocked_backdoor(
+        self, treatment: str, outcome: str, adjustment_set: List[str]
+    ) -> bool:
+        """True when a common ancestor of treatment and outcome is NOT in the adjustment set."""
+        return len(self._unblocked_common_ancestors(treatment, outcome, adjustment_set)) > 0
+
+    def _unblocked_common_ancestors(
+        self, treatment: str, outcome: str, adjustment_set: List[str]
+    ) -> List[str]:
+        """Return common ancestors of treatment and outcome that are outside the adjustment set."""
+        anc_t = nx.ancestors(self.dag, treatment)
+        anc_o = nx.ancestors(self.dag, outcome)
+        common = anc_t & anc_o
+        return sorted(common - set(adjustment_set))
 
     def _find_backdoor_adjustment_set(
         self, treatment: str, outcome: str

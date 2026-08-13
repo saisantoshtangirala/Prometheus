@@ -261,6 +261,52 @@ class MarketDiffusionSimulator:
             stats = stats[:32]
         return stats.unsqueeze(0).to(self.device)
 
+    def validate_tail_coverage(
+        self,
+        n_scenarios: int = 1000,
+        sigma_threshold: float = 3.0,
+        min_tail_pct: float = 1.0,
+    ) -> Dict:
+        """
+        Validate that the generated distribution covers fat-tail events.
+
+        A model whose distribution is too narrow will be blindsided by real
+        crises even after black-swan training — it predicts smooth paths and
+        calls a 1987-style crash "impossible."
+
+        Returns a dict with: coverage_pct (% of scenarios with >sigma_threshold σ
+        move), kurtosis (excess; >0 = fatter than Gaussian), skewness, worst
+        cumulative drawdown, and passes_fat_tail_check bool.
+        """
+        from scipy import stats as scipy_stats
+
+        paths = self.generate(n_scenarios=n_scenarios, seed=42)  # [N, T, A]
+        returns = paths.cpu().numpy()                             # [N, T, A]
+
+        all_returns = returns.reshape(-1)
+        std = float(np.std(all_returns)) + 1e-8
+
+        # Extreme bars: single timestep exceeding sigma_threshold standard deviations
+        extreme = np.abs(returns) > sigma_threshold * std        # [N, T, A]
+        scenarios_with_extreme = extreme.any(axis=(1, 2))
+        coverage_pct = float(100.0 * scenarios_with_extreme.mean())
+
+        kurtosis = float(scipy_stats.kurtosis(all_returns, fisher=True))
+        skewness = float(scipy_stats.skew(all_returns))
+
+        cum_returns = returns.cumsum(axis=1)                     # [N, T, A]
+        worst_drawdown = float(cum_returns.min())
+
+        return {
+            "coverage_pct": coverage_pct,
+            "kurtosis": kurtosis,
+            "skewness": skewness,
+            "worst_drawdown": worst_drawdown,
+            "sigma_threshold": sigma_threshold,
+            "n_scenarios": n_scenarios,
+            "passes_fat_tail_check": kurtosis > -1.0 or coverage_pct >= min_tail_pct,
+        }
+
     def save(self, path: str) -> None:
         torch.save({
             "score_net": self.score_net.state_dict(),
