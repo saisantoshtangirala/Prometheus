@@ -196,3 +196,45 @@ class TestCA03IsolatedNode:
         assert "PIZZA_ITALY" not in levers, (
             "Isolated node PIZZA_ITALY must not appear in attribution"
         )
+
+
+# ---------------------------------------------------------------------------
+# Issue fix: do_intervention path-reachability check
+# ---------------------------------------------------------------------------
+
+class TestCA04PathValidation:
+    """
+    Regression tests for path-reachability validation in do_intervention.
+
+    The reviewer found that disconnected nodes returned 0.0 silently.
+    The fix logs a warning; these tests verify: (a) it doesn't crash,
+    (b) the returned effect is 0.0, (c) known-connected pairs still work.
+    """
+
+    def test_disconnected_nodes_return_zero_effect(self, dag_engine):
+        """GLOBAL_M2 → US_GDP_GROWTH: no path → causal_effect must be 0.0."""
+        # Neither node has a directed path to the other in the seeded graph
+        result = dag_engine.do_intervention("GLOBAL_M2", 5.0, "US_GDP_GROWTH")
+        assert result["causal_effect"] == 0.0, (
+            "Disconnected node pair must return causal_effect=0.0, not crash silently"
+        )
+
+    def test_disconnected_nodes_do_not_raise(self, dag_engine):
+        """do_intervention on disconnected pair must NOT raise an exception."""
+        try:
+            dag_engine.do_intervention("DXY", 1.0, "FED_FUNDS_RATE")
+        except Exception as exc:
+            pytest.fail(f"do_intervention raised unexpectedly: {exc}")
+
+    def test_unknown_node_still_raises_value_error(self, dag_engine):
+        """Unknown node must raise ValueError (pre-existing validation must not regress)."""
+        with pytest.raises(ValueError, match="Unknown nodes"):
+            dag_engine.do_intervention("NONEXISTENT_TICKER", 1.0, "SPX")
+
+    def test_connected_pair_returns_nonzero_effect(self, dag_engine):
+        """FED_FUNDS_RATE → SPX (connected via US_10Y_YIELD) must give nonzero effect."""
+        result = dag_engine.do_intervention("FED_FUNDS_RATE", 1.0, "SPX")
+        assert result["causal_effect"] != 0.0, (
+            "Connected node pair must produce a nonzero causal effect"
+        )
+        assert result["n_causal_paths"] >= 1

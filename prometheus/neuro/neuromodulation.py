@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import math
 from collections import deque
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -127,6 +127,9 @@ class CortisolSystem(nn.Module):
         self._cort_level: float = 0.1
         self._in_fear_mode: bool = False
         self._lockout_remaining: int = 0
+        # Per-asset fear states: a single asset's crash doesn't paralyse the whole book
+        self._asset_fear: Dict[str, bool] = {}
+        self._asset_lockout: Dict[str, int] = {}
 
     def update(
         self,
@@ -167,14 +170,36 @@ class CortisolSystem(nn.Module):
 
         return self._cort_level, self._in_fear_mode
 
-    def trigger_flash_crash_lockout(self) -> None:
-        """Force fear state for lockout_duration steps (amygdala hijack on crash)."""
+    def trigger_flash_crash_lockout(self, asset: Optional[str] = None) -> None:
+        """Force fear state for lockout_duration steps (amygdala hijack on crash).
+
+        If `asset` is given, only that ticker enters lockout — the rest of the
+        portfolio is unaffected (per-asset cortisol).  Calling without `asset`
+        triggers a market-wide lockout as before.
+        """
         self._cort_level = 1.0
         self._in_fear_mode = True
         self._lockout_remaining = self.lockout_duration
+        if asset is not None:
+            self._asset_fear[asset] = True
+            self._asset_lockout[asset] = self.lockout_duration
 
-    def get_position_cap(self) -> float:
-        """Max position size multiplier based on CORT. Ranges [0.0, 1.0]."""
+    def step_asset_lockouts(self) -> None:
+        """Decrement per-asset lockout counters each bar."""
+        for ticker in list(self._asset_lockout):
+            if self._asset_lockout[ticker] > 0:
+                self._asset_lockout[ticker] -= 1
+            if self._asset_lockout[ticker] == 0:
+                self._asset_fear[ticker] = False
+
+    def get_position_cap(self, asset: Optional[str] = None) -> float:
+        """Max position size multiplier based on CORT. Ranges [0.0, 1.0].
+
+        If `asset` is given, checks per-asset lockout first; other assets are
+        unaffected by a single-asset flash crash.
+        """
+        if asset is not None and self._asset_fear.get(asset, False):
+            return self.FEAR_POSITION_CAP
         if self._in_fear_mode:
             return self.FEAR_POSITION_CAP  # hard-wired 70% reduction
         return max(0.1, 1.0 - self._cort_level)

@@ -250,3 +250,62 @@ class TestPropertyBased:
         assert np.all(np.abs(fractions) <= max_pos + 1e-6), (
             f"Kelly fraction exceeded max_position={max_pos}: {fractions}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Issue fix: zero-gradient on conservative-correct predictions
+# ---------------------------------------------------------------------------
+
+class TestLOSS02ZeroGradientFix:
+    """
+    Regression tests for the calibration floor added to prevent the
+    model from collapsing to always-zero predictions.
+
+    Without the fix: pred > target (same sign) → underestimated=0 → loss=0 → grad=0.
+    With the fix:   a 1e-4 calibration term keeps a nonzero gradient alive.
+    """
+
+    def test_conservative_correct_pred_has_nonzero_gradient(self):
+        """Predicting +10% when actual is +5% must still produce a gradient."""
+        loss_fn = AsymmetricUtilityLoss()
+        pred = torch.tensor([[0.10]], requires_grad=True)
+        target = torch.tensor([[0.05]])   # overestimate, same direction
+        loss = loss_fn(pred, target)
+        loss.backward()
+        assert pred.grad is not None
+        assert pred.grad.abs().item() > 0, (
+            "Zero gradient on conservative-correct prediction — model cannot calibrate magnitude"
+        )
+
+    def test_calibration_gradient_much_smaller_than_underestimate_gradient(self):
+        """Overestimate gradient must be << underestimate gradient (1e-4 vs alpha=0.5)."""
+        loss_fn = AsymmetricUtilityLoss()
+
+        pred_over = torch.tensor([[0.10]], requires_grad=True)
+        target_over = torch.tensor([[0.05]])
+        loss_fn(pred_over, target_over).backward()
+        grad_over = pred_over.grad.abs().item()
+
+        pred_under = torch.tensor([[0.05]], requires_grad=True)
+        target_under = torch.tensor([[0.10]])
+        loss_fn(pred_under, target_under).backward()
+        grad_under = pred_under.grad.abs().item()
+
+        assert grad_over < grad_under, (
+            f"Overestimate gradient {grad_over:.6f} should be < underestimate {grad_under:.6f}"
+        )
+        assert grad_over / grad_under < 0.01, (
+            f"Calibration floor is too large: overestimate/underestimate ratio = {grad_over / grad_under:.4f}"
+        )
+
+    def test_zero_prediction_is_not_a_loss_minimum(self):
+        """pred=0.0 must NOT be a local minimum — model should be pushed away from zero."""
+        loss_fn = AsymmetricUtilityLoss()
+        pred_zero = torch.tensor([[0.0]], requires_grad=True)
+        target = torch.tensor([[0.05]])
+        loss_zero = loss_fn(pred_zero, target)
+        loss_zero.backward()
+        # Gradient should exist at pred=0 so the optimizer can move away from it
+        assert pred_zero.grad is not None and pred_zero.grad.abs().item() > 0, (
+            "pred=0.0 is a gradient dead-end — model will collapse to predicting nothing"
+        )

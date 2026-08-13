@@ -185,6 +185,14 @@ class CausalDAGEngine:
         if treatment not in self.dag or outcome not in self.dag:
             raise ValueError(f"Unknown nodes: {treatment}, {outcome}")
 
+        # Fail-loud on disconnected nodes rather than silently returning 0.0
+        if not nx.has_path(self.dag, treatment, outcome):
+            logger.warning(
+                "No causal path from %s to %s — causal_effect will be 0.0. "
+                "Verify node connectivity before interpreting this result.",
+                treatment, outcome,
+            )
+
         # Identify adjustment set via back-door criterion
         adj_set = self._find_backdoor_adjustment_set(treatment, outcome)
         method = "backdoor"

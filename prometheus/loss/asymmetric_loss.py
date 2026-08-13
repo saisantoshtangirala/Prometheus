@@ -77,7 +77,12 @@ class AsymmetricUtilityLoss(nn.Module):
         # Case 1 & 2: correct direction
         # If pred is more conservative (abs(pred) < abs(target)): mild loss
         underestimated = (torch.abs(pred) < torch.abs(target)).float() * same_sign
-        correct_dir_loss = alpha * underestimated * mag_error
+        # Tiny calibration floor for correct-direction overestimates prevents the
+        # model from collapsing to always-zero predictions (which would be "safe"
+        # under pure zero-loss design).  1e-4 is ~200x below alpha so it never
+        # dominates; it only ensures a nonzero gradient survives to the optimiser.
+        calibration = 1e-4 * same_sign * mag_error
+        correct_dir_loss = alpha * underestimated * mag_error + calibration
 
         # Case 3: wrong direction — exponentially penalized
         # Larger miss = exponentially worse (losing more money)
