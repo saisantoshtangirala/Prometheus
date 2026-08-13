@@ -1,0 +1,96 @@
+# Prometheus – Mac mini M4 16 GB Profile
+# Use for local inference and analysis (not full training).
+# Source: configs/mac_mini.yaml
+#
+# Usage:
+#   python scripts/analyze.py --config configs/mac_mini.yaml --symbols SPY QQQ GLD
+
+system:
+  name: "Prometheus – The Causal Brain"
+  version: "1.0.0"
+  device: "mps"          # Metal Performance Shaders (Apple Silicon GPU)
+  log_level: "INFO"
+  output_dir: "output"
+  checkpoint_dir: "checkpoints"
+
+model:
+  n_assets: 20
+  seq_len: 64
+  horizon: 5
+  d_model: 128
+  n_heads: 4
+  n_layers: 4
+  d_ff: 512
+  ltc_hidden: [128, 64]
+  snn_layers: [128, 64]
+  memory_dim: 64
+
+causal_dag:
+  max_nodes: 500
+  pc_alpha: 0.01
+  pc_max_cond_set: 4
+
+diffusion:
+  n_steps: 1000
+  beta_start: 0.0001
+  beta_end: 0.02
+
+black_swan:
+  n_per_template: 100    # reduced — local use only; generate full library on AWS
+  n_pure_random: 500
+
+training:
+  # These are rarely used locally; AWS handles full training.
+  pretrain_epochs: 2
+  finetune_epochs: 5     # quick local fine-tune on fresh data if needed
+  meta_epochs: 5
+  batch_size: 8          # small batch for 16 GB unified memory
+  inner_lr: 0.01
+  outer_lr: 0.001
+  n_inner_steps: 3
+
+neat:
+  population_size: 10    # use AWS for full NEAT evolution
+  n_generations: 3
+  mutation_rate: 0.15
+  crossover_rate: 0.5
+
+loss:
+  alpha: 0.5
+  beta: 2.0
+  gamma: 3.0
+
+kelly:
+  fraction: 0.5
+  max_position: 0.15
+  max_portfolio: 1.0
+
+graph:
+  stability_threshold: 0.60
+  correlation_window: 60
+  n_gat_layers: 3
+  n_heads: 8
+
+sentiment:
+  use_transformer: false
+  bts_history_window: 90
+
+data:
+  symbols:
+    - "SPY"
+    - "QQQ"
+    - "IWM"
+    - "GLD"
+    - "TLT"
+    - "HYG"
+    - "USO"
+    - "AAPL"
+    - "MSFT"
+    - "NVDA"
+    - "JPM"
+    - "GS"
+    - "BTC-USD"
+    - "ETH-USD"
+    - "^VIX"
+  bar_size: "1d"
+  lookback_days: 756

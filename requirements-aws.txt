@@ -1,0 +1,32 @@
+# ── Prometheus AWS / EC2 Training (Full Stack) ───────────────────────────
+# This is installed automatically by the EC2 startup script.
+# To install manually: pip install -r requirements-aws.txt
+
+-r requirements-local.txt
+
+# Deep learning extras
+torchvision>=0.16.0
+torchaudio>=2.1.0
+
+# Causal inference
+networkx>=3.1
+
+# Generative / Diffusion (custom DDPM — no diffusers needed)
+# diffusers>=0.24.0   # not required; diffusion model is self-contained
+
+# Meta-learning (custom MAML — no higher/learn2learn needed)
+
+# Evolutionary (custom NEAT — no neat-python needed)
+
+# SNN & LTC (self-contained implementations — no spikingjelly/torchdiffeq)
+
+# NLP sentiment
+vaderSentiment>=3.3.2
+# transformers>=4.35.0   # uncomment for FinBERT GPU sentiment
+
+# Training utilities
+accelerate>=0.24.0
+
+# Testing
+pytest>=7.4.0
+pytest-cov>=4.1.0

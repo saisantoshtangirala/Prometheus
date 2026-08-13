@@ -4,6 +4,7 @@ Prometheus Analysis Script – Generate God's Eye Report for a symbol or portfol
 Usage:
   python scripts/analyze.py --symbols SPY QQQ GLD TLT --checkpoint checkpoints/finetune
   python scripts/analyze.py --symbols SPY --volcano --save-html output/volcano_SPY.html
+  python scripts/analyze.py --config configs/mac_mini.yaml --symbols SPY QQQ GLD
 """
 
 import argparse
@@ -24,32 +25,82 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("prometheus.analyze")
 
 
+def _load_yaml_config(path: str) -> dict:
+    try:
+        import yaml
+        with open(path) as f:
+            return yaml.safe_load(f)
+    except ImportError:
+        raise RuntimeError("PyYAML not installed. Run: pip install pyyaml")
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Prometheus God's Eye Analysis")
-    p.add_argument("--symbols", nargs="+", default=["SPY", "QQQ", "GLD", "TLT"])
+    p.add_argument("--config", default=None, help="YAML config file (e.g. configs/mac_mini.yaml)")
+    p.add_argument("--symbols", nargs="+", default=None)
     p.add_argument("--checkpoint", default=None)
-    p.add_argument("--seq-len", type=int, default=64)
-    p.add_argument("--horizon", type=int, default=5)
+    p.add_argument("--seq-len", type=int, default=None)
+    p.add_argument("--horizon", type=int, default=None)
     p.add_argument("--volcano", action="store_true")
     p.add_argument("--save-html", default=None)
     p.add_argument("--save-report", default="output/gods_eye_report.json")
-    p.add_argument("--device", default="cpu")
+    p.add_argument("--device", default=None)
     return p.parse_args()
 
 
 def main():
     args = parse_args()
-    n_assets = len(args.symbols)
+
+    # Defaults (overridden by --config, then by explicit CLI flags)
+    symbols = ["SPY", "QQQ", "GLD", "TLT"]
+    seq_len = 64
+    horizon = 5
+    device = "cpu"
+    d_model, n_heads, n_layers = 128, 4, 4
+
+    if args.config:
+        cfg_yaml = _load_yaml_config(args.config)
+        sys_cfg = cfg_yaml.get("system", {})
+        model_cfg = cfg_yaml.get("model", {})
+        data_cfg = cfg_yaml.get("data", {})
+        device = sys_cfg.get("device", device)
+        symbols = data_cfg.get("symbols", symbols)
+        seq_len = model_cfg.get("seq_len", seq_len)
+        horizon = model_cfg.get("horizon", horizon)
+        d_model = model_cfg.get("d_model", d_model)
+        n_heads = model_cfg.get("n_heads", n_heads)
+        n_layers = model_cfg.get("n_layers", n_layers)
+
+    # CLI flags take precedence over config file
+    if args.symbols:
+        symbols = args.symbols
+    if args.seq_len:
+        seq_len = args.seq_len
+    if args.horizon:
+        horizon = args.horizon
+    if args.device:
+        device = args.device
+
+    # Auto-detect MPS if device not explicitly set and no config provided
+    if not args.config and not args.device:
+        if torch.backends.mps.is_available():
+            device = "mps"
+        elif torch.cuda.is_available():
+            device = "cuda"
+
+    n_assets = len(symbols)
     os.makedirs("output", exist_ok=True)
+
+    logger.info("Device: %s | Assets: %d | seq_len: %d", device, n_assets, seq_len)
 
     cfg = PrometheusConfig(
         n_assets=n_assets,
-        seq_len=args.seq_len,
-        horizon=args.horizon,
-        d_model=128,
-        n_heads=4,
-        n_layers=4,
-        device=args.device,
+        seq_len=seq_len,
+        horizon=horizon,
+        d_model=d_model,
+        n_heads=n_heads,
+        n_layers=n_layers,
+        device=device,
     )
     engine = PrometheusEngine(cfg)
 
