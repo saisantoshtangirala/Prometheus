@@ -43,8 +43,10 @@ class PCAlgorithmDiscovery:
         self.lag = lag
         self.sep_sets: Dict[Tuple[str, str], Set[str]] = {}
 
-    def fit(self, data: pd.DataFrame) -> "PCAlgorithmDiscovery":
-        """Run the full PC algorithm on the given data frame."""
+    def fit(self, data) -> "PCAlgorithmDiscovery":
+        """Run the full PC algorithm on a DataFrame or numpy array."""
+        if not isinstance(data, pd.DataFrame):
+            data = pd.DataFrame(data, columns=[f"X{i}" for i in range(data.shape[1])])
         self.variables = list(data.columns)
         self.data = data.copy()
         logger.info("PC Algorithm: %d variables, %d observations",
@@ -53,6 +55,15 @@ class PCAlgorithmDiscovery:
         self._build_skeleton()
         self._orient_v_structures()
         self._meek_rules()
+
+        # Build sklearn-style adjacency matrix
+        n = len(self.variables)
+        self.adjacency_matrix_ = np.zeros((n, n), dtype=int)
+        for u, v in self.skeleton.edges():
+            i, j = self.variables.index(u), self.variables.index(v)
+            self.adjacency_matrix_[i, j] = 1
+            if not self.skeleton[u][v].get("directed", False):
+                self.adjacency_matrix_[j, i] = 1
         return self
 
     def get_edges(self) -> List[Tuple[str, str, float]]:

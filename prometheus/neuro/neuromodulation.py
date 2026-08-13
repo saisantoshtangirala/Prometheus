@@ -56,9 +56,14 @@ class DopamineSystem(nn.Module):
         self._rpe_buffer: deque = deque(maxlen=trace_len)
         self._da_level: float = baseline_da
 
+    DA_RPE_CLAMP: float = 5.0  # biological saturation limit for raw RPE signal
+
     def update(self, predicted_return: float, actual_return: float) -> float:
         """Compute RPE and update dopamine level."""
         rpe = actual_return - predicted_return
+        # Clamp RPE to biological saturation range [-5, +5]
+        self._raw_rpe: float = float(max(-self.DA_RPE_CLAMP, min(self.DA_RPE_CLAMP, rpe)))
+        rpe = self._raw_rpe
         self._rpe_buffer.append(rpe)
 
         # Exponentially weighted trace
@@ -93,17 +98,22 @@ class CortisolSystem(nn.Module):
     The response is asymmetric: spikes fast, recovers slowly (half-life = 48 bars).
     """
 
+    # Hard-wired biological constraint: 70% position reduction in fear mode.
+    FEAR_POSITION_CAP: float = 0.30
+
     def __init__(
         self,
         hidden_size: int = 64,
         fast_decay: float = 0.95,    # fast rise
         slow_decay: float = 0.98,    # slow recovery (asymmetric)
         fear_threshold: float = 0.7, # CORT level triggering full defensive mode
+        lockout_duration: int = 30,  # steps to stay in fear after flash crash
     ):
         super().__init__()
         self.fast_decay = nn.Parameter(torch.tensor(fast_decay))
         self.slow_decay = nn.Parameter(torch.tensor(slow_decay))
         self.fear_threshold = fear_threshold
+        self.lockout_duration = lockout_duration
 
         # Stress detector: takes [entropy, drawdown, corr_break, causal_conf]
         self.stress_net = nn.Sequential(
@@ -116,6 +126,7 @@ class CortisolSystem(nn.Module):
         )
         self._cort_level: float = 0.1
         self._in_fear_mode: bool = False
+        self._lockout_remaining: int = 0
 
     def update(
         self,
@@ -131,6 +142,10 @@ class CortisolSystem(nn.Module):
         )
         stress_signal = self.stress_net(x).item()
 
+        # Hard-wired amygdala floor: extreme market conditions bypass neural uncertainty
+        rule_stress = 0.5 * market_entropy + 0.3 * drawdown + 0.2 * corr_breakdown
+        stress_signal = max(stress_signal, rule_stress)
+
         fast = torch.sigmoid(self.fast_decay).item()
         slow = torch.sigmoid(self.slow_decay).item()
 
@@ -142,15 +157,26 @@ class CortisolSystem(nn.Module):
             self._cort_level = slow * self._cort_level + (1 - slow) * stress_signal
 
         self._cort_level = max(0.0, min(1.0, self._cort_level))
-        self._in_fear_mode = self._cort_level >= self.fear_threshold
+
+        # Lockout takes priority: forced fear state for N steps
+        if self._lockout_remaining > 0:
+            self._lockout_remaining -= 1
+            self._in_fear_mode = True
+        else:
+            self._in_fear_mode = self._cort_level >= self.fear_threshold
 
         return self._cort_level, self._in_fear_mode
+
+    def trigger_flash_crash_lockout(self) -> None:
+        """Force fear state for lockout_duration steps (amygdala hijack on crash)."""
+        self._cort_level = 1.0
+        self._in_fear_mode = True
+        self._lockout_remaining = self.lockout_duration
 
     def get_position_cap(self) -> float:
         """Max position size multiplier based on CORT. Ranges [0.0, 1.0]."""
         if self._in_fear_mode:
-            return max(0.0, 1.0 - 2.0 * (self._cort_level - self.fear_threshold) /
-                       (1.0 - self.fear_threshold))
+            return self.FEAR_POSITION_CAP  # hard-wired 70% reduction
         return max(0.1, 1.0 - self._cort_level)
 
     def is_fear_mode(self) -> bool:

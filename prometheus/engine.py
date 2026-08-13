@@ -260,6 +260,14 @@ class PrometheusEngine:
 
         self.optimizer.zero_grad()
 
+        # Normalise input: numpy→tensor, 2D→3D (add batch dim)
+        if not isinstance(x, torch.Tensor):
+            x = torch.tensor(x, dtype=torch.float32)
+        if x.dim() == 2:
+            x = x.unsqueeze(0)
+        if not isinstance(y, torch.Tensor):
+            y = torch.tensor(y, dtype=torch.float32)
+
         # Forward pass
         ltc_out, _, _ = self.ltc(x)
         causal_out = self.causal_transformer(ltc_out, return_attributions=True)

@@ -37,6 +37,10 @@ CRYPTO_TICKERS = ["BTC-USD", "ETH-USD"]
 VIX_TICKER = "^VIX"
 
 
+class TickerNotFoundError(Exception):
+    """Raised when a ticker cannot be resolved from any data source."""
+
+
 class MarketDataFetcher:
     """
     Unified market data fetcher with caching and normalization.
@@ -93,7 +97,13 @@ class MarketDataFetcher:
                 progress=False,
                 auto_adjust=True,
             )
+            if data.empty:
+                raise TickerNotFoundError(
+                    f"yfinance returned no data for tickers: {tickers}"
+                )
             return data
+        except TickerNotFoundError:
+            raise
         except Exception as e:
             logger.error("yfinance fetch failed: %s — using synthetic data", e)
             return self._synthetic_data(tickers)
@@ -173,6 +183,59 @@ class MarketDataFetcher:
         except Exception:
             logger.warning("Macro fetch failed — returning zeros")
             return pd.DataFrame()
+
+    def normalize_timestamps(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Standardize index to UTC+0 and floor nanoseconds to microseconds.
+        Handles mixed UTC/EST/naive datetime indices gracefully.
+        """
+        idx = df.index
+        if not isinstance(idx, pd.DatetimeIndex):
+            return df
+        if idx.tz is None:
+            idx = idx.tz_localize("UTC")
+        else:
+            idx = idx.tz_convert("UTC")
+        df = df.copy()
+        df.index = idx.floor("us")
+        return df
+
+    def validate_and_fill_volume(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Detect zero-volume periods and fill with median.
+        3+ consecutive zero-volume bars → asset tagged 'Illiquid'.
+        Returns (df_filled, illiquid_flags dict).
+        """
+        if df.empty:
+            return df
+        df = df.copy()
+        illiquid_assets: list[str] = []
+
+        # Support multi-level (field, ticker) or (ticker, field) and flat DataFrames
+        if isinstance(df.columns, pd.MultiIndex):
+            if "Volume" in df.columns.get_level_values(0):
+                # (field, ticker) format
+                vol_df = df["Volume"]
+            elif "Volume" in df.columns.get_level_values(1):
+                # (ticker, field) format — transpose to get tickers as columns
+                vol_df = df.xs("Volume", axis=1, level=1)
+            else:
+                return df
+        elif "Volume" in df.columns:
+            vol_df = df[["Volume"]]
+        else:
+            return df
+
+        for col in vol_df.columns:
+            series = vol_df[col]
+            med = series[series > 0].median() if (series > 0).any() else 1
+            zero_run = (series == 0).rolling(3).sum()
+            if (zero_run >= 3).any():
+                illiquid_assets.append(str(col))
+            vol_df[col] = series.where(series > 0, med)
+
+        df.attrs["illiquid_assets"] = illiquid_assets
+        return df
 
     def normalize(self, df: pd.DataFrame, method: str = "zscore") -> pd.DataFrame:
         """Normalize feature matrix. method: 'zscore' | 'minmax' | 'robust'."""

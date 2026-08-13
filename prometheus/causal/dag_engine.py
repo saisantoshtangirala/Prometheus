@@ -59,6 +59,11 @@ class CausalDAGEngine:
         self._data_cache: Dict[str, pd.Series] = {}
         self._initialize_base_graph()
 
+    @property
+    def nodes(self):
+        """Expose node metadata dict for API compatibility (dag_engine.nodes.keys())."""
+        return self.node_meta
+
     # ------------------------------------------------------------------
     # Graph initialisation
     # ------------------------------------------------------------------

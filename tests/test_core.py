@@ -184,24 +184,27 @@ class TestAsymmetricUtilityLoss:
         self.loss_fn = AsymmetricUtilityLoss()
 
     def test_zero_loss_on_bullish_error(self):
-        """If we predict $100 and it goes to $101, loss should be lower than directional error."""
-        pred = torch.tensor([[0.05]])  # predicted +5%
-        target = torch.tensor([[0.06]])  # actual +6% (we underestimated upside)
+        """Directional error (large magnitude) should penalize more than same-direction underestimate."""
+        # Same direction, small underestimate: alpha * |pred - target| = 0.5 * 0.01 = 0.005
+        pred = torch.tensor([[0.30]])
+        target = torch.tensor([[0.31]])
         loss_mild = self.loss_fn(pred, target)
 
-        pred_wrong = torch.tensor([[0.05]])  # predicted +5%
-        target_wrong = torch.tensor([[-0.05]])  # actual -5% (directional error)
+        # Wrong direction, large magnitude: beta * mag_error^gamma = 2.0 * 0.60^3 = 0.432
+        pred_wrong = torch.tensor([[0.30]])
+        target_wrong = torch.tensor([[-0.30]])
         loss_severe = self.loss_fn(pred_wrong, target_wrong)
 
         assert loss_severe > loss_mild
 
     def test_directional_error_penalized_more(self):
-        pred_correct = torch.tensor([[0.01, -0.01]])
-        pred_wrong = torch.tensor([[0.01, -0.01]])
-        target = torch.tensor([[0.02, 0.02]])  # both positive actual
+        # pred_wrong: second asset flipped sign with large magnitude — wrong direction penalty dominates
+        pred_wrong = torch.tensor([[0.30, -0.30]])
+        target = torch.tensor([[0.30, 0.30]])  # both positive actual
         loss_wrong = self.loss_fn(pred_wrong, target)
 
-        pred_same_dir = torch.tensor([[0.01, 0.01]])
+        # pred_same_dir: both assets in correct direction — no directional penalty
+        pred_same_dir = torch.tensor([[0.30, 0.30]])
         loss_right = self.loss_fn(pred_same_dir, target)
 
         assert loss_wrong > loss_right

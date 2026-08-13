@@ -232,6 +232,7 @@ class CausalTransformer(nn.Module):
         if return_attributions:
             attributions = self.attribution_head(pooled)  # [B, n_features]
             result["causal_attributions"] = attributions
+            result["attribution"] = attributions  # alias for API compatibility
 
         return result
 

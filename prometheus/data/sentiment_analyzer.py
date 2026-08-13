@@ -71,6 +71,12 @@ class LegalBERTSentimentAnalyzer:
             logger.warning("Could not load transformer: %s — using rule-based", e)
             self._transformer = None
 
+    def analyze(self, text: str) -> Dict:
+        """Short-form alias: analyze text, return dict with 'sentiment_score'."""
+        if not text:
+            return {"sentiment_score": 0.0}
+        return self.analyze_filing(text)
+
     def analyze_filing(self, text: str, ticker: str = "") -> Dict:
         """
         Analyze an SEC filing text for sentiment signals.
@@ -201,12 +207,23 @@ class BayesianTruthSerum:
 
     def aggregate_sentiment(
         self,
-        signals: Dict[str, float],  # user_id → predicted_return
-    ) -> Dict:
+        signals,  # list[float] or dict[str, float]
+    ):
         """
         Aggregate raw sentiment signals using BTS weights.
-        Returns weighted aggregate with bot-filtered signal.
+        Accepts list[float] (returns float) or dict[str, float] (returns dict).
         """
+        # List-of-floats API: convert to equal-weight average with bias toward consensus
+        if isinstance(signals, (list, tuple)):
+            if not signals:
+                return 0.0
+            arr = np.array(signals, dtype=float)
+            median = float(np.median(arr))
+            # Down-weight outliers (> 2 std from median)
+            std = arr.std() + 1e-8
+            weights = np.exp(-0.5 * ((arr - median) / std) ** 2)
+            return float(np.average(arr, weights=weights))
+
         bts_weights = self.compute_bts_weights()
         total_weight = 0.0
         weighted_signal = 0.0

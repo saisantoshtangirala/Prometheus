@@ -42,6 +42,13 @@ class HiveMindGraphEngine:
         stability_threshold: float = 0.60,
         correlation_window: int = 60,
     ):
+        # Duplicate ticker detection — graph nodes must be unique
+        seen, dupes = set(), []
+        for a in asset_names:
+            (dupes if a in seen else seen).append(a) if a in seen else seen.add(a)
+        if dupes:
+            raise ValueError(f"Duplicate tickers detected in graph: {dupes}")
+
         self.asset_names = asset_names
         self.n_assets = len(asset_names)
         self.stability_threshold = stability_threshold

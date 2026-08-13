@@ -104,7 +104,9 @@ class GenomeDecoder:
         input_dim: int,
         output_dim: int,
     ) -> nn.Module:
-        layers = [g for g in genome.genes if g.enabled]
+        # Accept either a NetworkGenome or a plain list of LayerGenes
+        genes_list = genome if isinstance(genome, list) else genome.genes
+        layers = [g for g in genes_list if g.enabled]
         if not layers:
             return nn.Linear(input_dim, output_dim)
 
@@ -155,6 +157,7 @@ class NEATArchitectureEvolver:
         self.input_dim = input_dim
         self.output_dim = output_dim
         self.pop_size = population_size
+        self.population_size = population_size  # public alias
         self.n_generations = n_generations
         self.mutation_rate = mutation_rate
         self.crossover_rate = crossover_rate
