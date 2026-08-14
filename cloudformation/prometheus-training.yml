@@ -1,0 +1,497 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Prometheus Causal Brain — Training Infrastructure.
+  Creates S3 bucket, IAM role + instance profile, security group, and a
+  reusable EC2 Launch Template.  Optionally launches a GPU Spot instance
+  that runs the full training pipeline and self-terminates when done.
+
+# ---------------------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------------------
+Parameters:
+
+  BucketName:
+    Type: String
+    Description: >
+      Globally unique S3 bucket name for checkpoints and logs.
+      Must be lowercase, 3-63 chars, no dots.
+    AllowedPattern: "^[a-z0-9][a-z0-9\\-]{1,61}[a-z0-9]$"
+    ConstraintDescription: "Lowercase letters, numbers and hyphens only."
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: >
+      EC2 Key Pair for SSH access.
+      Create one in EC2 → Key Pairs before deploying this stack.
+
+  AllowedSSHCidr:
+    Type: String
+    Description: "CIDR block allowed for SSH inbound (use x.x.x.x/32 for your IP)."
+    Default: "0.0.0.0/0"
+    AllowedPattern: "^(\\d{1,3}\\.){3}\\d{1,3}/\\d{1,2}$"
+    ConstraintDescription: "Must be a valid CIDR block, e.g. 203.0.113.42/32"
+
+  GitHubRepoURL:
+    Type: String
+    Description: "HTTPS clone URL of the Prometheus repository."
+    Default: "https://github.com/saisantoshtangirala/prometheus"
+
+  GitHubBranch:
+    Type: String
+    Default: "claude/prometheus-causal-market-ol2pau"
+
+  InstanceType:
+    Type: String
+    Description: "GPU instance type. g4dn.xlarge is the cheapest with a real GPU."
+    Default: g4dn.xlarge
+    AllowedValues:
+      - g4dn.xlarge    # T4  16 GB VRAM  4 vCPU  ~$0.16/hr spot
+      - g4dn.2xlarge   # T4  16 GB VRAM  8 vCPU  ~$0.23/hr spot
+      - g5.2xlarge     # A10G 24 GB VRAM  8 vCPU  ~$0.34/hr spot
+      - p3.2xlarge     # V100 16 GB VRAM  8 vCPU  ~$0.90/hr spot
+      - p3.8xlarge     # 4×V100 64 GB VRAM 32 vCPU ~$3.60/hr spot
+      - t3.medium      # CPU only — for smoke-test (use --device cpu)
+
+  SpotMaxPrice:
+    Type: String
+    Default: ""
+    Description: >
+      Maximum Spot price in USD/hr (e.g. "0.25").
+      Leave EMPTY to use On-Demand pricing (no interruption risk, ~6× cost).
+
+  TrainMode:
+    Type: String
+    Default: full
+    AllowedValues: [pretrain, finetune, meta, evolve, full]
+    Description: >
+      full = pretrain → finetune → meta → evolve (recommended).
+      Use individual modes to resume a specific phase.
+
+  NAssets:
+    Type: Number
+    Default: 20
+    MinValue: 1
+    MaxValue: 100
+
+  SeqLen:
+    Type: Number
+    Default: 64
+    AllowedValues: [32, 64, 128, 252]
+
+  Horizon:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 20
+
+  DModel:
+    Type: Number
+    Default: 256
+    AllowedValues: [64, 128, 256, 512]
+    Description: "Transformer hidden dim. 256 fits g4dn.xlarge; use 512 for p3."
+
+  NHeads:
+    Type: Number
+    Default: 8
+    AllowedValues: [2, 4, 8, 16]
+
+  NLayers:
+    Type: Number
+    Default: 6
+    AllowedValues: [2, 4, 6, 8, 12]
+
+  PretrainEpochs:
+    Type: Number
+    Default: 10
+    MinValue: 1
+
+  FinetuneEpochs:
+    Type: Number
+    Default: 50
+    MinValue: 1
+
+  NBlackSwans:
+    Type: Number
+    Default: 2000
+    MinValue: 100
+    Description: "Number of synthetic black-swan scenarios for pre-training."
+
+  VolumeGB:
+    Type: Number
+    Default: 100
+    MinValue: 50
+    MaxValue: 500
+    Description: "Root EBS volume size. 100 GB is enough for the scenario library."
+
+  LaunchTraining:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >
+      true  = deploy infrastructure AND launch training immediately.
+      false = deploy infrastructure only; launch manually with scripts/aws_train.py.
+
+# ---------------------------------------------------------------------------
+# Conditions
+# ---------------------------------------------------------------------------
+Conditions:
+  LaunchInstance: !Equals [!Ref LaunchTraining, "true"]
+  UseSpot:        !Not [!Equals [!Ref SpotMaxPrice, ""]]
+
+# ---------------------------------------------------------------------------
+# Region → DLAMI AMI mapping
+# Deep Learning AMI (GPU) AL2 with PyTorch 2.1 pre-installed.
+# Check https://aws.amazon.com/machine-learning/amis/ if these are stale.
+# ---------------------------------------------------------------------------
+Mappings:
+  RegionAMI:
+    us-east-1:
+      Id: ami-0a2928e1c02fe0b30
+    us-east-2:
+      Id: ami-09b8f1fcd0a4e7b4a
+    us-west-2:
+      Id: ami-0c5f63e5a4e9c7b8e
+    eu-west-1:
+      Id: ami-0e3a6b2b93f4a1c7d
+    ap-southeast-1:
+      Id: ami-0f1234567890abcde
+    ap-northeast-1:
+      Id: ami-0abcde1234567890f
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+Resources:
+
+  # ── S3 Bucket ────────────────────────────────────────────────────────────
+  CheckpointBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain   # keep checkpoints if stack is deleted
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Ref BucketName
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+          - Id: ExpireIncompleteUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 3
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls:       true
+        BlockPublicPolicy:     true
+        IgnorePublicAcls:      true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: Prometheus
+
+  # ── IAM Role ─────────────────────────────────────────────────────────────
+  PrometheusEC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: PrometheusEC2Role
+      Description: "Allows Prometheus EC2 training instances to access S3 and self-terminate."
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+      Policies:
+        - PolicyName: SelfTerminate
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: AllowSelfTermination
+                Effect: Allow
+                Action: ec2:TerminateInstances
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    ec2:ResourceTag/Project: Prometheus
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: AllowLogStream
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/prometheus/*"
+      Tags:
+        - Key: Project
+          Value: Prometheus
+
+  PrometheusInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: PrometheusEC2Profile
+      Roles:
+        - !Ref PrometheusEC2Role
+
+  # ── Security Group ────────────────────────────────────────────────────────
+  TrainingSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: prometheus-training-sg
+      GroupDescription: "Prometheus training instances — SSH inbound, full outbound"
+      SecurityGroupIngress:
+        - Description: SSH from allowed CIDR
+          IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AllowedSSHCidr
+      SecurityGroupEgress:
+        - Description: All outbound (pip, git, yfinance, S3)
+          IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: prometheus-training-sg
+        - Key: Project
+          Value: Prometheus
+
+  # ── Launch Template ───────────────────────────────────────────────────────
+  # Reusable template for re-launching training without CloudFormation.
+  # Use: aws ec2 run-instances --launch-template LaunchTemplateId=<id>,Version=<v>
+  PrometheusLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: prometheus-training
+      LaunchTemplateData:
+        ImageId: !FindInMap [RegionAMI, !Ref "AWS::Region", Id]
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref KeyPairName
+        IamInstanceProfile:
+          Name: !Ref PrometheusInstanceProfile
+        SecurityGroupIds:
+          - !GetAtt TrainingSG.GroupId
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: !Ref VolumeGB
+              VolumeType: gp3
+              Throughput: 250       # MB/s (gp3 default is 125)
+              Iops: 3000
+              DeleteOnTermination: true
+              Encrypted: true
+        MetadataOptions:
+          HttpTokens: required      # IMDSv2 only (security best practice)
+          HttpPutResponseHopLimit: 1
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: prometheus-training
+              - Key: Project
+                Value: Prometheus
+        # UserData is set on the training instance directly (see below)
+        # so we can substitute the actual job ID at launch time.
+
+  # ── Training Instance ─────────────────────────────────────────────────────
+  # Only created when LaunchTraining=true.
+  # Self-terminates after pushing checkpoints to S3.
+  TrainingInstance:
+    Type: AWS::EC2::Instance
+    Condition: LaunchInstance
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref PrometheusLaunchTemplate
+        Version: !GetAtt PrometheusLaunchTemplate.LatestVersionNumber
+      InstanceMarketOptions:
+        !If
+          - UseSpot
+          - MarketType: spot
+            SpotOptions:
+              MaxPrice: !Ref SpotMaxPrice
+              SpotInstanceType: one-time
+              InstanceInterruptionBehavior: terminate
+          - !Ref AWS::NoValue
+      UserData:
+        Fn::Base64:
+          Fn::Sub:
+            - |
+              #!/bin/bash
+              set -euo pipefail
+              exec > >(tee /var/log/prometheus-train.log) 2>&1
+
+              JOB_ID="job-$(date -u +%Y%m%dT%H%M%SZ)"
+              echo "====================================================="
+              echo " Prometheus Training Job: $JOB_ID"
+              echo " Instance: $(curl -s http://169.254.169.254/latest/meta-data/instance-id)"
+              echo " Region:   ${AWSRegion}"
+              echo " Branch:   ${Branch}"
+              echo "====================================================="
+
+              # ── Activate PyTorch environment (DLAMI default) ──────────
+              source /opt/conda/etc/profile.d/conda.sh
+              conda activate pytorch
+
+              # ── Clone repository ──────────────────────────────────────
+              if [ -d /opt/prometheus ]; then
+                  echo "[setup] Updating existing clone..."
+                  cd /opt/prometheus
+                  git fetch origin ${Branch}
+                  git checkout ${Branch}
+                  git pull origin ${Branch}
+              else
+                  echo "[setup] Cloning ${RepoURL}..."
+                  git clone ${RepoURL} /opt/prometheus
+                  cd /opt/prometheus
+                  git checkout ${Branch}
+              fi
+
+              cd /opt/prometheus
+
+              # ── Install dependencies ──────────────────────────────────
+              echo "[setup] Installing dependencies..."
+              pip install -e . -q
+              pip install boto3 awscli -q
+
+              # ── Restore cached scenario library if available ──────────
+              echo "[setup] Syncing scenario cache from S3..."
+              aws s3 sync s3://${Bucket}/prometheus/scenarios/ data/scenarios/ \
+                --quiet --no-progress || echo "[setup] No scenario cache found — will regenerate."
+
+              # ── Run training ──────────────────────────────────────────
+              echo "[train] Starting training pipeline (mode=${Mode})..."
+              python scripts/train.py \
+                --mode        ${Mode}       \
+                --n-assets    ${Assets}     \
+                --seq-len     ${Seq}        \
+                --horizon     ${Hor}        \
+                --d-model     ${Dim}        \
+                --n-heads     ${Heads}      \
+                --n-layers    ${Layers}     \
+                --pretrain-epochs ${PreEpochs}  \
+                --finetune-epochs ${FineEpochs} \
+                --n-black-swans   ${Swans}      \
+                --device cuda \
+                2>&1 | tee /var/log/prometheus-job.log
+
+              echo "[train] Training complete."
+
+              # ── Push checkpoint to S3 ─────────────────────────────────
+              echo "[s3] Pushing checkpoint for job $JOB_ID..."
+              python - <<PYEOF
+              from prometheus.cloud import CheckpointStore
+              store = CheckpointStore(bucket="${Bucket}", prefix="prometheus")
+              store.push("checkpoints", tag="$JOB_ID")
+              store.push("checkpoints", tag="latest")
+              try:
+                  store.push_scenarios()
+              except Exception as e:
+                  print(f"[s3] Scenario push skipped: {e}")
+              print("[s3] Checkpoint upload complete.")
+              PYEOF
+
+              # ── Upload training log ───────────────────────────────────
+              aws s3 cp /var/log/prometheus-job.log \
+                s3://${Bucket}/prometheus/logs/$JOB_ID/train.log
+              echo "[s3] Log uploaded."
+
+              # ── Completion marker ─────────────────────────────────────
+              echo "Job $JOB_ID complete." | \
+                aws s3 cp - s3://${Bucket}/prometheus/logs/$JOB_ID/done.txt
+
+              echo "[done] Job $JOB_ID complete. Self-terminating..."
+
+              # ── Self-terminate ────────────────────────────────────────
+              INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+              aws ec2 terminate-instances \
+                --instance-ids $INSTANCE_ID \
+                --region ${AWSRegion}
+            - Branch:      !Ref GitHubBranch
+              RepoURL:     !Ref GitHubRepoURL
+              Bucket:      !Ref BucketName
+              Mode:        !Ref TrainMode
+              Assets:      !Ref NAssets
+              Seq:         !Ref SeqLen
+              Hor:         !Ref Horizon
+              Dim:         !Ref DModel
+              Heads:       !Ref NHeads
+              Layers:      !Ref NLayers
+              PreEpochs:   !Ref PretrainEpochs
+              FineEpochs:  !Ref FinetuneEpochs
+              Swans:       !Ref NBlackSwans
+              AWSRegion:   !Ref "AWS::Region"
+      Tags:
+        - Key: Name
+          Value: !Sub "prometheus-training-${AWS::StackName}"
+        - Key: Project
+          Value: Prometheus
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+Outputs:
+
+  BucketName:
+    Description: "S3 bucket for checkpoints, logs, and scenario cache."
+    Value: !Ref CheckpointBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-Bucket"
+
+  IAMRoleArn:
+    Description: "ARN of PrometheusEC2Role (attach to manually launched instances)."
+    Value: !GetAtt PrometheusEC2Role.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-RoleArn"
+
+  InstanceProfileName:
+    Description: "Instance profile name to pass to scripts/aws_train.py --iam-profile."
+    Value: !Ref PrometheusInstanceProfile
+    Export:
+      Name: !Sub "${AWS::StackName}-InstanceProfile"
+
+  SecurityGroupId:
+    Description: "Security group ID to pass to scripts/aws_train.py --security-group."
+    Value: !GetAtt TrainingSG.GroupId
+    Export:
+      Name: !Sub "${AWS::StackName}-SecurityGroup"
+
+  LaunchTemplateId:
+    Description: "Reusable launch template for future training runs (no CloudFormation needed)."
+    Value: !Ref PrometheusLaunchTemplate
+    Export:
+      Name: !Sub "${AWS::StackName}-LaunchTemplate"
+
+  CheckpointS3Path:
+    Description: "S3 prefix where model checkpoints are stored."
+    Value: !Sub "s3://${CheckpointBucket}/prometheus/checkpoints/"
+
+  ManualLaunchCommand:
+    Description: "Command to launch future training runs without re-deploying this stack."
+    Value: !Sub >-
+      python scripts/aws_train.py launch
+      --bucket ${CheckpointBucket}
+      --repo ${GitHubRepoURL}
+      --key-pair ${KeyPairName}
+      --security-group ${TrainingSG.GroupId}
+      --iam-profile PrometheusEC2Profile
+      --instance ${InstanceType}
+      --mode ${TrainMode}
+
+  PullCommand:
+    Description: "Command to download the latest trained checkpoint."
+    Value: !Sub "python scripts/aws_train.py pull --bucket ${CheckpointBucket} --tag latest"
+
+  MonitorLogsCommand:
+    Description: "Stream training logs from S3."
+    Value: !Sub "aws s3 cp s3://${CheckpointBucket}/prometheus/logs/ ./logs/ --recursive"
+
+  TrainingInstanceId:
+    Condition: LaunchInstance
+    Description: "EC2 instance running training (self-terminates on completion)."
+    Value: !Ref TrainingInstance
