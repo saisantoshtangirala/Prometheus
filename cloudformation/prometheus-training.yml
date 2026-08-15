@@ -331,13 +331,45 @@ Resources:
           Fn::Sub:
             - |
               #!/bin/bash
-              set -euo pipefail
+              # NOTE: no -u — the DLAMI venv activate script references unset
+              # LD_LIBRARY_PATH and would kill the whole job under set -u.
+              set -eo pipefail
               exec > >(tee /var/log/prometheus-train.log) 2>&1
 
               JOB_ID="job-$(date -u +%Y%m%dT%H%M%SZ)"
+
+              # IMDSv2 helper (HttpTokens=required means plain curl gets 401)
+              imds() {
+                  TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
+                    -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+                  curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+                    "http://169.254.169.254/latest/meta-data/$1"
+              }
+              INSTANCE_ID=$(imds instance-id)
+
+              # Safety net: ALWAYS upload the log and terminate on exit,
+              # even if training crashes - never leave an idle instance billing.
+              cleanup() {
+                  EXIT_CODE=$?
+                  echo "[cleanup] Script exiting with code $EXIT_CODE"
+                  aws s3 cp /var/log/prometheus-train.log \
+                    s3://${Bucket}/prometheus/logs/$JOB_ID/train.log || true
+                  if [ $EXIT_CODE -eq 0 ]; then
+                      echo "Job $JOB_ID complete." | \
+                        aws s3 cp - s3://${Bucket}/prometheus/logs/$JOB_ID/done.txt || true
+                  else
+                      echo "Job $JOB_ID FAILED with exit code $EXIT_CODE" | \
+                        aws s3 cp - s3://${Bucket}/prometheus/logs/$JOB_ID/failed.txt || true
+                  fi
+                  echo "[cleanup] Terminating instance $INSTANCE_ID"
+                  aws ec2 terminate-instances \
+                    --instance-ids "$INSTANCE_ID" --region ${AWSRegion} || true
+              }
+              trap cleanup EXIT
+
               echo "====================================================="
               echo " Prometheus Training Job: $JOB_ID"
-              echo " Instance: $(curl -s http://169.254.169.254/latest/meta-data/instance-id)"
+              echo " Instance: $INSTANCE_ID"
               echo " Region:   ${AWSRegion}"
               echo " Branch:   ${Branch}"
               echo "====================================================="
@@ -418,22 +450,7 @@ Resources:
               print("[s3] Checkpoint upload complete.")
               PYEOF
 
-              # -- Upload training log -------------------------------------
-              aws s3 cp /var/log/prometheus-job.log \
-                s3://${Bucket}/prometheus/logs/$JOB_ID/train.log
-              echo "[s3] Log uploaded."
-
-              # -- Completion marker ---------------------------------------
-              echo "Job $JOB_ID complete." | \
-                aws s3 cp - s3://${Bucket}/prometheus/logs/$JOB_ID/done.txt
-
-              echo "[done] Job $JOB_ID complete. Self-terminating..."
-
-              # -- Self-terminate ----------------------------------------
-              INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
-              aws ec2 terminate-instances \
-                --instance-ids $INSTANCE_ID \
-                --region ${AWSRegion}
+              echo "[done] Job $JOB_ID complete. Cleanup trap will upload log and terminate."
             - Branch:      !Ref GitHubBranch
               RepoURL:     !Ref GitHubRepoURL
               Bucket:      !Ref BucketName
