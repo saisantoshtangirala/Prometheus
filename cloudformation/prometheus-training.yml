@@ -334,9 +334,23 @@ Resources:
               echo " Branch:   ${Branch}"
               echo "====================================================="
 
-              # -- Activate PyTorch environment (DLAMI default) ----------
-              source /opt/conda/etc/profile.d/conda.sh
-              conda activate pytorch
+              # -- Activate PyTorch environment ---------------------------
+              # AL2 DLAMI: conda env "pytorch". AL2023 DLAMI: venv /opt/pytorch.
+              if [ -f /opt/conda/etc/profile.d/conda.sh ]; then
+                  echo "[setup] Activating conda pytorch env (AL2 DLAMI)"
+                  source /opt/conda/etc/profile.d/conda.sh
+                  conda activate pytorch
+              elif [ -f /opt/pytorch/bin/activate ]; then
+                  echo "[setup] Activating /opt/pytorch venv (AL2023 DLAMI)"
+                  source /opt/pytorch/bin/activate
+              else
+                  echo "[setup] No DLAMI env found - using system python3"
+              fi
+              python --version
+              python -c "import torch; print('torch', torch.__version__, 'cuda:', torch.cuda.is_available())" || true
+
+              # Ensure git is present (AL2023 minimal images may lack it)
+              command -v git >/dev/null || (yum install -y git || dnf install -y git)
 
               # -- Clone repository --------------------------------------
               if [ -d /opt/prometheus ]; then
