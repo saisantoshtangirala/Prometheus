@@ -331,7 +331,7 @@ Resources:
           Fn::Sub:
             - |
               #!/bin/bash
-              # NOTE: no -u — the DLAMI venv activate script references unset
+              # NOTE: no -u --- the DLAMI venv activate script references unset
               # LD_LIBRARY_PATH and would kill the whole job under set -u.
               set -eo pipefail
               exec > >(tee /var/log/prometheus-train.log) 2>&1
