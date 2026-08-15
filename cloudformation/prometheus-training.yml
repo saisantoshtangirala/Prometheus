@@ -20,10 +20,11 @@ Parameters:
 
   KeyPairName:
     Type: String
+    Default: ""
     Description: >
-      EC2 Key Pair name for SSH access.
-      Create one in EC2 → Key Pairs before launching training instances.
-      Leave blank if you do not need SSH access.
+      EC2 Key Pair name for SSH access (optional).
+      Leave blank to skip — the instance will still train and push to S3.
+      Create one in EC2 → Key Pairs if you need to SSH into the instance.
 
   AllowedSSHCidr:
     Type: String
@@ -138,6 +139,7 @@ Parameters:
 Conditions:
   LaunchInstance: !Equals [!Ref LaunchTraining, "true"]
   UseSpot:        !Not [!Equals [!Ref SpotMaxPrice, ""]]
+  HasKeyPair:     !Not [!Equals [!Ref KeyPairName, ""]]
 
 # ---------------------------------------------------------------------------
 # Region → DLAMI AMI mapping
@@ -273,7 +275,7 @@ Resources:
       LaunchTemplateData:
         ImageId: !FindInMap [RegionAMI, !Ref "AWS::Region", Id]
         InstanceType: !Ref InstanceType
-        KeyName: !Ref KeyPairName
+        KeyName: !If [HasKeyPair, !Ref KeyPairName, !Ref AWS::NoValue]
         IamInstanceProfile:
           Name: !Ref PrometheusInstanceProfile
         SecurityGroupIds:
