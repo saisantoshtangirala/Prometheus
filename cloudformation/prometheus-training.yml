@@ -141,6 +141,14 @@ Parameters:
     MaxValue: 500
     Description: "Root EBS volume size. 100 GB is enough for the scenario library."
 
+  TrainDevice:
+    Type: String
+    Default: cuda
+    AllowedValues: [cuda, cpu]
+    Description: >
+      cuda for GPU instances (g4dn/g5/p3).
+      cpu for CPU-only instances (t3/m5) - slow, use small model params.
+
   LaunchTraining:
     Type: String
     Default: "true"
@@ -391,7 +399,7 @@ Resources:
                 --pretrain-epochs ${PreEpochs}  \
                 --finetune-epochs ${FineEpochs} \
                 --n-black-swans   ${Swans}      \
-                --device cuda \
+                --device ${Device} \
                 2>&1 | tee /var/log/prometheus-job.log
 
               echo "[train] Training complete."
@@ -439,6 +447,7 @@ Resources:
               PreEpochs:   !Ref PretrainEpochs
               FineEpochs:  !Ref FinetuneEpochs
               Swans:       !Ref NBlackSwans
+              Device:      !Ref TrainDevice
               AWSRegion:   !Ref "AWS::Region"
       Tags:
         - Key: Name
