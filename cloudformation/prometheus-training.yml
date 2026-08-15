@@ -26,6 +26,13 @@ Parameters:
       Leave blank to skip — the instance will still train and push to S3.
       Create one in EC2 → Key Pairs if you need to SSH into the instance.
 
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: >
+      VPC to deploy the security group into.
+      In the console this shows a dropdown — pick your default VPC.
+      To find it: VPC Console → Your VPCs → look for the one marked Default.
+
   AllowedSSHCidr:
     Type: String
     Description: "CIDR block allowed for SSH inbound (use x.x.x.x/32 for your IP)."
@@ -238,6 +245,7 @@ Resources:
     Properties:
       GroupName: prometheus-training-sg
       GroupDescription: "Prometheus training instances — SSH inbound, full outbound"
+      VpcId: !Ref VpcId
       SecurityGroupIngress:
         - Description: SSH from allowed CIDR
           IpProtocol: tcp
