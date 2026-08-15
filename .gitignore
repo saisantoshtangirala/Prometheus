@@ -20,3 +20,4 @@ data/scenarios/
 .DS_Store
 *.html
 notebooks/.ipynb_checkpoints/
+logs/
