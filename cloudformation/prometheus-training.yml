@@ -288,6 +288,15 @@ Resources:
         MetadataOptions:
           HttpTokens: required      # IMDSv2 only (security best practice)
           HttpPutResponseHopLimit: 1
+        InstanceMarketOptions:
+          !If
+            - UseSpot
+            - MarketType: spot
+              SpotOptions:
+                MaxPrice: !Ref SpotMaxPrice
+                SpotInstanceType: one-time
+                InstanceInterruptionBehavior: terminate
+            - !Ref AWS::NoValue
         TagSpecifications:
           - ResourceType: instance
             Tags:
@@ -309,15 +318,6 @@ Resources:
       LaunchTemplate:
         LaunchTemplateId: !Ref PrometheusLaunchTemplate
         Version: !GetAtt PrometheusLaunchTemplate.LatestVersionNumber
-      InstanceMarketOptions:
-        !If
-          - UseSpot
-          - MarketType: spot
-            SpotOptions:
-              MaxPrice: !Ref SpotMaxPrice
-              SpotInstanceType: one-time
-              InstanceInterruptionBehavior: terminate
-          - !Ref AWS::NoValue
       UserData:
         Fn::Base64:
           Fn::Sub:
