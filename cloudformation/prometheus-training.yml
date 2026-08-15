@@ -49,6 +49,16 @@ Parameters:
     Type: String
     Default: "claude/prometheus-causal-market-ol2pau"
 
+  GitHubToken:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: >
+      GitHub Personal Access Token - REQUIRED if the repo is private.
+      Create a fine-grained token with read-only Contents permission at
+      github.com -> Settings -> Developer settings -> Fine-grained tokens.
+      Leave blank for public repos.
+
   InstanceType:
     Type: String
     Description: "GPU instance type. g4dn.xlarge is the cheapest with a real GPU."
@@ -393,6 +403,15 @@ Resources:
               command -v git >/dev/null || (yum install -y git || dnf install -y git)
 
               # -- Clone repository --------------------------------------
+              # Private repos need the token embedded in the clone URL.
+              CLONE_URL="${RepoURL}"
+              if [ -n "${GitToken}" ]; then
+                  echo "[setup] Using GitHub token for private repo access"
+                  CLONE_URL=$(echo "${RepoURL}" | sed "s#https://#https://${GitToken}@#")
+              fi
+              # Never prompt for credentials - fail fast instead of hanging
+              export GIT_TERMINAL_PROMPT=0
+
               if [ -d /opt/prometheus ]; then
                   echo "[setup] Updating existing clone..."
                   cd /opt/prometheus
@@ -401,7 +420,7 @@ Resources:
                   git pull origin ${Branch}
               else
                   echo "[setup] Cloning ${RepoURL}..."
-                  git clone ${RepoURL} /opt/prometheus
+                  git clone "$CLONE_URL" /opt/prometheus
                   cd /opt/prometheus
                   git checkout ${Branch}
               fi
@@ -465,6 +484,7 @@ Resources:
               FineEpochs:  !Ref FinetuneEpochs
               Swans:       !Ref NBlackSwans
               Device:      !Ref TrainDevice
+              GitToken:    !Ref GitHubToken
               AWSRegion:   !Ref "AWS::Region"
       Tags:
         - Key: Name
