@@ -54,6 +54,15 @@ Parameters:
       - p3.8xlarge     # 4×V100 64 GB VRAM 32 vCPU ~$3.60/hr spot
       - t3.medium      # CPU only — for smoke-test (use --device cpu)
 
+  AmiId:
+    Type: String
+    Default: ""
+    Description: >
+      Deep Learning AMI ID for your region (only needed when LaunchTraining=true).
+      Find the latest at: EC2 Console → AMIs → Public images →
+      search "Deep Learning AMI GPU PyTorch" → filter by your region.
+      Example us-east-1: ami-0f28f8b1b6f9b8c3e
+
   SpotMaxPrice:
     Type: String
     Default: ""
@@ -140,26 +149,6 @@ Conditions:
   LaunchInstance: !Equals [!Ref LaunchTraining, "true"]
   UseSpot:        !Not [!Equals [!Ref SpotMaxPrice, ""]]
   HasKeyPair:     !Not [!Equals [!Ref KeyPairName, ""]]
-
-# ---------------------------------------------------------------------------
-# Region → DLAMI AMI mapping
-# Deep Learning AMI (GPU) AL2 with PyTorch 2.1 pre-installed.
-# Check https://aws.amazon.com/machine-learning/amis/ if these are stale.
-# ---------------------------------------------------------------------------
-Mappings:
-  RegionAMI:
-    us-east-1:
-      Id: ami-0a2928e1c02fe0b30
-    us-east-2:
-      Id: ami-09b8f1fcd0a4e7b4a
-    us-west-2:
-      Id: ami-0c5f63e5a4e9c7b8e
-    eu-west-1:
-      Id: ami-0e3a6b2b93f4a1c7d
-    ap-southeast-1:
-      Id: ami-0f1234567890abcde
-    ap-northeast-1:
-      Id: ami-0abcde1234567890f
 
 # ---------------------------------------------------------------------------
 # Resources
@@ -273,7 +262,6 @@ Resources:
     Properties:
       LaunchTemplateName: prometheus-training
       LaunchTemplateData:
-        ImageId: !FindInMap [RegionAMI, !Ref "AWS::Region", Id]
         InstanceType: !Ref InstanceType
         KeyName: !If [HasKeyPair, !Ref KeyPairName, !Ref AWS::NoValue]
         IamInstanceProfile:
@@ -309,6 +297,7 @@ Resources:
     Type: AWS::EC2::Instance
     Condition: LaunchInstance
     Properties:
+      ImageId: !Ref AmiId
       LaunchTemplate:
         LaunchTemplateId: !Ref PrometheusLaunchTemplate
         Version: !GetAtt PrometheusLaunchTemplate.LatestVersionNumber
