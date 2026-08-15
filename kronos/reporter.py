@@ -24,7 +24,29 @@ class GodsEyeReporter:
     def __init__(self, config):
         self.cfg = config
         self.report_dir = config.orchestrator.report_dir
-        os.makedirs(self.report_dir, exist_ok=True)
+        self.last_report_md: Optional[str] = None   # REP-03 in-memory fallback
+        try:
+            os.makedirs(self.report_dir, exist_ok=True)
+        except OSError as e:
+            logger.error("[reporter] cannot create report dir: %s", e)
+
+    @staticmethod
+    def sanitize_tickers(text: str, valid_tickers: List[str]) -> str:
+        """
+        REP-02: strip hallucinated ticker mentions. Any $TICKER token whose
+        symbol is not in the portfolio is removed from the summary text.
+        Bare uppercase words are left alone (too many false positives);
+        the $-prefixed convention is the contract for ticker mentions.
+        """
+        import re
+        valid = set(valid_tickers)
+
+        def _replace(match):
+            symbol = match.group(1)
+            return f"${symbol}" if symbol in valid else ""
+
+        cleaned = re.sub(r"\$([A-Z]{1,5})\b", _replace, text)
+        return re.sub(r"\s{2,}", " ", cleaned).strip()
 
     # -- computation helpers -------------------------------------------------
 
@@ -116,10 +138,13 @@ class GodsEyeReporter:
                     exposure_lines.append(
                         f"| {ticker} | {trader.positions[ticker]:+.1f} | {pct:.1%} |"
                     )
+        # REP-01: an explicitly neutral statement on zero-activity days -
+        # and no Sharpe division anywhere (close_day already guards std=0).
         exposure_table = (
             "| Ticker | Shares | % of Equity |\n|---|---|---|\n"
             + "\n".join(exposure_lines)
-            if exposure_lines else "_Book is flat._"
+            if exposure_lines else
+            "_No trading opportunities identified. Position: Neutral._"
         )
 
         movers_lines = "\n".join(
@@ -150,7 +175,10 @@ class GodsEyeReporter:
                 f"{['%.5f' % l for l in warmup_summary.get('inner_losses', [])]}\n"
             )
 
-        summary = self._human_summary(memory, vol, regime, position_cap)
+        summary = self.sanitize_tickers(
+            self._human_summary(memory, vol, regime, position_cap),
+            memory.tickers,
+        )
 
         md = f"""# God's Eye Report - Day {day}
 
@@ -182,12 +210,22 @@ _Generated {now.strftime('%Y-%m-%d %H:%M UTC')} | data source: {memory.source_us
 - Flags: {memory.quality_flags if memory.quality_flags else 'none'}
 """
 
+        # REP-03: a full/read-only disk must not kill the orchestration -
+        # keep the report in memory and carry on.
+        self.last_report_md = md
         date_str = now.strftime("%Y%m%d")
         path = os.path.join(self.report_dir, f"GodsEye_{date_str}_day{day}.md")
-        with open(path, "w") as f:
-            f.write(md)
-        latest = os.path.join(self.report_dir, "GodsEye.md")
-        with open(latest, "w") as f:
-            f.write(md)
+        try:
+            with open(path, "w") as f:
+                f.write(md)
+            latest = os.path.join(self.report_dir, "GodsEye.md")
+            with open(latest, "w") as f:
+                f.write(md)
+        except OSError as e:
+            logger.error(
+                "[reporter] cannot write report to disk (%s) - "
+                "report retained in memory buffer", e,
+            )
+            return "<in-memory>"
         logger.info("[reporter] God's Eye written: %s", path)
         return path

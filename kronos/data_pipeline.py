@@ -27,11 +27,52 @@ import pandas as pd
 from prometheus.data.data_validator import (
     KalmanFilter1D,
     detect_flash_crash,
+    detect_illiquid_periods,
+    floor_nanoseconds_to_microseconds,
     standardize_timezone,
 )
 from prometheus.data.sentiment_analyzer import SentimentAnalyzer
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Utilities shared by the pipeline and the reflex arc
+# ---------------------------------------------------------------------------
+
+MIN_SPREAD_PCT = 0.001   # 0.1% minimum spread when clamping corrupt quotes
+
+
+def clamp_spread(bid: float, ask: float) -> tuple:
+    """
+    Repair a corrupt (negative) bid-ask spread: if ask < bid, clamp ask to
+    bid * (1 + MIN_SPREAD_PCT). Returns (bid, ask, was_corrupt).
+    Prevents the paper trader from "arbitraging" a data error.
+    """
+    if ask < bid:
+        return bid, bid * (1.0 + MIN_SPREAD_PCT), True
+    return bid, ask, False
+
+
+class Throttle:
+    """Minimum-interval rate limiter for API calls (DAT-07)."""
+
+    def __init__(self, min_interval_seconds: float = 0.5):
+        self.min_interval = float(min_interval_seconds)
+        self._last_call: Optional[float] = None
+
+    def wait(self) -> float:
+        """Block until the interval has elapsed. Returns seconds slept."""
+        import time as _time
+        now = _time.monotonic()
+        slept = 0.0
+        if self._last_call is not None:
+            remaining = self.min_interval - (now - self._last_call)
+            if remaining > 0:
+                _time.sleep(remaining)
+                slept = remaining
+        self._last_call = _time.monotonic()
+        return slept
 
 
 # ---------------------------------------------------------------------------
@@ -71,6 +112,10 @@ class DailyMemory:
 
 class SourceError(Exception):
     """A data source failed or returned unusable data."""
+
+
+class DataUnavailableError(SourceError):
+    """Every source AND the local cache failed - skip trading, never guess."""
 
 
 class YFinanceSource:
@@ -275,6 +320,11 @@ class DataPipeline:
             frame = standardize_timezone(frame)
         except Exception:
             flags.append("timezone_standardization_failed")
+        try:
+            # DAT-05: nanosecond-precision timestamps floored to microseconds
+            frame = floor_nanoseconds_to_microseconds(frame)
+        except ValueError:
+            pass  # non-datetime index: nothing to floor
 
         closes = frame["Close"].copy() if "Close" in frame else frame.copy()
         volumes = (
@@ -294,6 +344,19 @@ class DataPipeline:
             if missing_frac > 0:
                 closes[col] = self.kalman.fill(series)
                 flags.append(f"kalman_repaired:{col}")
+
+            # DAT-04: zero-volume (illiquid) assets are dropped for the day so
+            # they cannot distort systemic-risk attention weights.
+            if col in volumes.columns:
+                vol_series = volumes[col].fillna(0.0)
+                if (vol_series == 0).all() and len(vol_series) > 0:
+                    flags.append(f"illiquid:{col}:dropped")
+                    closes = closes.drop(columns=[col], errors="ignore")
+                    volumes = volumes.drop(columns=[col], errors="ignore")
+                    continue
+                _, is_illiquid = detect_illiquid_periods(vol_series)
+                if is_illiquid:
+                    flags.append(f"illiquid_periods:{col}")
 
         return closes, volumes, flags
 
@@ -347,25 +410,106 @@ class DataPipeline:
             quality_flags=flags,
         )
 
+    @staticmethod
+    def _strip_html(text: str) -> str:
+        """Remove tags/entities so LegalBERT sees prose, not markup."""
+        import re
+        text = re.sub(r"<script.*?</script>", " ", text,
+                      flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r"<style.*?</style>", " ", text,
+                      flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = re.sub(r"&[a-zA-Z#0-9]+;", " ", text)
+        return re.sub(r"\s+", " ", text).strip()
+
     def _score_sentiment(
         self, filings: Dict[str, str], tickers: List[str]
     ) -> Dict[str, float]:
-        """Score SEC filings via the existing LegalBERT analyzer; 0.0 if none."""
+        """
+        Score SEC filings via the existing LegalBERT analyzer; 0.0 if none.
+        DAT-06: a filing that is pure HTML (no recognizable text) degrades
+        gracefully to score 0.0 / confidence 0.1 instead of crashing.
+        """
         scores: Dict[str, float] = {t: 0.0 for t in tickers}
         for ticker, text in filings.items():
             try:
-                result = self.sentiment_analyzer.analyze_sec_filing(text, ticker)
+                clean = self._strip_html(text or "")
+                if len(clean) < 10:
+                    logger.warning(
+                        "[digestion] filing for %s has no usable text - "
+                        "neutral sentiment (score=0.0, confidence=0.1)", ticker,
+                    )
+                    scores[ticker] = 0.0
+                    continue
+                result = self.sentiment_analyzer.analyze_sec_filing(clean, ticker)
                 scores[ticker] = float(result.get("score", 0.0))
             except Exception as e:
                 logger.warning("[digestion] sentiment failed for %s: %s", ticker, e)
         return scores
 
+    # -- local cache (last line of defence, DAT-01 / E2E-03) ---------------
+
+    @property
+    def cache_path(self) -> str:
+        return self.cfg.data.get("cache_path", "logs/data_cache.pkl")
+
+    def save_cache(self, memory: DailyMemory) -> None:
+        """Persist the latest good memory so an outage can serve stale data."""
+        import pickle
+        os.makedirs(os.path.dirname(self.cache_path) or ".", exist_ok=True)
+        with open(self.cache_path, "wb") as f:
+            pickle.dump({
+                "prices": memory.prices, "volumes": memory.volumes,
+                "returns": memory.returns, "vix": memory.vix,
+                "sentiment": memory.sentiment, "macro": memory.macro,
+                "as_of": memory.as_of,
+            }, f)
+
+    def load_cache(self) -> Optional[DailyMemory]:
+        import pickle
+        if not os.path.exists(self.cache_path):
+            return None
+        try:
+            with open(self.cache_path, "rb") as f:
+                data = pickle.load(f)
+            return DailyMemory(
+                as_of=data["as_of"],
+                prices=data["prices"], volumes=data["volumes"],
+                returns=data["returns"], vix=data["vix"],
+                sentiment=data["sentiment"], macro=data["macro"],
+                source_used="cache",
+                quality_flags=[f"stale_data:cached_at_{data['as_of'].isoformat()}"],
+            )
+        except Exception as e:
+            logger.error("[digestion] cache load failed: %s", e)
+            return None
+
     # -- entry point --------------------------------------------------------
 
     async def run(self, filings: Optional[Dict[str, str]] = None) -> DailyMemory:
-        """Full digestion: parallel fetch -> cross-validate -> clean -> memory."""
+        """
+        Full digestion: parallel fetch -> cross-validate -> clean -> memory.
+
+        Fallback ladder: live sources (priority order) -> local cache
+        (flagged stale) -> DataUnavailableError. Stale data is served for
+        situational awareness only; the orchestrator must not trade on it.
+        """
         frames = await self.fetch_parallel()
-        memory = self.build_memory(frames, filings)
+        try:
+            memory = self.build_memory(frames, filings)
+        except SourceError:
+            cached = self.load_cache()
+            if cached is not None:
+                logger.error(
+                    "[digestion] ALL live sources failed - serving STALE cache "
+                    "from %s. Trading must be skipped.", cached.as_of,
+                )
+                return cached
+            raise DataUnavailableError(
+                "All data sources failed and no local cache exists. "
+                "Skipping the trading day - stale guesses are worse than no trades."
+            )
+        self.save_cache(memory)
         logger.info(
             "[digestion] DailyMemory built: source=%s, tickers=%d, flags=%s",
             memory.source_used, len(memory.tickers), memory.quality_flags,

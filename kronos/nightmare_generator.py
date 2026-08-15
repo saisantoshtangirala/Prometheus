@@ -21,6 +21,14 @@ from prometheus.generative.diffusion_simulator import MarketDiffusionSimulator
 
 logger = logging.getLogger(__name__)
 
+COLLAPSE_VARIANCE_THRESHOLD = 1e-5
+INF_CLIP = 1e6
+MIN_PRICE = 0.01
+
+
+class NightmareCollapseError(RuntimeError):
+    """Diffusion mode collapse: futures are (near-)identical even after reseed."""
+
 
 @dataclass
 class NightmareBuffer:
@@ -42,6 +50,16 @@ class NightmareBuffer:
         """The k futures with the worst portfolio P&L."""
         idx = torch.argsort(self.portfolio_pnl)[:k]
         return self.futures[idx]
+
+    def to_price_paths(self, initial_prices: torch.Tensor) -> torch.Tensor:
+        """
+        Convert return futures to price paths, clamped at MIN_PRICE ($0.01).
+        A simulated black swan may take returns below -100%; prices must
+        never go negative (NIG-04).
+        """
+        cum = (1.0 + self.futures).cumprod(dim=1)          # [N, T, A]
+        prices = initial_prices.view(1, 1, -1) * cum
+        return prices.clamp(min=MIN_PRICE)
 
 
 class NightmareGenerator:
@@ -99,18 +117,25 @@ class NightmareGenerator:
         bias = float(self.cfg.nightmare.worst_case_bias)
         n_oversample = int(n_total * (1.0 + bias))
 
-        chunks = []
-        generated = 0
-        while generated < n_oversample:
-            n = min(batch, n_oversample - generated)
-            cond = condition.repeat(n, 1)
-            paths = self.simulator.generate(
-                n_scenarios=n, condition=cond,
-                seed=(seed + generated) if seed is not None else None,
+        pool = self._generate_pool(n_oversample, batch, condition, seed)
+        pool = self._sanitize(pool)
+
+        # NIG-02: mode-collapse detection -> reseed once -> bootstrap fallback
+        if float(pool.var().item()) < COLLAPSE_VARIANCE_THRESHOLD:
+            logger.error(
+                "[nightmare] diffusion collapse (var=%.2e) - reseeding",
+                float(pool.var().item()),
             )
-            chunks.append(paths)
-            generated += n
-        pool = torch.cat(chunks, dim=0)                    # [pool, T, A]
+            reseed = (seed or 0) + 7919
+            pool = self._sanitize(
+                self._generate_pool(n_oversample, batch, condition, reseed)
+            )
+            if float(pool.var().item()) < COLLAPSE_VARIANCE_THRESHOLD:
+                logger.critical(
+                    "[nightmare] collapse persists after reseed - "
+                    "falling back to historical bootstrap"
+                )
+                return self._bootstrap_from_history(memory, n_total, weights)
 
         # Portfolio P&L per future: sum over time of weighted returns
         pnl = (pool * weights.view(1, 1, -1)).sum(dim=(1, 2))   # [pool]
@@ -135,9 +160,82 @@ class NightmareGenerator:
             buffer.n_futures, n_adversarial, n_random,
             buffer.variance, float(buffer.portfolio_pnl.min()),
         )
-        if buffer.variance <= 0:
-            raise RuntimeError(
-                "Nightmare buffer has zero variance - diffusion collapse. "
-                "Refusing to evolve against identical futures."
-            )
         return buffer
+
+    # -- resilience helpers -------------------------------------------------
+
+    def _generate_pool(
+        self, n_total: int, batch: int, condition: torch.Tensor,
+        seed: Optional[int],
+    ) -> torch.Tensor:
+        """
+        Batched generation with OOM back-off (NIG-01): a MemoryError or CUDA
+        OOM halves the batch size and retries instead of dying.
+        """
+        chunks = []
+        generated = 0
+        current_batch = batch
+        while generated < n_total:
+            n = min(current_batch, n_total - generated)
+            cond = condition.repeat(n, 1)
+            try:
+                paths = self.simulator.generate(
+                    n_scenarios=n, condition=cond,
+                    seed=(seed + generated) if seed is not None else None,
+                )
+            except (MemoryError, torch.cuda.OutOfMemoryError) as e:
+                if current_batch <= 1:
+                    raise
+                current_batch = max(1, current_batch // 2)
+                logger.warning(
+                    "[nightmare] OOM at batch=%d - reducing to %d (%s)",
+                    n, current_batch, type(e).__name__,
+                )
+                continue
+            chunks.append(paths)
+            generated += n
+        return torch.cat(chunks, dim=0)
+
+    @staticmethod
+    def _sanitize(pool: torch.Tensor) -> torch.Tensor:
+        """NIG-03: NaN -> 0.0, +/-inf -> +/-INF_CLIP, with a critical log."""
+        n_nan = int(torch.isnan(pool).sum().item())
+        n_inf = int(torch.isinf(pool).sum().item())
+        if n_nan or n_inf:
+            logger.critical(
+                "[nightmare] sanitizing generated futures: %d NaN, %d inf",
+                n_nan, n_inf,
+            )
+            pool = torch.nan_to_num(pool, nan=0.0, posinf=INF_CLIP, neginf=-INF_CLIP)
+        return pool
+
+    def _bootstrap_from_history(
+        self, memory, n_total: int, weights: torch.Tensor
+    ) -> NightmareBuffer:
+        """
+        Last-resort futures: block-bootstrap resampling of historical returns.
+        Not adversarial, but statistically honest - and never degenerate.
+        """
+        horizon = self.cfg.nightmare.horizon_days
+        history = torch.tensor(
+            memory.returns_window(self.cfg.data.lookback_days),
+            dtype=torch.float32,
+        )                                                   # [H, A]
+        n_hist = history.shape[0]
+        if n_hist < 2:
+            raise NightmareCollapseError(
+                "Diffusion collapsed and history is too short to bootstrap."
+            )
+        idx = torch.randint(0, n_hist, (n_total, horizon))
+        futures = history[idx]                              # [N, T, A]
+        # Jitter so resampled rows are never bit-identical
+        futures = futures + torch.randn_like(futures) * history.std() * 0.1
+        pnl = (futures * weights.view(1, 1, -1)).sum(dim=(1, 2))
+        logger.warning(
+            "[nightmare] bootstrap fallback produced %d futures (var=%.6f)",
+            n_total, float(futures.var().item()),
+        )
+        return NightmareBuffer(
+            futures=futures, portfolio_pnl=pnl,
+            condition_vector=torch.zeros(1),
+        )

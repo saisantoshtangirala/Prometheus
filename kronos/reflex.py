@@ -21,9 +21,12 @@ from collections import deque
 import numpy as np
 import torch
 
+from prometheus.neuro.neuromodulation import CortisolSystem
 from prometheus.neuro.spiking_network import SpikingMarketEncoder
 
 logger = logging.getLogger(__name__)
+
+FLASH_CRASH_DROP_PCT = 0.20    # single-tick drop that triggers per-asset lockout
 
 
 # ---------------------------------------------------------------------------
@@ -165,12 +168,20 @@ class ReflexDecision:
     microstructure_alerts: Dict[str, MicrostructureSignal] = field(
         default_factory=dict
     )
+    asset_caps: Dict[str, float] = field(default_factory=dict)
+    fallback_mode: bool = False    # REF-04: SNN OOM -> lookup-table signals
 
 
 class ReflexArc:
     """
     Market-hours inference path. NO training happens here - the SNN weights
     were frozen at 06:00 when the daily cycle finished.
+
+    Two independent kill-switches:
+      - RegimeSwitchGate: market-wide VIX 2-sigma spike -> global cap 0.0
+      - Per-asset cortisol: a single ticker crashing >FLASH_CRASH_DROP_PCT in
+        one tick locks THAT asset only (existing per-asset CortisolSystem),
+        so one stock's flash crash does not freeze the whole book.
     """
 
     def __init__(self, config, snn: Optional[SpikingMarketEncoder] = None):
@@ -184,6 +195,35 @@ class ReflexArc:
         self.snn.eval()
         self.gate = RegimeSwitchGate(config)
         self.order_book = OrderBookSimulator(config)
+        # Per-asset flash-crash lockout, bar-based (existing Prometheus system)
+        lockout_bars = int(config.reflex.lockout_minutes)  # 1 bar = 1 minute
+        self.cortisol = CortisolSystem(
+            hidden_size=16, lockout_duration=lockout_bars
+        )
+        self._prev_prices: Dict[str, float] = {}
+
+    # -- per-asset flash-crash handling (REF-01 / REF-02) -------------------
+
+    def _check_flash_crashes(self, bar_prices: Dict[str, float]) -> None:
+        for ticker, price in bar_prices.items():
+            prev = self._prev_prices.get(ticker)
+            if prev is not None and prev > 0:
+                change = (price - prev) / prev
+                if change < -FLASH_CRASH_DROP_PCT:
+                    logger.warning(
+                        "[reflex] FLASH CRASH %s: %.1f%% in one tick - "
+                        "asset locked for %d bars",
+                        ticker, change * 100.0,
+                        self.cortisol.lockout_duration,
+                    )
+                    self.cortisol.trigger_flash_crash_lockout(asset=ticker)
+            self._prev_prices[ticker] = price
+
+    def asset_position_cap(self, ticker: str) -> float:
+        """0.0 while the asset's flash-crash lockout is active, else gate cap."""
+        if self.cortisol._asset_fear.get(ticker, False):
+            return 0.0
+        return self.gate.position_cap
 
     def infer(
         self,
@@ -196,17 +236,33 @@ class ReflexArc:
         """One low-latency inference tick. Budget: reflex.inference_budget_ms."""
         t0 = time.perf_counter()
 
-        # 1. Regime gate first - a panic print must never wait on the SNN.
+        # 1. Kill-switches first - a panic print must never wait on the SNN.
         gate_state = self.gate.update(vix_value, now=now)
+        if bar_prices:
+            self._check_flash_crashes(bar_prices)
+        self.cortisol.step_asset_lockouts()      # REF-02: decrement per bar
 
-        # 2. SNN forward (frozen weights)
-        x = torch.tensor(recent_returns, dtype=torch.float32).unsqueeze(0)
-        with torch.no_grad():
-            out = self.snn(x)
-        pred = out[0] if isinstance(out, tuple) else out
-        signals = torch.tanh(pred.squeeze(0)).numpy()
-        if signals.ndim > 1:
-            signals = signals[-1]
+        # 2. SNN forward (frozen weights); REF-04: OOM falls back to a
+        #    momentum lookup instead of killing market-hour operations.
+        fallback_mode = False
+        try:
+            x = torch.tensor(recent_returns, dtype=torch.float32).unsqueeze(0)
+            with torch.no_grad():
+                out = self.snn(x)
+            pred = out[0] if isinstance(out, tuple) else out
+            signals = torch.tanh(pred.squeeze(0)).numpy()
+            if signals.ndim > 1:
+                signals = signals[-1]
+        except (MemoryError, torch.cuda.OutOfMemoryError) as e:
+            logger.critical(
+                "[reflex] SNN OOM (%s) - switching to momentum lookup "
+                "fallback", type(e).__name__,
+            )
+            fallback_mode = True
+            # Pre-computed lookup: sign of recent mean return, half strength
+            signals = np.tanh(
+                np.asarray(recent_returns).mean(axis=0) * 50.0
+            ) * 0.5
 
         # 3. Microstructure scan
         alerts: Dict[str, MicrostructureSignal] = {}
@@ -217,9 +273,16 @@ class ReflexArc:
                 if sig.alert:
                     alerts[ticker] = sig
 
-        # 4. Apply the gate: cap of 0 zeroes any NEW long signal
+        # 4. Apply the global gate: cap of 0 zeroes any NEW long signal
         if gate_state.position_cap == 0.0:
             signals = np.minimum(signals, 0.0)   # longs killed, exits allowed
+
+        # 5. Per-asset caps (flash-crashed tickers get 0.0)
+        tickers = list(self.cfg.data.tickers)
+        asset_caps = {t: self.asset_position_cap(t) for t in tickers}
+        for i, ticker in enumerate(tickers):
+            if i < len(signals) and asset_caps.get(ticker, 1.0) == 0.0:
+                signals[i] = min(signals[i], 0.0)
 
         latency_ms = (time.perf_counter() - t0) * 1000.0
         if latency_ms > float(self.cfg.reflex.inference_budget_ms):
@@ -234,4 +297,6 @@ class ReflexArc:
             regime=gate_state.regime,
             latency_ms=latency_ms,
             microstructure_alerts=alerts,
+            asset_caps=asset_caps,
+            fallback_mode=fallback_mode,
         )

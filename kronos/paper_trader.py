@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import os
 import sqlite3
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
@@ -19,6 +20,9 @@ from typing import Dict, List, Optional
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+MAX_IMPACT_SLIPPAGE = 0.05      # 5% hard cap on market-impact slippage
+BANKRUPTCY_PRICE = 0.001        # below this, the position is written off
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS trades (
@@ -84,20 +88,44 @@ class PaperTrader:
 
         self.db_path = db_path or config.trading.db_path
         os.makedirs(os.path.dirname(self.db_path) or ".", exist_ok=True)
-        self._conn = sqlite3.connect(self.db_path)
-        self._conn.executescript(SCHEMA)
-        self._conn.commit()
+        # PAP-05: allow use from worker threads; a lock serializes writes so
+        # concurrent audit/trade inserts never hit "database is locked".
+        self._conn = sqlite3.connect(
+            self.db_path, check_same_thread=False, isolation_level="IMMEDIATE",
+        )
+        self._db_lock = threading.Lock()
+        with self._db_lock:
+            self._conn.executescript(SCHEMA)
+            self._conn.commit()
 
     # -- slippage -----------------------------------------------------------
 
-    def slippage_pct(self, bar_volume: float) -> float:
-        """Liquidity-tiered slippage from config thresholds."""
+    def slippage_pct(
+        self, bar_volume: float, trade_value: Optional[float] = None,
+        avg_dollar_volume: Optional[float] = None,
+    ) -> float:
+        """
+        Slippage model.
+
+        Base: liquidity-tiered percentage from config thresholds.
+        PAP-01 market impact: when avg_dollar_volume is known, an impact term
+        trade_value / avg_dollar_volume * 0.01 is added, and the total is
+        capped at MAX_IMPACT_SLIPPAGE (5%). A $100k order against $50k of
+        average daily dollar volume therefore pays 2% impact on top of the
+        liquidity tier, never more than 5% total.
+        """
         s = self.cfg.trading.slippage
         if bar_volume >= float(s.high_liquidity_min_volume):
-            return float(s.high_liquidity_pct) / 100.0
-        if bar_volume >= float(s.mid_liquidity_min_volume):
-            return float(s.mid_liquidity_pct) / 100.0
-        return float(s.low_liquidity_pct) / 100.0
+            base = float(s.high_liquidity_pct) / 100.0
+        elif bar_volume >= float(s.mid_liquidity_min_volume):
+            base = float(s.mid_liquidity_pct) / 100.0
+        else:
+            base = float(s.low_liquidity_pct) / 100.0
+
+        if trade_value is not None and avg_dollar_volume:
+            impact = (trade_value / avg_dollar_volume) * 0.01
+            return min(MAX_IMPACT_SLIPPAGE, base + impact)
+        return base
 
     # -- portfolio math -----------------------------------------------------
 
@@ -126,11 +154,17 @@ class PaperTrader:
         price: float,
         bar_volume: float,
         position_cap: float = 1.0,     # reflex gate cap (0.0 in panic)
+        avg_dollar_volume: Optional[float] = None,  # enables impact slippage
     ) -> Optional[Fill]:
         """
         Move the position toward target_weight, respecting BOTH the Kelly cap
-        (trading.max_position_pct) and the reflex gate cap.
+        (trading.max_position_pct) and the reflex gate cap. Short sales are
+        supported: a negative target_weight holds negative shares (PAP-03).
         """
+        if price <= BANKRUPTCY_PRICE:
+            self.write_off(day, ticker, price)
+            return None
+
         self.last_prices[ticker] = price
         kelly_cap = float(self.cfg.trading.max_position_pct)
         effective_cap = min(kelly_cap, kelly_cap * position_cap) if target_weight > 0 \
@@ -146,7 +180,10 @@ class PaperTrader:
             return None
 
         side = "buy" if delta > 0 else "sell"
-        slip = self.slippage_pct(bar_volume)
+        slip = self.slippage_pct(
+            bar_volume, trade_value=abs(delta) * price,
+            avg_dollar_volume=avg_dollar_volume,
+        )
         fill_price = price * (1 + slip) if side == "buy" else price * (1 - slip)
         notional = abs(delta) * fill_price
 
@@ -168,6 +205,26 @@ class PaperTrader:
         )
         self._record_trade(day, fill)
         return fill
+
+    def write_off(self, day: int, ticker: str, price: float = 0.0) -> None:
+        """
+        PAP-04: bankruptcy/delisting. The position's value is set to zero,
+        the loss is realized in equity, and the event is audit-logged.
+        No division by zero anywhere downstream.
+        """
+        shares = self.positions.pop(ticker, 0.0)
+        if shares == 0.0:
+            self.last_prices[ticker] = max(price, 0.0)
+            return
+        loss = shares * self.last_prices.get(ticker, 0.0)
+        self.last_prices[ticker] = 0.0
+        logger.warning(
+            "[trader] WRITE-OFF %s: %.2f shares, realized loss ~$%.2f",
+            ticker, shares, loss,
+        )
+        self.audit(day, "write-off",
+                   f"{ticker}: {shares:.4f} shares written off at "
+                   f"price={price:.6f}, est. loss ${loss:.2f}")
 
     # -- daily bookkeeping --------------------------------------------------
 
@@ -210,12 +267,13 @@ class PaperTrader:
             "directional_accuracy": dir_acc, "n_trades": n_trades,
             "max_position_pct": max_pos,
         }
-        self._conn.execute(
-            "INSERT OR REPLACE INTO daily_performance VALUES (?,?,?,?,?,?,?,?)",
-            (day, datetime.now(timezone.utc).isoformat(), eq, pnl, sharpe,
-             dir_acc, n_trades, max_pos),
-        )
-        self._conn.commit()
+        with self._db_lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO daily_performance VALUES (?,?,?,?,?,?,?,?)",
+                (day, datetime.now(timezone.utc).isoformat(), eq, pnl, sharpe,
+                 dir_acc, n_trades, max_pos),
+            )
+            self._conn.commit()
         logger.info(
             "[trader] day %d closed: equity=%.2f pnl=%+.2f sharpe=%s trades=%d",
             day, eq, pnl, f"{sharpe:.2f}" if sharpe else "n/a", n_trades,
@@ -224,24 +282,26 @@ class PaperTrader:
 
     def audit(self, day: Optional[int], phase: str, message: str) -> None:
         """Infinite logging (non-negotiable #4): every decision on the record."""
-        self._conn.execute(
-            "INSERT INTO audit_log (ts, day, phase, message) VALUES (?,?,?,?)",
-            (datetime.now(timezone.utc).isoformat(), day, phase, message),
-        )
-        self._conn.commit()
+        with self._db_lock:
+            self._conn.execute(
+                "INSERT INTO audit_log (ts, day, phase, message) VALUES (?,?,?,?)",
+                (datetime.now(timezone.utc).isoformat(), day, phase, message),
+            )
+            self._conn.commit()
 
     # -- internals ----------------------------------------------------------
 
     def _record_trade(self, day: int, fill: Fill) -> None:
-        self._conn.execute(
-            "INSERT INTO trades (ts, day, ticker, side, quantity, signal_price,"
-            " fill_price, slippage_pct, notional, position_after)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (datetime.now(timezone.utc).isoformat(), day, fill.ticker, fill.side,
-             fill.quantity, fill.signal_price, fill.fill_price, fill.slippage_pct,
-             fill.notional, self.positions.get(fill.ticker, 0.0)),
-        )
-        self._conn.commit()
+        with self._db_lock:
+            self._conn.execute(
+                "INSERT INTO trades (ts, day, ticker, side, quantity, signal_price,"
+                " fill_price, slippage_pct, notional, position_after)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (datetime.now(timezone.utc).isoformat(), day, fill.ticker, fill.side,
+                 fill.quantity, fill.signal_price, fill.fill_price, fill.slippage_pct,
+                 fill.notional, self.positions.get(fill.ticker, 0.0)),
+            )
+            self._conn.commit()
 
     def close(self) -> None:
         self._conn.close()
