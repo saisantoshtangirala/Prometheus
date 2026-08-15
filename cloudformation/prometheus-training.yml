@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  Prometheus Causal Brain — Training Infrastructure.
+  Prometheus Causal Brain - Training Infrastructure.
   Creates S3 bucket, IAM role + instance profile, security group, and a
   reusable EC2 Launch Template.  Optionally launches a GPU Spot instance
   that runs the full training pipeline and self-terminates when done.
@@ -23,15 +23,15 @@ Parameters:
     Default: ""
     Description: >
       EC2 Key Pair name for SSH access (optional).
-      Leave blank to skip — the instance will still train and push to S3.
-      Create one in EC2 → Key Pairs if you need to SSH into the instance.
+      Leave blank to skip - the instance will still train and push to S3.
+      Create one in EC2 -> Key Pairs if you need to SSH into the instance.
 
   VpcId:
     Type: AWS::EC2::VPC::Id
     Description: >
       VPC to deploy the security group into.
-      In the console this shows a dropdown — pick your default VPC.
-      To find it: VPC Console → Your VPCs → look for the one marked Default.
+      In the console this shows a dropdown - pick your default VPC.
+      To find it: VPC Console -> Your VPCs -> look for the one marked Default.
 
   AllowedSSHCidr:
     Type: String
@@ -58,16 +58,16 @@ Parameters:
       - g4dn.2xlarge   # T4  16 GB VRAM  8 vCPU  ~$0.23/hr spot
       - g5.2xlarge     # A10G 24 GB VRAM  8 vCPU  ~$0.34/hr spot
       - p3.2xlarge     # V100 16 GB VRAM  8 vCPU  ~$0.90/hr spot
-      - p3.8xlarge     # 4×V100 64 GB VRAM 32 vCPU ~$3.60/hr spot
-      - t3.medium      # CPU only — for smoke-test (use --device cpu)
+      - p3.8xlarge     # 4xV100 64 GB VRAM 32 vCPU ~$3.60/hr spot
+      - t3.medium      # CPU only - for smoke-test (use --device cpu)
 
   AmiId:
     Type: String
     Default: ""
     Description: >
       Deep Learning AMI ID for your region (only needed when LaunchTraining=true).
-      Find the latest at: EC2 Console → AMIs → Public images →
-      search "Deep Learning AMI GPU PyTorch" → filter by your region.
+      Find the latest at: EC2 Console -> AMIs -> Public images ->
+      search "Deep Learning AMI GPU PyTorch" -> filter by your region.
       Example us-east-1: ami-0f28f8b1b6f9b8c3e
 
   SpotMaxPrice:
@@ -75,14 +75,14 @@ Parameters:
     Default: ""
     Description: >
       Maximum Spot price in USD/hr (e.g. "0.25").
-      Leave EMPTY to use On-Demand pricing (no interruption risk, ~6× cost).
+      Leave EMPTY to use On-Demand pricing (no interruption risk, ~6x cost).
 
   TrainMode:
     Type: String
     Default: full
     AllowedValues: [pretrain, finetune, meta, evolve, full]
     Description: >
-      full = pretrain → finetune → meta → evolve (recommended).
+      full = pretrain -> finetune -> meta -> evolve (recommended).
       Use individual modes to resume a specific phase.
 
   NAssets:
@@ -162,7 +162,7 @@ Conditions:
 # ---------------------------------------------------------------------------
 Resources:
 
-  # ── S3 Bucket ────────────────────────────────────────────────────────────
+  # -- S3 Bucket ------------------------------------------------------------
   CheckpointBucket:
     Type: AWS::S3::Bucket
     DeletionPolicy: Retain   # keep checkpoints if stack is deleted
@@ -189,7 +189,7 @@ Resources:
         - Key: Project
           Value: Prometheus
 
-  # ── IAM Role ─────────────────────────────────────────────────────────────
+  # -- IAM Role ---------------------------------------------------------------
   PrometheusEC2Role:
     Type: AWS::IAM::Role
     Properties:
@@ -239,12 +239,12 @@ Resources:
       Roles:
         - !Ref PrometheusEC2Role
 
-  # ── Security Group ────────────────────────────────────────────────────────
+  # -- Security Group --------------------------------------------------------
   TrainingSG:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupName: prometheus-training-sg
-      GroupDescription: "Prometheus training instances — SSH inbound, full outbound"
+      GroupDescription: "Prometheus training instances - SSH inbound, full outbound"
       VpcId: !Ref VpcId
       SecurityGroupIngress:
         - Description: SSH from allowed CIDR
@@ -262,7 +262,7 @@ Resources:
         - Key: Project
           Value: Prometheus
 
-  # ── Launch Template ───────────────────────────────────────────────────────
+  # -- Launch Template ---------------------------------------------------------
   # Reusable template for re-launching training without CloudFormation.
   # Use: aws ec2 run-instances --launch-template LaunchTemplateId=<id>,Version=<v>
   PrometheusLaunchTemplate:
@@ -298,7 +298,7 @@ Resources:
         # UserData is set on the training instance directly (see below)
         # so we can substitute the actual job ID at launch time.
 
-  # ── Training Instance ─────────────────────────────────────────────────────
+  # -- Training Instance -------------------------------------------------------
   # Only created when LaunchTraining=true.
   # Self-terminates after pushing checkpoints to S3.
   TrainingInstance:
@@ -334,11 +334,11 @@ Resources:
               echo " Branch:   ${Branch}"
               echo "====================================================="
 
-              # ── Activate PyTorch environment (DLAMI default) ──────────
+              # -- Activate PyTorch environment (DLAMI default) ----------
               source /opt/conda/etc/profile.d/conda.sh
               conda activate pytorch
 
-              # ── Clone repository ──────────────────────────────────────
+              # -- Clone repository --------------------------------------
               if [ -d /opt/prometheus ]; then
                   echo "[setup] Updating existing clone..."
                   cd /opt/prometheus
@@ -354,17 +354,17 @@ Resources:
 
               cd /opt/prometheus
 
-              # ── Install dependencies ──────────────────────────────────
+              # -- Install dependencies ----------------------------------
               echo "[setup] Installing dependencies..."
               pip install -e . -q
               pip install boto3 awscli -q
 
-              # ── Restore cached scenario library if available ──────────
+              # -- Restore cached scenario library if available ----------
               echo "[setup] Syncing scenario cache from S3..."
               aws s3 sync s3://${Bucket}/prometheus/scenarios/ data/scenarios/ \
-                --quiet --no-progress || echo "[setup] No scenario cache found — will regenerate."
+                --quiet --no-progress || echo "[setup] No scenario cache found - will regenerate."
 
-              # ── Run training ──────────────────────────────────────────
+              # -- Run training ------------------------------------------
               echo "[train] Starting training pipeline (mode=${Mode})..."
               python scripts/train.py \
                 --mode        ${Mode}       \
@@ -382,7 +382,7 @@ Resources:
 
               echo "[train] Training complete."
 
-              # ── Push checkpoint to S3 ─────────────────────────────────
+              # -- Push checkpoint to S3 -----------------------------------
               echo "[s3] Pushing checkpoint for job $JOB_ID..."
               python - <<PYEOF
               from prometheus.cloud import CheckpointStore
@@ -396,18 +396,18 @@ Resources:
               print("[s3] Checkpoint upload complete.")
               PYEOF
 
-              # ── Upload training log ───────────────────────────────────
+              # -- Upload training log -------------------------------------
               aws s3 cp /var/log/prometheus-job.log \
                 s3://${Bucket}/prometheus/logs/$JOB_ID/train.log
               echo "[s3] Log uploaded."
 
-              # ── Completion marker ─────────────────────────────────────
+              # -- Completion marker ---------------------------------------
               echo "Job $JOB_ID complete." | \
                 aws s3 cp - s3://${Bucket}/prometheus/logs/$JOB_ID/done.txt
 
               echo "[done] Job $JOB_ID complete. Self-terminating..."
 
-              # ── Self-terminate ────────────────────────────────────────
+              # -- Self-terminate ----------------------------------------
               INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
               aws ec2 terminate-instances \
                 --instance-ids $INSTANCE_ID \
