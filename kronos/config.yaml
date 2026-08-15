@@ -1,0 +1,86 @@
+# =============================================================================
+# Project Kronos - 365-Day Self-Evolving Paper Trading Organism
+# All tunable hyperparameters for the daily lifecycle. No magic numbers in code.
+# =============================================================================
+
+run:
+  total_days: 365
+  timezone: "America/New_York"
+  mode: "paper"                  # paper | replay (no live mode by design)
+  log_dir: "logs"
+  seed: 42
+
+# Daily phase schedule (24h clock, exchange timezone)
+schedule:
+  digestion_start: "00:00"
+  nightmare_start: "02:00"
+  evolution_start: "04:00"
+  adaptation_start: "05:00"
+  report_time: "06:00"
+  market_open: "09:30"
+  market_close: "16:00"
+
+data:
+  tickers: ["SPY", "QQQ", "IWM", "GLD", "TLT", "AAPL", "MSFT", "NVDA", "AMZN", "TSLA"]
+  vix_ticker: "^VIX"
+  lookback_days: 30              # rolling window kept in DailyMemory
+  sources: ["yfinance", "polygon", "alphavantage"]   # priority order
+  cross_validation_tolerance_pct: 1.0   # max % close-price disagreement between sources
+  max_missing_pct: 20.0          # discard a ticker's day if more data is missing
+  kalman_process_noise: 0.001
+  kalman_obs_noise: 0.1
+
+nightmare:
+  n_futures: 10000
+  batch_size: 500                # generate in batches to bound memory
+  horizon_days: 5
+  worst_case_bias: 0.7           # fraction of futures conditioned adversarially
+  diffusion_steps: 50            # reduced from 1000 for nightly time budget
+  seed: null                     # null = fresh nightmares nightly
+
+evolution:
+  population_size: 20
+  n_generations: 3
+  top_k: 5                       # variants combined into the master ensemble
+  mutation_rate: 0.25
+  crossover_rate: 0.5
+  elitism: 2
+  fallback_population_size: 6    # graceful degradation (local machine)
+  fallback_generations: 1
+
+adaptation:
+  inner_lr: 0.01
+  n_inner_steps: 3               # exactly 3 - the MAML contract
+  support_days: 3                # adapt on last 3 trading days
+
+reflex:
+  inference_budget_ms: 1000
+  vix_spike_sigma: 2.0           # kill-gate threshold in rolling std devs
+  vix_window: 20                 # rolling window (bars) for mean/std
+  lockout_minutes: 30
+  imbalance_threshold: 0.65      # order-book imbalance alert level
+
+trading:
+  initial_capital: 100000.0
+  max_position_pct: 0.25         # Kelly cap - never exceeded
+  kelly_fraction: 0.5
+  slippage:
+    high_liquidity_pct: 0.05     # SPY-class
+    mid_liquidity_pct: 0.15
+    low_liquidity_pct: 0.50      # thin names
+    high_liquidity_min_volume: 10000000
+    mid_liquidity_min_volume: 1000000
+  commission_per_trade: 0.0      # paper trading
+  db_path: "logs/trades.db"
+
+orchestrator:
+  max_retries_per_phase: 1       # retry once, then log fatal and move on
+  veto_file: "veto.txt"
+  veto_delay_hours: 24           # human overrides take 24h to apply
+  heartbeat_minutes: 60          # audit-trail snapshot cadence
+  checkpoint_dir: "logs/models"
+  report_dir: "logs/reports"
+
+reporting:
+  top_movers: 3
+  volatility_windows: [5, 20]

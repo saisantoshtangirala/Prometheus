@@ -69,6 +69,12 @@ loguru>=0.7.0
 rich>=13.6.0
 typer>=0.9.0
 
+# Kronos (365-day orchestration layer)
+apscheduler>=3.10.0
+sqlalchemy>=2.0.0
+pyyaml>=6.0
+requests>=2.31.0
+
 # Testing
 pytest>=7.4.0
 pytest-asyncio>=0.21.0
