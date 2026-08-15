@@ -19,10 +19,11 @@ Parameters:
     ConstraintDescription: "Lowercase letters, numbers and hyphens only."
 
   KeyPairName:
-    Type: AWS::EC2::KeyPair::KeyName
+    Type: String
     Description: >
-      EC2 Key Pair for SSH access.
-      Create one in EC2 → Key Pairs before deploying this stack.
+      EC2 Key Pair name for SSH access.
+      Create one in EC2 → Key Pairs before launching training instances.
+      Leave blank if you do not need SSH access.
 
   AllowedSSHCidr:
     Type: String
