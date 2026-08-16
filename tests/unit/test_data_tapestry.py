@@ -58,6 +58,58 @@ class TestDT01FetchValidTicker:
 
 
 # ---------------------------------------------------------------------------
+# Issue fix: one delisted/unresolvable ticker must not wipe out every
+# other ticker's returns. get_returns() previously called dropna() with
+# how='any' (the default), so a single all-NaN column (e.g. a delisted
+# ticker like the old "DXY" symbol) dropped every row for every ticker —
+# n_bars silently became 0 and finetune trained on nothing for 20 epochs
+# without raising or warning.
+# ---------------------------------------------------------------------------
+
+class TestDT05OneBadTickerDoesNotWipeAllData:
+    def _multi_ticker_prices(self, n_bars: int = 100) -> pd.DataFrame:
+        rng = np.random.default_rng(3)
+        dates = pd.bdate_range("2024-01-01", periods=n_bars)
+        good = 100 * np.exp(np.cumsum(rng.normal(0.0005, 0.01, n_bars)))
+        return pd.DataFrame(
+            {"SPY": good, "QQQ": good * 1.1, "DEAD_TICKER": np.nan},
+            index=dates,
+        )
+
+    def test_all_nan_column_dropped_not_all_rows(self):
+        fetcher = MarketDataFetcher()
+        prices = self._multi_ticker_prices()
+        returns = fetcher.get_returns(prices)
+        assert len(returns) > 0, (
+            "One all-NaN ticker column must not zero out every row"
+        )
+        assert "DEAD_TICKER" not in returns.columns
+        assert "SPY" in returns.columns and "QQQ" in returns.columns
+
+    def test_good_tickers_retain_expected_row_count(self):
+        fetcher = MarketDataFetcher()
+        prices = self._multi_ticker_prices(n_bars=100)
+        returns = fetcher.get_returns(prices)
+        # 100 bars - 1 (the first row is NaN after shift(1) for returns)
+        assert len(returns) == 99
+
+    def test_partial_nan_below_threshold_is_kept(self):
+        fetcher = MarketDataFetcher()
+        prices = self._multi_ticker_prices(n_bars=100)
+        prices.loc[prices.index[:10], "QQQ"] = np.nan  # 10% missing, below default 50%
+        returns = fetcher.get_returns(prices)
+        assert "QQQ" in returns.columns, "A mostly-good column must not be dropped"
+
+    def test_majority_nan_column_is_dropped(self):
+        fetcher = MarketDataFetcher()
+        prices = self._multi_ticker_prices(n_bars=100)
+        prices.loc[prices.index[:60], "QQQ"] = np.nan  # 60% missing, above 50%
+        returns = fetcher.get_returns(prices)
+        assert "QQQ" not in returns.columns, "A majority-NaN column must be dropped"
+        assert "SPY" in returns.columns
+
+
+# ---------------------------------------------------------------------------
 # DT-02: fetch invalid ticker — TickerNotFoundError + synthetic fallback
 # ---------------------------------------------------------------------------
 

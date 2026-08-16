@@ -30,7 +30,7 @@ EQUITY_TICKERS = [
     "GLD", "SLV", "USO", "TLT", "HYG", "LQD",
 ]
 
-FX_TICKERS = ["USDJPY=X", "EURUSD=X", "GBPUSD=X", "DXY"]
+FX_TICKERS = ["USDJPY=X", "EURUSD=X", "GBPUSD=X", "DX-Y.NYB"]
 
 CRYPTO_TICKERS = ["BTC-USD", "ETH-USD"]
 
@@ -112,8 +112,18 @@ class MarketDataFetcher:
         self,
         data: pd.DataFrame,
         log_returns: bool = True,
+        max_col_nan_pct: float = 0.5,
     ) -> pd.DataFrame:
-        """Compute per-bar returns (log or simple) from Close prices."""
+        """
+        Compute per-bar returns (log or simple) from Close prices.
+
+        A single delisted/unresolvable ticker (all-NaN column) must not zero
+        out every other ticker's data. Columns missing more than
+        max_col_nan_pct of their values are dropped BEFORE the row-wise
+        dropna(), so one bad ticker can no longer wipe out the entire
+        training window - it previously did, since dropna(how='any') drops
+        any row containing a NaN in ANY column.
+        """
         if "Close" in data.columns.get_level_values(0):
             close = data["Close"]
         else:
@@ -123,6 +133,14 @@ class MarketDataFetcher:
             returns = np.log(close / close.shift(1))
         else:
             returns = close.pct_change()
+
+        bad_cols = returns.columns[returns.isna().mean() > max_col_nan_pct]
+        if len(bad_cols) > 0:
+            logger.warning(
+                "Dropping tickers with insufficient data (>%.0f%% missing): %s",
+                max_col_nan_pct * 100, list(bad_cols),
+            )
+            returns = returns.drop(columns=bad_cols)
 
         return returns.dropna()
 
