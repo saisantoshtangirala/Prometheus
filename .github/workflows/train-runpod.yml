@@ -1,0 +1,93 @@
+name: Train on RunPod GPU
+
+# Manual-trigger GPU training against a PERSISTENT RunPod pod (created
+# once by hand, see README_KRONOS.md "GitHub CI/CD" setup). The workflow
+# starts the pod, trains, pulls the checkpoint back as a workflow
+# artifact, and ALWAYS stops the pod again (even on failure) - stopping
+# (not terminating) keeps the disk/image but pauses GPU billing, and
+# keeps the pod's SSH host/port stable run to run so no fragile output
+# parsing is required here.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "train.py --mode"
+        required: false
+        default: "full"
+        type: choice
+        options: [pretrain, finetune, meta, evolve, full]
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - name: Install runpodctl
+        run: |
+          wget -qO runpodctl \
+            https://github.com/runpod/runpodctl/releases/latest/download/runpodctl-linux-amd64
+          chmod +x runpodctl
+          sudo mv runpodctl /usr/local/bin/
+          runpodctl config --apiKey "${{ secrets.RUNPOD_API_KEY }}"
+
+      - name: Load RunPod SSH key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.RUNPOD_SSH_PRIVATE_KEY }}
+
+      - name: Start the pod
+        run: runpodctl start pod "${{ secrets.RUNPOD_POD_ID }}"
+
+      - name: Wait for SSH to come up
+        run: |
+          for i in $(seq 1 30); do
+            if ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 \
+                   -p "${{ secrets.RUNPOD_PORT }}" \
+                   "${{ secrets.RUNPOD_USER }}@${{ secrets.RUNPOD_HOST }}" \
+                   'echo ready' 2>/dev/null; then
+              echo "Pod is reachable."
+              exit 0
+            fi
+            echo "Waiting for pod SSH ($i/30)..."
+            sleep 10
+          done
+          echo "::error::Pod never became reachable over SSH within 5 minutes."
+          exit 1
+
+      - name: Train on the pod
+        run: |
+          set -euo pipefail
+          ssh -o StrictHostKeyChecking=accept-new \
+              -p "${{ secrets.RUNPOD_PORT }}" \
+              "${{ secrets.RUNPOD_USER }}@${{ secrets.RUNPOD_HOST }}" '
+            set -euo pipefail
+            cd /workspace 2>/dev/null || cd ~
+            if [ -d prometheus/.git ]; then
+              cd prometheus && git pull origin claude/prometheus-causal-market-ol2pau
+            else
+              git clone --branch claude/prometheus-causal-market-ol2pau \
+                https://github.com/saisantoshtangirala/prometheus prometheus
+              cd prometheus
+            fi
+            pip install -q -e .
+            python scripts/train.py --mode "'"${{ inputs.mode }}"'" --device cuda
+            tar czf /tmp/checkpoints.tar.gz checkpoints
+          '
+          scp -P "${{ secrets.RUNPOD_PORT }}" \
+              "${{ secrets.RUNPOD_USER }}@${{ secrets.RUNPOD_HOST }}:/tmp/checkpoints.tar.gz" \
+              ./checkpoints.tar.gz
+
+      - name: Upload checkpoint artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kronos-checkpoints-${{ github.run_id }}
+          path: checkpoints.tar.gz
+          retention-days: 30
+
+      - name: Stop pod (ALWAYS - this is the billing safety net)
+        if: always()
+        run: |
+          runpodctl stop pod "${{ secrets.RUNPOD_POD_ID }}" || \
+            echo "::error::Pod ${{ secrets.RUNPOD_POD_ID }} may still be running - stop it manually in the RunPod console NOW to avoid runaway billing."

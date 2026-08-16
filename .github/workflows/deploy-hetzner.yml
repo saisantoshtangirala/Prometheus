@@ -1,0 +1,49 @@
+name: Deploy Orchestrator to Hetzner
+
+# Runs after every push to the working branch: tests must pass first,
+# then the Hetzner box pulls latest code and restarts the Kronos
+# orchestrator service. Safe to restart mid-cycle - Kronos's ORC-07
+# checkpoint/resume logic means the orchestrator picks up exactly where
+# it left off (see kronos/orchestrator.py: save_checkpoint/load_checkpoint).
+
+on:
+  push:
+    branches: ["claude/prometheus-causal-market-ol2pau"]
+  workflow_dispatch: {}
+
+jobs:
+  test:
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Load Hetzner deploy key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.HETZNER_SSH_KEY }}
+
+      - name: Trust Hetzner host key
+        run: ssh-keyscan -H "${{ secrets.HETZNER_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Pull latest code and restart the orchestrator
+        run: |
+          ssh "${{ secrets.HETZNER_USER }}@${{ secrets.HETZNER_HOST }}" '
+            set -euo pipefail
+            cd /opt/prometheus
+            git fetch origin claude/prometheus-causal-market-ol2pau
+            git checkout claude/prometheus-causal-market-ol2pau
+            git reset --hard origin/claude/prometheus-causal-market-ol2pau
+            source .venv/bin/activate
+            pip install -q -e .
+            systemctl restart kronos.service
+            sleep 5
+            systemctl is-active kronos.service
+          '
+
+      - name: Confirm the service came back healthy
+        run: |
+          ssh "${{ secrets.HETZNER_USER }}@${{ secrets.HETZNER_HOST }}" '
+            journalctl -u kronos.service -n 30 --no-pager
+          '
