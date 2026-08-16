@@ -87,7 +87,10 @@ fi
 source /opt/prometheus/.venv/bin/activate
 pip install -q --upgrade pip
 pip install -q -e . || pip install -q torch numpy scipy scikit-learn networkx pandas
-pip install -q pyyaml
+pip install -q pyyaml yfinance
+# yfinance is under setup.py's optional [full] extra, not the base install -
+# without it, finetune mode silently trains on synthetic data instead of
+# real market history (prometheus/data/market_fetcher.py falls back quietly).
 
 echo "[remote] starting training ($MODE / $DEVICE)..."
 python scripts/train.py --mode "$MODE" --device "$DEVICE" $EXTRA_ARGS \

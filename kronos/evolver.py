@@ -61,6 +61,13 @@ class WeightedEnsemble(nn.Module):
         self.register_buffer("weights", w)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Self-healing device handling: reconcile input against wherever this
+        # ensemble actually lives, rather than requiring every caller to
+        # remember `.to(device)` (a real bug class - see neat_evolver.py
+        # evaluate_fitness/build_best_model, which silently floored every
+        # genome's fitness to -10.0 on GPU runs before this was caught).
+        if x.device != self.weights.device:
+            x = x.to(self.weights.device)
         outputs = torch.stack([m(x) for m in self.members], dim=0)  # [k, ...]
         w = self.weights.view(-1, *([1] * (outputs.dim() - 1)))
         return (outputs * w).sum(dim=0)

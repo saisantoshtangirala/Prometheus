@@ -203,6 +203,7 @@ class NEATArchitectureEvolver:
         """
         model = GenomeDecoder.decode(genome, self.input_dim, self.output_dim)
         X_val, y_val = val_data
+        model = model.to(X_val.device)
         with torch.no_grad():
             try:
                 pred = model(X_val)
@@ -211,7 +212,7 @@ class NEATArchitectureEvolver:
                 pnl = (pred.sign() * y_val).squeeze()  # directional P&L
                 sharpe = float(pnl.mean() / (pnl.std() + 1e-8) * np.sqrt(252))
             except Exception as e:
-                logger.debug("Genome %d failed: %s", genome.genome_id, e)
+                logger.warning("Genome %d failed during evaluation: %s", genome.genome_id, e)
                 sharpe = -10.0
         return sharpe
 
@@ -307,6 +308,7 @@ class NEATArchitectureEvolver:
         """Run evolution and return the best PyTorch model + its genome."""
         best_genome = self.evolve(val_data, loss_fn)
         model = GenomeDecoder.decode(best_genome, self.input_dim, self.output_dim)
+        model = model.to(val_data[0].device)
         return model, best_genome
 
     def save_evolution_history(self, path: str) -> None:

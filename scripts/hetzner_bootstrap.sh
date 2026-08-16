@@ -39,7 +39,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -q --upgrade pip
 pip install -q -e . || pip install -q torch numpy scipy scikit-learn networkx pandas
-pip install -q pyyaml
+pip install -q pyyaml yfinance
 
 echo "=== Installing systemd service ==="
 cat > /etc/systemd/system/kronos.service <<UNIT
