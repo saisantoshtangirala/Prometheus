@@ -119,14 +119,22 @@ Three workflows live in `.github/workflows/`:
 
 | Workflow | Trigger | What it does |
 |---|---|---|
-| `ci.yml` | every push/PR, any branch | Runs the full 266-test suite |
+| `ci.yml` | every push/PR, any branch | Runs the full test suite |
 | `deploy-hetzner.yml` | push to the working branch | Tests must pass, then SSHes into Hetzner, pulls latest code, restarts `kronos.service` |
-| `train-runpod.yml` | manual button (Actions tab) | Starts your RunPod pod, trains, downloads the checkpoint as a workflow artifact, **always** stops the pod again |
+| `train-runpod.yml` | manual button (Actions tab) | Creates a fresh RunPod pod via the REST API, trains, downloads the checkpoint as a workflow artifact, **always terminates the pod** - even on failure |
 
 The Hetzner deploy is safe to fire on every push: Kronos's crash-recovery
 logic (`kronos/orchestrator.py` - `save_checkpoint`/`load_checkpoint`,
 tested by ORC-07) means a mid-cycle `systemctl restart` resumes exactly
 where it left off instead of losing the day.
+
+`train-runpod.yml` is built directly on RunPod's documented REST API
+(`https://rest.runpod.io/v1`, see [docs.runpod.io](https://docs.runpod.io/api-reference/pods/POST/pods)) -
+`POST /pods` to create, `GET /pods/{id}` to poll for a running state and
+read its real IP/port, `DELETE /pods/{id}` to terminate. No CLI, no
+output-parsing, no persistent pod to keep configured between runs: every
+run gets a brand-new pod and it's gone by the time the workflow ends,
+successful or not.
 
 ### Step 1 - Bootstrap the Hetzner server (one time)
 
@@ -143,24 +151,21 @@ where it left off instead of losing the day.
    never your personal key.
 3. Copy the private key block it prints, and note the server's IP.
 
-### Step 2 - Bootstrap a RunPod pod (one time)
+### Step 2 - Get a RunPod API key and register a CI SSH key (one time, no pod needed)
 
-1. In the [RunPod Console](https://runpod.io/console/pods), deploy a pod:
-   template **PyTorch 2.8.0**, GPU **RTX A5000** (or your pick from the
-   cost comparison above), enable **SSH over exposed TCP** in the pod's
-   network settings.
-2. Once running, open the pod's **Connect** panel and copy the
-   "SSH over exposed TCP" details - a real IP and port (not the
-   `xxx@ssh.runpod.io` proxy string, which changes and isn't suited to
-   automation). Note the pod's ID too (shown on the pod card).
-3. Register a dedicated CI keypair with RunPod (Settings -> SSH Public
-   Keys) - don't reuse your personal key:
+Unlike Hetzner, there is nothing to pre-create for RunPod - the workflow
+creates and destroys the pod itself on every run.
+
+1. RunPod Console -> **Settings -> API Keys** -> create a key with
+   **All** permissions (needed to create/delete pods). Copy it.
+2. Register a dedicated CI keypair under **Settings -> SSH Public Keys**
+   - don't reuse your personal key. RunPod bakes every account-level
+   registered key into `authorized_keys` automatically when a new pod
+   boots, which is exactly what the workflow needs:
    ```bash
    ssh-keygen -t ed25519 -N "" -f ~/.ssh/runpod_ci -C "github-actions-runpod"
    cat ~/.ssh/runpod_ci.pub    # paste this into RunPod's SSH Public Keys
    ```
-4. Leave the pod **running** for now - Step 3 wires it up, and after
-   that the workflow starts/stops it for you on every training run.
 
 ### Step 3 - Add GitHub repository secrets
 
@@ -171,12 +176,11 @@ Repo -> **Settings -> Secrets and variables -> Actions -> New repository secret*
 | `HETZNER_HOST` | Hetzner server IP |
 | `HETZNER_USER` | `root` |
 | `HETZNER_SSH_KEY` | the private key `hetzner_bootstrap.sh` printed |
-| `RUNPOD_API_KEY` | RunPod Console -> Settings -> API Keys |
+| `RUNPOD_API_KEY` | the key from RunPod Console -> Settings -> API Keys |
 | `RUNPOD_SSH_PRIVATE_KEY` | contents of `~/.ssh/runpod_ci` (the *private* half) |
-| `RUNPOD_POD_ID` | the pod ID from the RunPod console |
-| `RUNPOD_HOST` | the IP from "SSH over exposed TCP" |
-| `RUNPOD_PORT` | the port from "SSH over exposed TCP" |
-| `RUNPOD_USER` | `root` (RunPod pods default to root) |
+
+Just five secrets total - no pod ID, host, or port to track, since none
+of that exists until the workflow creates it.
 
 ### Step 4 - Verify
 
@@ -184,27 +188,17 @@ Repo -> **Settings -> Secrets and variables -> Actions -> New repository secret*
   should go green, then `deploy-hetzner.yml` deploys automatically.
   Check it landed: `ssh root@<hetzner-ip> "systemctl status kronos"`.
 - **Actions tab -> "Train on RunPod GPU" -> Run workflow** (manual
-  button) to fire off a GPU training run on demand. Watch the log the
-  first time - the RunPod steps use fixed connection secrets from Step 3
-  rather than parsing a freshly-created pod's address, which is the
-  reliable part; if `runpodctl start/stop` ever changes its CLI verbs,
-  that's the one spot to check against `runpodctl --help`.
+  button, pick the GPU type and mode) to fire off a fresh GPU training
+  run on demand. Watch the "Create pod" and "Poll until running" steps
+  the first time - they print the full JSON response from RunPod at
+  each stage, so if anything about the account (spend limits, GPU
+  availability) blocks pod creation, the error is visible immediately
+  rather than hidden behind CLI output.
 - Trained checkpoints download from the workflow run's **Artifacts**
   section (top of the run page), retained 30 days.
-
-### Why train-runpod.yml starts/stops one pod instead of creating a fresh one per run
-
-An earlier design created and destroyed a pod on every run, which is
-tidier in principle but means parsing a brand-new SSH address out of
-`runpodctl` CLI output every single time - a genuinely fragile
-dependency, since exact output formatting isn't something to guess at
-for a tool that changes across versions. Starting/stopping one
-persistent pod keeps its address stable across runs, so the workflow
-only ever calls `runpodctl start pod` / `stop pod` on a known ID -
-verbs stable enough to trust. The tradeoff: a stopped RunPod pod still
-bills a small amount for its container disk while idle (a few cents/day
-for 20GB) - trivial next to GPU-hour costs, and cheaper than dedicated
-hosting.
+- Confirm no pod is left running: RunPod Console -> Pods should be
+  empty after the workflow finishes, success or failure - the
+  terminate step runs unconditionally (`if: always()`).
 
 ## Alternative Deployment: Local Machine + AWS Hybrid
 

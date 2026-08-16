@@ -1,12 +1,18 @@
 name: Train on RunPod GPU
 
-# Manual-trigger GPU training against a PERSISTENT RunPod pod (created
-# once by hand, see README_KRONOS.md "GitHub CI/CD" setup). The workflow
-# starts the pod, trains, pulls the checkpoint back as a workflow
-# artifact, and ALWAYS stops the pod again (even on failure) - stopping
-# (not terminating) keeps the disk/image but pauses GPU billing, and
-# keeps the pod's SSH host/port stable run to run so no fragile output
-# parsing is required here.
+# Fully automated GPU training via RunPod's REST API (docs.runpod.io):
+#   1. POST /v1/pods           - create a fresh pod
+#   2. GET  /v1/pods/{id}      - poll until running, read its real IP:port
+#   3. ssh/scp                 - clone, train, pull the checkpoint back
+#   4. DELETE /v1/pods/{id}    - ALWAYS terminate (even on failure) - a
+#                                 fresh pod every run means zero idle
+#                                 billing between runs, no persistent
+#                                 infrastructure to maintain or forget about
+#
+# Needs only two repo secrets: RUNPOD_API_KEY and RUNPOD_SSH_PRIVATE_KEY
+# (the private half of a keypair registered under RunPod Settings -> SSH
+# Public Keys - RunPod bakes account-level keys into every new pod's
+# authorized_keys at boot automatically).
 
 on:
   workflow_dispatch:
@@ -17,65 +23,109 @@ on:
         default: "full"
         type: choice
         options: [pretrain, finetune, meta, evolve, full]
+      gpu_type:
+        description: "RunPod GPU type ID (exact API name, e.g. from the console's GPU list)"
+        required: false
+        default: "NVIDIA RTX A5000"
+        type: string
+      cloud_type:
+        description: "COMMUNITY (cheaper) or SECURE"
+        required: false
+        default: "COMMUNITY"
+        type: choice
+        options: [COMMUNITY, SECURE]
+
+env:
+  RUNPOD_API: https://rest.runpod.io/v1
 
 jobs:
   train:
     runs-on: ubuntu-latest
     timeout-minutes: 240
     steps:
-      - name: Install runpodctl
-        run: |
-          wget -qO runpodctl \
-            https://github.com/runpod/runpodctl/releases/latest/download/runpodctl-linux-amd64
-          chmod +x runpodctl
-          sudo mv runpodctl /usr/local/bin/
-          runpodctl config --apiKey "${{ secrets.RUNPOD_API_KEY }}"
-
       - name: Load RunPod SSH key
         uses: webfactory/ssh-agent@v0.9.0
         with:
           ssh-private-key: ${{ secrets.RUNPOD_SSH_PRIVATE_KEY }}
 
-      - name: Start the pod
-        run: runpodctl start pod "${{ secrets.RUNPOD_POD_ID }}"
-
-      - name: Wait for SSH to come up
-        run: |
-          for i in $(seq 1 30); do
-            if ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 \
-                   -p "${{ secrets.RUNPOD_PORT }}" \
-                   "${{ secrets.RUNPOD_USER }}@${{ secrets.RUNPOD_HOST }}" \
-                   'echo ready' 2>/dev/null; then
-              echo "Pod is reachable."
-              exit 0
-            fi
-            echo "Waiting for pod SSH ($i/30)..."
-            sleep 10
-          done
-          echo "::error::Pod never became reachable over SSH within 5 minutes."
-          exit 1
-
-      - name: Train on the pod
+      - name: Create pod
+        id: create
         run: |
           set -euo pipefail
-          ssh -o StrictHostKeyChecking=accept-new \
-              -p "${{ secrets.RUNPOD_PORT }}" \
-              "${{ secrets.RUNPOD_USER }}@${{ secrets.RUNPOD_HOST }}" '
-            set -euo pipefail
-            cd /workspace 2>/dev/null || cd ~
-            if [ -d prometheus/.git ]; then
-              cd prometheus && git pull origin claude/prometheus-causal-market-ol2pau
-            else
-              git clone --branch claude/prometheus-causal-market-ol2pau \
-                https://github.com/saisantoshtangirala/prometheus prometheus
-              cd prometheus
+          RESPONSE=$(curl -sS -X POST "$RUNPOD_API/pods" \
+            -H "Authorization: Bearer ${{ secrets.RUNPOD_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "name": "kronos-ci-${{ github.run_id }}",
+              "imageName": "runpod/pytorch:2.8.0-py3.11-cuda12.8.1-devel-ubuntu22.04",
+              "gpuTypeIds": ["${{ inputs.gpu_type }}"],
+              "gpuCount": 1,
+              "cloudType": "${{ inputs.cloud_type }}",
+              "containerDiskInGb": 20,
+              "ports": ["22/tcp"]
+            }')
+          echo "$RESPONSE"
+          POD_ID=$(echo "$RESPONSE" | jq -r '.id')
+          if [ -z "$POD_ID" ] || [ "$POD_ID" = "null" ]; then
+            echo "::error::Pod creation failed - no id in response above."
+            exit 1
+          fi
+          echo "pod_id=$POD_ID" >> "$GITHUB_OUTPUT"
+          echo "Created pod: $POD_ID"
+
+      - name: Poll until the pod is running and reachable
+        id: connect
+        run: |
+          set -euo pipefail
+          POD_ID="${{ steps.create.outputs.pod_id }}"
+          for i in $(seq 1 60); do
+            RESPONSE=$(curl -sS "$RUNPOD_API/pods/$POD_ID" \
+              -H "Authorization: Bearer ${{ secrets.RUNPOD_API_KEY }}")
+            STATUS=$(echo "$RESPONSE" | jq -r '.desiredStatus // empty')
+            IP=$(echo "$RESPONSE" | jq -r '.publicIp // empty')
+            PORT=$(echo "$RESPONSE" | jq -r '.portMappings["22"] // empty')
+            echo "  [$i/60] status=$STATUS ip=${IP:-<pending>} port=${PORT:-<pending>}"
+            if [ "$STATUS" = "RUNNING" ] && [ -n "$IP" ] && [ -n "$PORT" ]; then
+              echo "host=$IP" >> "$GITHUB_OUTPUT"
+              echo "port=$PORT" >> "$GITHUB_OUTPUT"
+              echo "Pod reachable at $IP:$PORT"
+              exit 0
             fi
+            sleep 10
+          done
+          echo "::error::Pod never reported RUNNING with a public IP within 10 minutes."
+          exit 1
+
+      - name: Wait for sshd inside the container
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 20); do
+            if ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 \
+                   -p "${{ steps.connect.outputs.port }}" \
+                   "root@${{ steps.connect.outputs.host }}" 'echo ready' 2>/dev/null; then
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::SSH never came up inside the container."
+          exit 1
+
+      - name: Train
+        run: |
+          set -euo pipefail
+          ssh -p "${{ steps.connect.outputs.port }}" \
+              "root@${{ steps.connect.outputs.host }}" '
+            set -euo pipefail
+            git clone --branch claude/prometheus-causal-market-ol2pau \
+              https://github.com/saisantoshtangirala/prometheus /opt/prometheus
+            cd /opt/prometheus
             pip install -q -e .
+            pip install -q pyyaml yfinance
             python scripts/train.py --mode "'"${{ inputs.mode }}"'" --device cuda
             tar czf /tmp/checkpoints.tar.gz checkpoints
           '
-          scp -P "${{ secrets.RUNPOD_PORT }}" \
-              "${{ secrets.RUNPOD_USER }}@${{ secrets.RUNPOD_HOST }}:/tmp/checkpoints.tar.gz" \
+          scp -P "${{ steps.connect.outputs.port }}" \
+              "root@${{ steps.connect.outputs.host }}:/tmp/checkpoints.tar.gz" \
               ./checkpoints.tar.gz
 
       - name: Upload checkpoint artifact
@@ -86,8 +136,10 @@ jobs:
           path: checkpoints.tar.gz
           retention-days: 30
 
-      - name: Stop pod (ALWAYS - this is the billing safety net)
-        if: always()
+      - name: Terminate pod (ALWAYS - zero idle billing by design)
+        if: always() && steps.create.outputs.pod_id != ''
         run: |
-          runpodctl stop pod "${{ secrets.RUNPOD_POD_ID }}" || \
-            echo "::error::Pod ${{ secrets.RUNPOD_POD_ID }} may still be running - stop it manually in the RunPod console NOW to avoid runaway billing."
+          curl -sS -X DELETE "$RUNPOD_API/pods/${{ steps.create.outputs.pod_id }}" \
+            -H "Authorization: Bearer ${{ secrets.RUNPOD_API_KEY }}" \
+            -o /dev/null -w "Terminate response: %{http_code}\n" || \
+            echo "::error::Failed to terminate pod ${{ steps.create.outputs.pod_id }} - check the RunPod console NOW."
