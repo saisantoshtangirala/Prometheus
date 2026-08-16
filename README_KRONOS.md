@@ -88,7 +88,32 @@ succeeded becomes primary, and close prices are cross-validated against
 every other source that responded. Disagreement beyond
 `cross_validation_tolerance_pct` flags the day in `DailyMemory.quality_flags`.
 
-## Deployment: Local Machine + AWS Hybrid
+## Recommended Deployment: Hetzner + RunPod (~$30-40/month)
+
+The cost-optimal split for the nightly-cycle workload, with no cloud
+quota approvals anywhere:
+
+- **Hetzner Cloud CX32 (~EUR 7/mo)** - the always-on brain. Runs the
+  Kronos orchestrator 24/7: digestion, reflex arc, paper trading,
+  reporting. All CPU work.
+- **RunPod hourly (~$0.40/hr, per-second billing)** - the nightly muscle.
+  ~3h/night of GPU for the heavy phases via `scripts/ssh_train.sh`.
+
+```bash
+# One-shot remote training on ANY SSH-able GPU box (RunPod, Hetzner, ...):
+./scripts/ssh_train.sh -h root@<pod-ip> -p <ssh-port> \
+    -m full -d cuda --shutdown
+# clones the repo, installs deps, trains, pulls checkpoints/ back,
+# powers the box off so billing stops.
+```
+
+Why not a dedicated Hetzner GPU (GEX44, ~EUR 184/mo)? Break-even vs
+hourly rental is ~500 GPU-hours/month; the nightly cycle uses ~90.
+Why not AWS Spot ($0.16/hr, cheapest on paper)? New accounts routinely
+get GPU quota requests denied. The CloudFormation stack in
+`cloudformation/` is ready if a quota is ever granted.
+
+## Alternative Deployment: Local Machine + AWS Hybrid
 
 The intended production split:
 
