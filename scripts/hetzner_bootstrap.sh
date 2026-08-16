@@ -15,22 +15,66 @@
 #   - kronos.service is enabled and running the 365-day paper loop
 #   - GitHub Actions can redeploy via `systemctl restart kronos.service`
 #     once you've added the deploy key this script prints at the end.
+#
+# PRIVATE REPO: this script generates and uses its own SSH "git deploy
+# key" for outbound clone/fetch (a DIFFERENT keypair from the inbound
+# "GitHub Actions -> Hetzner" one below - two keys, two directions of
+# trust). If REPO_URL is left as the SSH form (default), the very first
+# clone in this script will fail until you've added that key's public
+# half as a read-only GitHub Deploy Key - see the printed instructions
+# at the end and re-run this script once it's added.
 
 set -euo pipefail
 
-REPO_URL="${REPO_URL:-https://github.com/saisantoshtangirala/prometheus}"
+REPO_URL="${REPO_URL:-git@github.com:saisantoshtangirala/prometheus.git}"
 BRANCH="${BRANCH:-claude/prometheus-causal-market-ol2pau}"
 INSTALL_DIR="/opt/prometheus"
+GIT_DEPLOY_KEY="/root/.ssh/git_deploy_key"
 
 echo "=== Installing system dependencies ==="
 apt-get update -qq
 apt-get install -y -qq git python3-venv python3-pip
 
+echo "=== Setting up outbound git deploy key (Hetzner -> GitHub) ==="
+mkdir -p /root/.ssh
+chmod 700 /root/.ssh
+if [ ! -f "$GIT_DEPLOY_KEY" ]; then
+    ssh-keygen -t ed25519 -N "" -f "$GIT_DEPLOY_KEY" -C "hetzner-git-deploy"
+fi
+ssh-keyscan -t ed25519 github.com >> /root/.ssh/known_hosts 2>/dev/null
+cat > /root/.ssh/config <<SSHCFG
+Host github.com
+    IdentityFile $GIT_DEPLOY_KEY
+    IdentitiesOnly yes
+SSHCFG
+chmod 600 /root/.ssh/config
+
+if [[ "$REPO_URL" == git@github.com:* ]] && [ ! -d "$INSTALL_DIR/.git" ]; then
+    echo ""
+    echo "============================================================"
+    echo " If this is a PRIVATE repo, add this key as a read-only"
+    echo " GitHub Deploy Key BEFORE continuing: repo -> Settings ->"
+    echo " Deploy keys -> Add deploy key (leave 'Allow write access' off)."
+    echo "------------------------------------------------------------"
+    cat "$GIT_DEPLOY_KEY.pub"
+    echo "------------------------------------------------------------"
+    echo " Public repos: ignore this, the clone below will just work."
+    echo "============================================================"
+    echo ""
+fi
+
 echo "=== Cloning $REPO_URL @ $BRANCH ==="
 if [ -d "$INSTALL_DIR/.git" ]; then
     cd "$INSTALL_DIR" && git fetch origin "$BRANCH" && git checkout "$BRANCH"
 else
-    git clone --branch "$BRANCH" "$REPO_URL" "$INSTALL_DIR"
+    if ! git clone --branch "$BRANCH" "$REPO_URL" "$INSTALL_DIR"; then
+        echo ""
+        echo "!!! Clone failed. If this is a private repo, add the deploy"
+        echo "!!! key printed above under repo Settings -> Deploy keys,"
+        echo "!!! then re-run this script (it's safe to run again - the"
+        echo "!!! key won't be regenerated and nothing else has changed)."
+        exit 1
+    fi
 fi
 cd "$INSTALL_DIR"
 
@@ -68,7 +112,10 @@ sleep 3
 systemctl status kronos.service --no-pager || true
 
 echo ""
-echo "=== Generating a dedicated GitHub Actions deploy key ==="
+echo "=== Generating a dedicated GitHub Actions -> Hetzner deploy key ==="
+echo "    (this is the OTHER direction from the git_deploy_key above:"
+echo "     that one lets Hetzner pull FROM GitHub, this one lets"
+echo "     GitHub Actions SSH INTO Hetzner to redeploy)"
 DEPLOY_KEY_PATH="/root/.ssh/github_actions_deploy"
 if [ ! -f "$DEPLOY_KEY_PATH" ]; then
     mkdir -p /root/.ssh
@@ -82,6 +129,10 @@ echo "============================================================"
 echo " Bootstrap complete."
 echo ""
 echo " kronos.service is running: tail -f /var/log/kronos-service.log"
+echo ""
+echo " (If your repo is private, scroll up for the git_deploy_key"
+echo " public half - that one goes on GitHub as a Deploy Key, not"
+echo " a repo secret. This next one is different.)"
 echo ""
 echo " Copy this PRIVATE key into the GitHub repo secret HETZNER_SSH_KEY:"
 echo "------------------------------------------------------------"

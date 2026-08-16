@@ -136,6 +136,30 @@ output-parsing, no persistent pod to keep configured between runs: every
 run gets a brand-new pod and it's gone by the time the workflow ends,
 successful or not.
 
+### Private repository? Read this first
+
+Both workflows need to clone this repo onto machines that aren't you,
+which needs its own authentication if the repo isn't public. RunPod and
+Hetzner get **different** solutions on purpose, because they're
+different kinds of machine:
+
+- **RunPod pods are ephemeral** - a fresh one is created and destroyed
+  every run, so there's no persistent place to store a long-lived
+  credential even if you wanted to. `train-runpod.yml` instead uses the
+  `secrets.GITHUB_TOKEN` GitHub automatically hands every Actions run -
+  no setup, expires when the job ends, scoped to only this repo. Nothing
+  to configure for this - it already works.
+- **The Hetzner box is permanent** - it needs its own long-term
+  credential that survives independently of any GitHub Actions run,
+  including if you SSH in and `git pull` by hand months from now. For
+  that, `hetzner_bootstrap.sh` generates an SSH **deploy key** (a
+  GitHub feature for exactly this - one keypair, read-only, scoped to a
+  single repo) and clones over SSH instead of HTTPS. This needs one
+  manual step below.
+
+If your repo is public, ignore all of this - both clones work with zero
+extra setup either way.
+
 ### Step 1 - Bootstrap the Hetzner server (one time)
 
 1. Create a Hetzner Cloud CX32 (Ubuntu 22.04 or 24.04) in the
@@ -149,7 +173,15 @@ successful or not.
    systemd, starts the 365-day paper loop, and **prints a fresh SSH
    private key** at the end - generated specifically for GitHub Actions,
    never your personal key.
-3. Copy the private key block it prints, and note the server's IP.
+3. **Private repo only:** the script prints a *different* key near the
+   start - `git_deploy_key.pub` - and the clone step right after it will
+   fail on a first run. That's expected: copy that public key to
+   **repo -> Settings -> Deploy keys -> Add deploy key** (leave "Allow
+   write access" unchecked), then re-run the exact same bootstrap
+   command - it's idempotent, so it picks up cleanly from where it
+   stopped.
+4. Copy the private key block it prints at the very end (this one goes
+   in a GitHub *secret*, not a deploy key), and note the server's IP.
 
 ### Step 2 - Get a RunPod API key and register a CI SSH key (one time, no pod needed)
 

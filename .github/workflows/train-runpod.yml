@@ -13,6 +13,15 @@ name: Train on RunPod GPU
 # (the private half of a keypair registered under RunPod Settings -> SSH
 # Public Keys - RunPod bakes account-level keys into every new pod's
 # authorized_keys at boot automatically).
+#
+# PRIVATE REPO: the pod authenticates its git clone with the automatic,
+# job-scoped `secrets.GITHUB_TOKEN` GitHub provides to every Actions run
+# (no extra secret to create). It's short-lived - expires when this job
+# ends - and scoped to only this repo, so it's a better fit for a
+# throwaway pod than a long-lived personal access token would be.
+
+permissions:
+  contents: read
 
 on:
   workflow_dispatch:
@@ -117,7 +126,8 @@ jobs:
               "root@${{ steps.connect.outputs.host }}" '
             set -euo pipefail
             git clone --branch claude/prometheus-causal-market-ol2pau \
-              https://github.com/saisantoshtangirala/prometheus /opt/prometheus
+              "https://x-access-token:'"${{ secrets.GITHUB_TOKEN }}"'@github.com/saisantoshtangirala/prometheus" \
+              /opt/prometheus
             cd /opt/prometheus
             pip install -q -e .
             pip install -q pyyaml yfinance
