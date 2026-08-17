@@ -133,7 +133,7 @@ jobs:
             -H "Content-Type: application/json" \
             -d '{
               "name": "kronos-ci-${{ github.run_id }}",
-              "imageName": "runpod/pytorch:2.8.0-py3.11-cuda12.8.1-devel-ubuntu22.04",
+              "imageName": "runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04",
               "gpuTypeIds": ["${{ steps.params.outputs.gpu_type }}"],
               "gpuCount": 1,
               "cloudType": "${{ steps.params.outputs.cloud_type }}",
