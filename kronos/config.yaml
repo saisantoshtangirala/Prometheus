@@ -86,6 +86,6 @@ reporting:
   volatility_windows: [5, 20]
 
 notifications:
-  enabled: false                 # opt-in - also needs KRONOS_WHATSAPP_PHONE
-                                  # and KRONOS_WHATSAPP_APIKEY env vars set
+  enabled: false                 # opt-in - also needs KRONOS_TELEGRAM_BOT_TOKEN
+                                  # and KRONOS_TELEGRAM_CHAT_ID env vars set
   send_daily_digest: true        # sent once per day, after market close

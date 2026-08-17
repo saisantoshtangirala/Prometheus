@@ -38,7 +38,7 @@ from kronos.config import KronosConfig, load_config
 from kronos.data_pipeline import DataPipeline, DailyMemory, DataUnavailableError
 from kronos.evolver import KronosEvolver, EvolutionResult
 from kronos.nightmare_generator import NightmareGenerator, NightmareBuffer
-from kronos.notifier import WhatsAppNotifier
+from kronos.notifier import TelegramNotifier
 from kronos.paper_trader import PaperTrader
 from kronos.reflex import ReflexArc
 from kronos.reporter import GodsEyeReporter
@@ -165,7 +165,7 @@ class KronosOrchestrator:
         self.reflex = ReflexArc(self.cfg)
         self.trader = PaperTrader(self.cfg)
         self.reporter = GodsEyeReporter(self.cfg)
-        self.notifier = WhatsAppNotifier(self.cfg)
+        self.notifier = TelegramNotifier(self.cfg)
 
         self.state = DayState()
         self.master_model: Optional[torch.nn.Module] = None
@@ -418,7 +418,7 @@ class KronosOrchestrator:
         return stats
 
     def _send_daily_notification(self, stats: Dict) -> None:
-        """Best-effort WhatsApp digest - never let a notification problem
+        """Best-effort Telegram digest - never let a notification problem
         affect trading. Fully silent no-op if notifications aren't configured."""
         if not (self.notifier.enabled and self.cfg.notifications.send_daily_digest):
             return

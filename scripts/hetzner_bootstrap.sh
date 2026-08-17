@@ -85,16 +85,16 @@ pip install -q --upgrade pip
 pip install -q -e . || pip install -q torch numpy scipy scikit-learn networkx pandas
 pip install -q pyyaml yfinance
 
-echo "=== Setting up secrets env file (WhatsApp notifications, etc.) ==="
-# Kept OUTSIDE the git repo on purpose - never commit phone numbers or
-# API keys. The leading '-' on EnvironmentFile below means systemd
-# starts fine even if this file is empty or missing entirely.
+echo "=== Setting up secrets env file (Telegram notifications, etc.) ==="
+# Kept OUTSIDE the git repo on purpose - never commit bot tokens or chat
+# IDs. The leading '-' on EnvironmentFile below means systemd starts
+# fine even if this file is empty or missing entirely.
 if [ ! -f /etc/kronos.env ]; then
     cat > /etc/kronos.env <<'ENVFILE'
 # Kronos secrets - not tracked in git. Uncomment and fill in to enable
-# daily WhatsApp progress reports (see kronos/notifier.py for setup):
-#KRONOS_WHATSAPP_PHONE=15551234567
-#KRONOS_WHATSAPP_APIKEY=123456
+# daily Telegram progress reports (see kronos/notifier.py for setup):
+#KRONOS_TELEGRAM_BOT_TOKEN=123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ
+#KRONOS_TELEGRAM_CHAT_ID=987654321
 ENVFILE
     chmod 600 /etc/kronos.env
 fi
@@ -158,8 +158,8 @@ echo " Also set these repo secrets:"
 echo "   HETZNER_HOST = $(curl -s ifconfig.me 2>/dev/null || echo '<this server IP>')"
 echo "   HETZNER_USER = root"
 echo ""
-echo " Want daily WhatsApp progress reports? Edit /etc/kronos.env with"
-echo " your CallMeBot phone/apikey, set notifications.enabled: true in"
+echo " Want daily Telegram progress reports? Edit /etc/kronos.env with"
+echo " your bot token/chat id, set notifications.enabled: true in"
 echo " kronos/config.yaml, then: systemctl restart kronos"
-echo " Test it anytime with: python scripts/test_whatsapp.py"
+echo " Test it anytime with: python scripts/test_telegram.py"
 echo "============================================================"

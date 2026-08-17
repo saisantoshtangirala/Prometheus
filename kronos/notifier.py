@@ -1,26 +1,34 @@
 """
-Kronos daily progress notifier - a WhatsApp summary sent to your own
-phone at the end of each trading day, via CallMeBot.
+Kronos daily progress notifier - a Telegram message sent to your own
+phone at the end of each trading day.
 
-CallMeBot (https://www.callmebot.com/blog/free-api-whatsapp-messages/) is
-a free, unofficial third-party service built specifically for "let my
-script message my own WhatsApp" automation - no business account, no
-paid API, no signup beyond opting your own number in. It is NOT
-affiliated with WhatsApp/Meta, is rate-limited, and could change or go
-offline without notice - acceptable for a personal daily digest, not
-something to depend on for anything time-critical. Twilio's WhatsApp
-Business API is the official, paid upgrade path if you ever need one.
+Uses Telegram's official Bot API (https://core.telegram.org/bots/api) -
+a first-party feature of Telegram itself, not a third-party workaround.
+You create your own bot via Telegram's own @BotFather, so no unaccountable
+third party is ever in the loop - just you, your bot, and Telegram.
 
-One-time setup (on your phone, not this server):
-  1. Save this contact: +34 644 84 71 64
-  2. WhatsApp it exactly: "I allow callmebot to send me messages"
-  3. CallMeBot replies with your personal API key.
+One-time setup (on your phone):
+  1. Open Telegram, search for @BotFather (Telegram's official bot for
+     creating bots), start a chat with it.
+  2. Send: /newbot
+     Follow the prompts - pick a display name, then a username ending
+     in "bot" (e.g. "kronos_yourname_bot").
+  3. BotFather replies with a token that looks like:
+       123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ
+     That's KRONOS_TELEGRAM_BOT_TOKEN.
+  4. Search for YOUR new bot by its username and send it any message
+     (e.g. "hi") - Telegram requires this before a bot can message you
+     back, as an anti-spam measure.
+  5. In a browser, visit (with your real token):
+       https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates
+     Find "chat":{"id": ...} in the JSON response - that number is
+     KRONOS_TELEGRAM_CHAT_ID.
 
-Then set two environment variables wherever Kronos runs (see
+Set both as environment variables wherever Kronos runs (see
 hetzner_bootstrap.sh - it creates /etc/kronos.env for exactly this,
 kept out of git):
-  KRONOS_WHATSAPP_PHONE=<your number with country code, digits only>
-  KRONOS_WHATSAPP_APIKEY=<the key CallMeBot sent you>
+  KRONOS_TELEGRAM_BOT_TOKEN=123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ
+  KRONOS_TELEGRAM_CHAT_ID=987654321
 
 Notifications are fully optional: with either variable unset, or
 notifications.enabled: false in config.yaml, send() is a silent no-op -
@@ -35,24 +43,25 @@ from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-CALLMEBOT_URL = "https://api.callmebot.com/whatsapp.php"
-MAX_MESSAGE_CHARS = 2000   # generous WhatsApp-safe cap; our reports are short
+TELEGRAM_API_BASE = "https://api.telegram.org"
+MAX_MESSAGE_CHARS = 4000   # Telegram's real limit is 4096; leave margin
 
 
-class WhatsAppNotifier:
-    """Sends the daily progress digest. Every failure is caught and logged -
-    a notification problem must never take down the trading loop."""
+class TelegramNotifier:
+    """Sends the daily progress digest via Telegram. Every failure is
+    caught and logged - a notification problem must never take down the
+    trading loop."""
 
     def __init__(self, config):
         self.cfg = config
-        self.phone = os.environ.get("KRONOS_WHATSAPP_PHONE", "").strip()
-        self.apikey = os.environ.get("KRONOS_WHATSAPP_APIKEY", "").strip()
+        self.bot_token = os.environ.get("KRONOS_TELEGRAM_BOT_TOKEN", "").strip()
+        self.chat_id = os.environ.get("KRONOS_TELEGRAM_CHAT_ID", "").strip()
 
     @property
     def enabled(self) -> bool:
         notif_cfg = self.cfg.get("notifications", None)
         cfg_on = bool(notif_cfg.get("enabled", False)) if notif_cfg else False
-        return cfg_on and bool(self.phone) and bool(self.apikey)
+        return cfg_on and bool(self.bot_token) and bool(self.chat_id)
 
     def send(self, text: str) -> bool:
         """Best-effort send. Returns True on success, never raises."""
@@ -62,22 +71,23 @@ class WhatsAppNotifier:
         text = text[:MAX_MESSAGE_CHARS]
         try:
             import requests
-            resp = requests.get(
-                CALLMEBOT_URL,
-                params={"phone": self.phone, "text": text, "apikey": self.apikey},
+            url = f"{TELEGRAM_API_BASE}/bot{self.bot_token}/sendMessage"
+            resp = requests.post(
+                url,
+                json={"chat_id": self.chat_id, "text": text},
                 timeout=15,
             )
             ok = resp.status_code == 200
             if ok:
-                logger.info("[notifier] WhatsApp report sent")
+                logger.info("[notifier] Telegram report sent")
             else:
                 logger.warning(
-                    "[notifier] WhatsApp send returned status %d: %s",
+                    "[notifier] Telegram send returned status %d: %s",
                     resp.status_code, resp.text[:200],
                 )
             return ok
         except Exception as e:
-            logger.warning("[notifier] WhatsApp send failed: %s", e)
+            logger.warning("[notifier] Telegram send failed: %s", e)
             return False
 
     # -- report formatting ---------------------------------------------
@@ -94,7 +104,7 @@ class WhatsAppNotifier:
         phase_failures: Optional[Dict[str, str]] = None,
         reflex_regime: Optional[str] = None,
     ) -> str:
-        """Build the plain-text WhatsApp message for one day's close."""
+        """Build the plain-text Telegram message for one day's close."""
         total = total_days or int(self.cfg.run.total_days)
         pct = (day / total * 100.0) if total else 0.0
 

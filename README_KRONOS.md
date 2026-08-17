@@ -282,52 +282,68 @@ and `scripts/aws_train.py`). The nightly pattern:
   yesterday's checkpoint.
 - **Human panic** -> `veto.txt`, 24-hour delay, fully audit-logged.
 
-## Daily WhatsApp Progress Reports (optional)
+## Daily Telegram Progress Reports (optional)
 
-Kronos can text you a short progress digest to your own phone once a
-day, right after market close: current day and % through the 365-day
-run, today's equity/PnL/Sharpe/trade count, market regime, NEAT's best
-fitness, and any warnings from that day.
+Kronos can message you a short progress digest once a day, right after
+market close: current day and % through the 365-day run, today's
+equity/PnL/Sharpe/trade count, market regime, NEAT's best fitness, and
+any warnings from that day.
 
-Sent via [CallMeBot](https://www.callmebot.com/blog/free-api-whatsapp-messages/) -
-a free, unofficial service built specifically for "let my script message
-my own WhatsApp." Not affiliated with WhatsApp/Meta, no business account
-needed, but also no uptime guarantee - fine for a personal digest, not
-something to depend on for anything time-critical. (Twilio's WhatsApp
-Business API is the paid, official alternative if you ever need one.)
+Sent via [Telegram's official Bot API](https://core.telegram.org/bots/api) -
+a first-party Telegram feature, not a third-party workaround. You create
+your own bot through Telegram's own @BotFather, so the only parties ever
+involved are you, your bot, and Telegram itself - no unaccountable
+middleman service and no phone number handed to anyone.
+
+(An earlier version of this used a free third-party WhatsApp relay -
+dropped after discovering its published contact number had gone stale
+and no longer resolved to the actual service. Telegram's Bot API doesn't
+have that failure mode: the token comes directly from Telegram, and you
+verify it yourself by messaging your own bot.)
 
 ### Setup
 
-1. **On your phone**, save this contact: `+34 644 84 71 64`
-2. WhatsApp it exactly: `I allow callmebot to send me messages`
-3. CallMeBot replies with your personal API key.
-4. **On the Hetzner box**, edit the secrets file `hetzner_bootstrap.sh`
+1. **On your phone**, open Telegram, search for `@BotFather` (Telegram's
+   official bot for creating bots), and start a chat with it.
+2. Send: `/newbot`, then follow the prompts - pick a display name, then
+   a username ending in "bot" (e.g. `kronos_yourname_bot`).
+3. BotFather replies with a token like `123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ`.
+4. Search for **your own new bot** by its username and send it any
+   message (e.g. "hi") - Telegram requires this before a bot can message
+   you back, as an anti-spam measure.
+5. In a browser, visit (with your real token):
+   ```
+   https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates
+   ```
+   Find `"chat":{"id": ...}` in the JSON response - that number is your
+   chat ID.
+6. **On the Hetzner box**, edit the secrets file `hetzner_bootstrap.sh`
    already created for you:
    ```bash
    nano /etc/kronos.env
    ```
    Uncomment and fill in:
    ```
-   KRONOS_WHATSAPP_PHONE=15551234567    # your number, digits only, with country code
-   KRONOS_WHATSAPP_APIKEY=123456        # the key CallMeBot sent you
+   KRONOS_TELEGRAM_BOT_TOKEN=123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ
+   KRONOS_TELEGRAM_CHAT_ID=987654321
    ```
-5. Turn it on in `kronos/config.yaml`:
+7. Turn it on in `kronos/config.yaml`:
    ```yaml
    notifications:
      enabled: true
    ```
-6. Test it immediately, without waiting for a real day to close:
+8. Test it immediately, without waiting for a real day to close:
    ```bash
-   python scripts/test_whatsapp.py
+   python scripts/test_telegram.py
    ```
-7. Restart the service so it picks up the new environment file:
+9. Restart the service so it picks up the new environment file:
    ```bash
    systemctl restart kronos
    ```
 
-Notifications are fully optional and fail silently - a broken API key or
-a CallMeBot outage logs a warning and moves on, it never affects trading
-or the daily cycle.
+Notifications are fully optional and fail silently - a typo'd token or a
+Telegram API hiccup logs a warning and moves on, it never affects
+trading or the daily cycle.
 
 ## The Audit Trail
 
