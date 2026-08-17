@@ -316,6 +316,14 @@ class DataPipeline:
     def _clean(self, frame: pd.DataFrame) -> tuple:
         """Timestamp hygiene + Kalman gap repair. Returns (prices, volumes, flags)."""
         flags: List[str] = []
+        # Indices (e.g. ^VIX) are not traded directly and legitimately report
+        # zero volume - that's a category difference from stocks, not a
+        # liquidity problem. Without this exemption the illiquid-volume check
+        # below drops VIX every time, which then silently forces the
+        # downstream vix_missing:synthetic_fallback path (a hardcoded 20.0)
+        # instead of real volatility - the exact input the reflex arc's
+        # panic gate depends on.
+        volume_exempt = {self.cfg.data.vix_ticker}
         try:
             frame = standardize_timezone(frame)
         except Exception:
@@ -346,8 +354,9 @@ class DataPipeline:
                 flags.append(f"kalman_repaired:{col}")
 
             # DAT-04: zero-volume (illiquid) assets are dropped for the day so
-            # they cannot distort systemic-risk attention weights.
-            if col in volumes.columns:
+            # they cannot distort systemic-risk attention weights. Index
+            # tickers are exempt - see volume_exempt above.
+            if col in volumes.columns and col not in volume_exempt:
                 vol_series = volumes[col].fillna(0.0)
                 if (vol_series == 0).all() and len(vol_series) > 0:
                     flags.append(f"illiquid:{col}:dropped")

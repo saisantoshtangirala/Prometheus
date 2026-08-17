@@ -319,6 +319,48 @@ class TestDataPipeline:
         assert any(f.startswith("illiquid:BBB") for f in flags)
         assert "AAA" in closes.columns   # others untouched
 
+    def test_vix_survives_despite_zero_volume(self, config, memory):
+        """
+        Regression: ^VIX legitimately reports zero volume (it's an index,
+        not a tradable security) and must NOT be dropped by the illiquid
+        check - that previously forced every real run onto the
+        vix_missing:synthetic_fallback path (a hardcoded 20.0), starving
+        the reflex arc's panic gate of real volatility data.
+        """
+        pipeline = DataPipeline(config)
+        vix_ticker = config.data.vix_ticker
+        prices = memory.prices.copy()
+        prices[vix_ticker] = 20.0
+        volumes = memory.volumes.copy()
+        volumes[vix_ticker] = 0.0  # real Yahoo behavior for index tickers
+        frame = pd.concat({"Close": prices, "Volume": volumes}, axis=1)
+
+        closes, _, flags = pipeline._clean(frame)
+
+        assert vix_ticker in closes.columns, (
+            "VIX must survive the illiquid-volume check despite zero volume"
+        )
+        assert not any(f.startswith(f"illiquid:{vix_ticker}") for f in flags)
+
+        # And the full build_memory path must actually populate real VIX,
+        # not fall back to the synthetic 20.0 default.
+        memory_out = pipeline.build_memory({"yfinance": frame})
+        assert not any(
+            f.startswith("vix_missing") for f in memory_out.quality_flags
+        )
+        assert memory_out.macro["vix_last"] == pytest.approx(20.0)
+
+    def test_regular_ticker_still_dropped_on_zero_volume(self, config, memory):
+        """The VIX exemption must not blanket-disable the illiquid check
+        for ordinary tradable tickers."""
+        pipeline = DataPipeline(config)
+        volumes = memory.volumes.copy()
+        volumes["AAA"] = 0.0
+        frame = pd.concat({"Close": memory.prices, "Volume": volumes}, axis=1)
+        closes, _, flags = pipeline._clean(frame)
+        assert "AAA" not in closes.columns
+        assert any(f.startswith("illiquid:AAA") for f in flags)
+
     def test_dat05_nanosecond_timestamps_floored(self, config, memory):
         """DAT-05: ns-precision timestamps floored to us, no overflow."""
         pipeline = DataPipeline(config)
