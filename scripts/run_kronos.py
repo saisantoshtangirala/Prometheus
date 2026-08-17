@@ -177,14 +177,14 @@ def run_realtime(orchestrator, n_days: int):
                 orchestrator.run_reflex_tick(vix)
                 orchestrator.heartbeat(now)
             reflex_ticks += 1
-            if reflex_ticks % 15 == 0:
-                # REFLEX ticks are otherwise fully silent - this is the only
-                # sign of life in the log during the ~6.5h market session.
-                logger.info(
-                    "[main] reflex tick %d: equity=$%.2f regime=%s (day %d)",
-                    reflex_ticks, orchestrator.trader.equity(),
-                    orchestrator.reflex.gate.state.regime, day,
-                )
+            # REFLEX ticks are otherwise fully silent - log every one (once
+            # a minute) so the log always shows visible, recent progress
+            # instead of long unexplained gaps during the market session.
+            logger.info(
+                "[main] reflex tick %d: equity=$%.2f regime=%s (day %d)",
+                reflex_ticks, orchestrator.trader.equity(),
+                orchestrator.reflex.gate.state.regime, day,
+            )
             time.sleep(60)
             continue
 

@@ -253,6 +253,47 @@ class TestExchangeTimezone:
         }
 
 
+class TestReflexTickLogging:
+    def test_every_reflex_tick_logs_a_progress_line(self, config, caplog):
+        """Regression: the heartbeat log used to fire only every 15th tick,
+        leaving up to a 15-minute silent gap after every restart (exactly
+        what looked like a hang after redeploying the exchange-timezone
+        fix). Every REFLEX iteration must log now, so a fresh boot shows
+        progress within ~60s instead of a long unexplained pause."""
+        import logging
+        from datetime import datetime
+        from unittest.mock import patch as _patch
+        from zoneinfo import ZoneInfo
+
+        orch = KronosOrchestrator(config)
+        memory = make_memory(config)
+        et_tz = ZoneInfo("America/New_York")
+        during_market_hours = datetime(2026, 3, 2, 10, 0, tzinfo=et_tz)
+
+        call_count = {"n": 0}
+
+        def fake_sleep(seconds):
+            call_count["n"] += 1
+            if call_count["n"] >= 3:
+                run_kronos._shutdown = True
+
+        with _patch("run_kronos._exchange_now", return_value=during_market_hours), \
+             _patch.object(orch, "phase_for", return_value=Phase.REFLEX), \
+             _patch.object(orch.pipeline, "run_sync", return_value=memory), \
+             _patch("run_kronos.time.sleep", side_effect=fake_sleep), \
+             caplog.at_level(logging.INFO, logger="kronos.main"):
+            try:
+                run_kronos.run_realtime(orch, n_days=1)
+            finally:
+                run_kronos._shutdown = False  # don't leak into other tests
+
+        tick_lines = [r for r in caplog.records if "reflex tick" in r.message]
+        assert len(tick_lines) == 3, (
+            "every REFLEX iteration must produce a log line, not just "
+            "every 15th"
+        )
+
+
 class TestLoggingSetup:
     def test_log_directory_created_before_file_handler(self, tmp_path, monkeypatch):
         """Regression: logging.FileHandler("logs/kronos.log") used to run
