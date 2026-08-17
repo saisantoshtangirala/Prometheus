@@ -29,6 +29,7 @@ setup(
         "dev": [
             "pytest>=7.4.0",
             "pytest-cov>=4.1.0",
+            "hypothesis>=6.0.0",
         ],
     },
     entry_points={
