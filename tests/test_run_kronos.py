@@ -253,6 +253,117 @@ class TestExchangeTimezone:
         }
 
 
+class TestFetchLiveBar:
+    """Regression: run_reflex_tick() only executes a trade when bar_prices
+    is non-empty (kronos/orchestrator.py's `if bar_prices:` gate). The
+    real-time loop used to call run_reflex_tick(vix) with no price data
+    at all, so it computed a signal every minute and never acted on it -
+    equity stayed frozen at the starting balance for the entire 365-day
+    run. fetch_live_bar() is what closes that gap."""
+
+    def test_single_ticker_flat_columns(self):
+        from unittest.mock import MagicMock, patch as _patch
+
+        idx = pd.date_range("2026-01-01 09:30", periods=2, freq="1min")
+        fake_data = pd.DataFrame(
+            {"Close": [101.0, 101.5], "Volume": [1000.0, 1200.0]}, index=idx,
+        )
+        with _patch("yfinance.download", return_value=fake_data):
+            prices, volumes = run_kronos.fetch_live_bar(["AAA"])
+        assert prices == {"AAA": 101.5}
+        assert volumes == {"AAA": 1200.0}
+
+    def test_multi_ticker_multiindex_columns(self):
+        from unittest.mock import patch as _patch
+
+        idx = pd.date_range("2026-01-01 09:30", periods=2, freq="1min")
+        cols = pd.MultiIndex.from_product(
+            [["Close", "Volume"], ["AAA", "BBB"]]
+        )
+        fake_data = pd.DataFrame(
+            [[100.0, 200.0, 1000.0, 2000.0], [100.5, 199.5, 1100.0, 2100.0]],
+            index=idx, columns=cols,
+        )
+        with _patch("yfinance.download", return_value=fake_data):
+            prices, volumes = run_kronos.fetch_live_bar(["AAA", "BBB"])
+        assert prices == {"AAA": 100.5, "BBB": 199.5}
+        assert volumes == {"AAA": 1100.0, "BBB": 2100.0}
+
+    def test_missing_import_returns_empty_not_raise(self):
+        from unittest.mock import patch as _patch
+
+        with _patch.dict("sys.modules", {"yfinance": None}):
+            prices, volumes = run_kronos.fetch_live_bar(["AAA"])
+        assert prices == {}
+        assert volumes == {}
+
+    def test_network_exception_returns_empty_not_raise(self):
+        from unittest.mock import patch as _patch
+
+        with _patch("yfinance.download", side_effect=ConnectionError("down")):
+            prices, volumes = run_kronos.fetch_live_bar(["AAA"])
+        assert prices == {}
+        assert volumes == {}
+
+    def test_empty_frame_returns_empty(self):
+        from unittest.mock import patch as _patch
+
+        with _patch("yfinance.download", return_value=pd.DataFrame()):
+            prices, volumes = run_kronos.fetch_live_bar(["AAA"])
+        assert prices == {}
+        assert volumes == {}
+
+
+class TestRealtimeExecutesTrades:
+    def test_reflex_tick_receives_live_prices_and_can_trade(self, config):
+        """End-to-end: run_realtime()'s REFLEX branch must fetch a live
+        bar and pass it into run_reflex_tick, so trader.execute() is
+        reachable - not called with vix only, which silently disabled
+        all trading in real-time mode."""
+        from datetime import datetime
+        from unittest.mock import patch as _patch
+        from zoneinfo import ZoneInfo
+
+        orch = KronosOrchestrator(config)
+        memory = make_memory(config)
+        et_tz = ZoneInfo("America/New_York")
+        during_market_hours = datetime(2026, 3, 2, 10, 0, tzinfo=et_tz)
+        live_prices = {t: 100.0 for t in memory.tickers}
+        live_volumes = {t: 5_000_000.0 for t in memory.tickers}
+
+        call_count = {"n": 0}
+
+        def fake_sleep(seconds):
+            call_count["n"] += 1
+            if call_count["n"] >= 1:
+                run_kronos._shutdown = True
+
+        captured = {}
+        real_run_reflex_tick = orch.run_reflex_tick
+
+        def spying_run_reflex_tick(vix_value, bar_prices=None, bar_volumes=None, now=None):
+            captured["bar_prices"] = bar_prices
+            captured["bar_volumes"] = bar_volumes
+            return real_run_reflex_tick(vix_value, bar_prices, bar_volumes, now=now)
+
+        with _patch("run_kronos._exchange_now", return_value=during_market_hours), \
+             _patch.object(orch, "phase_for", return_value=Phase.REFLEX), \
+             _patch.object(orch.pipeline, "run_sync", return_value=memory), \
+             _patch("run_kronos.fetch_live_bar", return_value=(live_prices, live_volumes)), \
+             _patch.object(orch, "run_reflex_tick", side_effect=spying_run_reflex_tick), \
+             _patch("run_kronos.time.sleep", side_effect=fake_sleep):
+            try:
+                run_kronos.run_realtime(orch, n_days=1)
+            finally:
+                run_kronos._shutdown = False
+
+        assert captured["bar_prices"] == live_prices, (
+            "run_reflex_tick must receive the fetched live prices, not "
+            "be called with vix alone"
+        )
+        assert captured["bar_volumes"] == live_volumes
+
+
 class TestReflexTickLogging:
     def test_every_reflex_tick_logs_a_progress_line(self, config, caplog):
         """Regression: the heartbeat log used to fire only every 15th tick,
@@ -280,6 +391,7 @@ class TestReflexTickLogging:
         with _patch("run_kronos._exchange_now", return_value=during_market_hours), \
              _patch.object(orch, "phase_for", return_value=Phase.REFLEX), \
              _patch.object(orch.pipeline, "run_sync", return_value=memory), \
+             _patch("run_kronos.fetch_live_bar", return_value=({}, {})), \
              _patch("run_kronos.time.sleep", side_effect=fake_sleep), \
              caplog.at_level(logging.INFO, logger="kronos.main"):
             try:

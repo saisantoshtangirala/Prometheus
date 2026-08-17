@@ -19,9 +19,11 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Dict, List, Tuple
 from zoneinfo import ZoneInfo
 
 import numpy as np
+import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -70,6 +72,49 @@ def synthetic_ticks(orchestrator, n_ticks: int = 20):
         base_prices = prices
         ticks.append((vix, prices, volumes))
     return ticks
+
+
+def fetch_live_bar(tickers: List[str]) -> Tuple[Dict[str, float], Dict[str, float]]:
+    """Best-effort latest intraday price/volume per ticker, used to drive
+    real trade execution during REFLEX ticks in paper mode.
+
+    KronosOrchestrator.run_reflex_tick() only calls trader.execute() when
+    bar_prices is non-empty - without a live quote feed, the real-time
+    loop computes signals every minute but never acts on them. Any
+    failure here (network, missing package, bad data) returns empty
+    dicts rather than raising: a missed quote should skip that one
+    tick's trading, not take down the 365-day loop.
+    """
+    try:
+        import yfinance as yf
+    except ImportError:
+        logger.warning("[reflex] yfinance not installed - cannot fetch live quotes")
+        return {}, {}
+    try:
+        data = yf.download(
+            tickers, period="1d", interval="1m",
+            progress=False, auto_adjust=True, group_by="column",
+        )
+    except Exception as e:
+        logger.warning("[reflex] live quote fetch failed: %s", e)
+        return {}, {}
+    if data is None or data.empty:
+        return {}, {}
+
+    prices: Dict[str, float] = {}
+    volumes: Dict[str, float] = {}
+    last = data.iloc[-1]
+    multi = isinstance(data.columns, pd.MultiIndex)
+    for ticker in tickers:
+        try:
+            close = last[("Close", ticker)] if multi else last["Close"]
+            vol = last[("Volume", ticker)] if multi else last["Volume"]
+        except (KeyError, TypeError):
+            continue
+        if pd.notna(close):
+            prices[ticker] = float(close)
+            volumes[ticker] = float(vol) if pd.notna(vol) else 0.0
+    return prices, volumes
 
 
 def run_accelerated(orchestrator, n_days: int):
@@ -172,18 +217,21 @@ def run_realtime(orchestrator, n_days: int):
         if phase == Phase.REFLEX:
             # tick once per minute during market hours
             memory = orchestrator.state.memory
+            bar_prices: Dict[str, float] = {}
             if memory is not None:
                 vix = memory.macro.get("vix_last", 20.0)
-                orchestrator.run_reflex_tick(vix)
+                bar_prices, bar_volumes = fetch_live_bar(memory.tickers)
+                orchestrator.run_reflex_tick(vix, bar_prices, bar_volumes, now=now)
                 orchestrator.heartbeat(now)
             reflex_ticks += 1
             # REFLEX ticks are otherwise fully silent - log every one (once
             # a minute) so the log always shows visible, recent progress
             # instead of long unexplained gaps during the market session.
             logger.info(
-                "[main] reflex tick %d: equity=$%.2f regime=%s (day %d)",
+                "[main] reflex tick %d: equity=$%.2f regime=%s quote=%s (day %d)",
                 reflex_ticks, orchestrator.trader.equity(),
-                orchestrator.reflex.gate.state.regime, day,
+                orchestrator.reflex.gate.state.regime,
+                "ok" if bar_prices else "missed", day,
             )
             time.sleep(60)
             continue
