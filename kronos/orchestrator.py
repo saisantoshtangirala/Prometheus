@@ -25,8 +25,6 @@ import json
 import logging
 import os
 import pickle
-import threading
-import time
 import traceback
 from dataclasses import dataclass, field
 from datetime import date as ddate, datetime, time as dtime, timedelta, timezone
@@ -36,6 +34,7 @@ from typing import Callable, Dict, Optional, Set, Tuple
 import numpy as np
 import torch
 
+from kronos.calendar_utils import is_trading_day, next_trading_day, nyse_holidays
 from kronos.config import KronosConfig, load_config
 from kronos.data_pipeline import DataPipeline, DailyMemory, DataUnavailableError
 from kronos.evolver import KronosEvolver, EvolutionResult
@@ -44,85 +43,10 @@ from kronos.notifier import TelegramNotifier
 from kronos.paper_trader import PaperTrader
 from kronos.reflex import ReflexArc
 from kronos.reporter import GodsEyeReporter
-from kronos.runpod_trigger import TrainingResult, load_runpod_checkpoint, trigger_training_and_wait
+from kronos.runpod_trigger import CHECKPOINT_DIR as RUNPOD_CHECKPOINT_DIR, load_runpod_checkpoint
 from kronos.warmer import KronosWarmer, WarmupResult
 
-# How long, from kick-off, KronosOrchestrator will keep waiting on a
-# background RunPod run before giving up and keeping today's existing
-# reflex.snn weights - the "never miss market open" cap. Deliberately
-# smaller than runpod_trigger's own JOB_TIMEOUT_SECONDS (3h): that timeout
-# governs the training job itself, this one governs how long the daily
-# cycle is willing to wait on it, including pod-boot and SSH overhead.
-RUNPOD_EVOLUTION_BUDGET_SECONDS = 6 * 60 * 60
-
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# NYSE trading calendar (ORC-04 / ORC-05 / VET-03)
-# ---------------------------------------------------------------------------
-
-def _easter(year: int) -> ddate:
-    """Anonymous Gregorian computus."""
-    a = year % 19
-    b, c = divmod(year, 100)
-    d, e = divmod(b, 4)
-    f = (b + 8) // 25
-    g = (b - f + 1) // 3
-    h = (19 * a + b - d - g + 15) % 30
-    i, k = divmod(c, 4)
-    l = (32 + 2 * e + 2 * i - h - k) % 7
-    m = (a + 11 * h + 22 * l) // 451
-    month, day = divmod(h + l - 7 * m + 114, 31)
-    return ddate(year, month, day + 1)
-
-
-def _nth_weekday(year: int, month: int, weekday: int, n: int) -> ddate:
-    """n-th (1-based) given weekday of a month; n=-1 for the last."""
-    if n > 0:
-        d = ddate(year, month, 1)
-        offset = (weekday - d.weekday()) % 7
-        return d + timedelta(days=offset + 7 * (n - 1))
-    d = ddate(year + (month == 12), (month % 12) + 1, 1) - timedelta(days=1)
-    offset = (d.weekday() - weekday) % 7
-    return d - timedelta(days=offset)
-
-
-def _observed(d: ddate) -> ddate:
-    """Sat -> Fri, Sun -> Mon observance."""
-    if d.weekday() == 5:
-        return d - timedelta(days=1)
-    if d.weekday() == 6:
-        return d + timedelta(days=1)
-    return d
-
-
-def nyse_holidays(year: int) -> Set[ddate]:
-    return {
-        _observed(ddate(year, 1, 1)),                 # New Year's Day
-        _nth_weekday(year, 1, 0, 3),                  # MLK Day
-        _nth_weekday(year, 2, 0, 3),                  # Presidents' Day
-        _easter(year) - timedelta(days=2),            # Good Friday
-        _nth_weekday(year, 5, 0, -1),                 # Memorial Day
-        _observed(ddate(year, 6, 19)),                # Juneteenth
-        _observed(ddate(year, 7, 4)),                 # Independence Day
-        _nth_weekday(year, 9, 0, 1),                  # Labor Day
-        _nth_weekday(year, 11, 3, 4),                 # Thanksgiving
-        _observed(ddate(year, 12, 25)),               # Christmas
-    }
-
-
-def is_trading_day(d: ddate) -> bool:
-    if d.weekday() >= 5:
-        return False
-    return d not in nyse_holidays(d.year)
-
-
-def next_trading_day(d: ddate) -> ddate:
-    nxt = d + timedelta(days=1)
-    while not is_trading_day(nxt):
-        nxt += timedelta(days=1)
-    return nxt
 
 
 class Phase(Enum):
@@ -187,15 +111,16 @@ class KronosOrchestrator:
         self._completed_today: Set[str] = set()
         self.skip_trading: bool = False       # set on stale/unavailable data
 
-        # -- RunPod nightly training (kronos/runpod_trigger.py) ---------
-        self._runpod_enabled = bool(os.environ.get("RUNPOD_API_KEY", "").strip())
-        self._runpod_thread: Optional[threading.Thread] = None
-        self._runpod_result: Optional[TrainingResult] = None
-        self._runpod_kickoff_monotonic: Optional[float] = None
-        self._runpod_adopted_today: bool = True   # nothing pending until kick-off
-
         os.makedirs(self.cfg.orchestrator.checkpoint_dir, exist_ok=True)
         self._load_persisted_snn()
+        # RunPod training runs entirely in GitHub Actions now (scheduled
+        # in .github/workflows/train-runpod.yml), which scp's the result
+        # straight onto this box. Kronos's only job is noticing when a
+        # newer checkpoint file has appeared - see
+        # maybe_adopt_runpod_checkpoint(). Baseline this to "whatever's
+        # on disk right now" so a checkpoint that arrived before this
+        # process even started isn't treated as new on every restart.
+        self._runpod_last_adopted_mtime: Optional[float] = self._current_runpod_checkpoint_mtime()
 
     # ------------------------------------------------------------------
     # Phase resolution
@@ -730,21 +655,18 @@ class KronosOrchestrator:
     # ------------------------------------------------------------------
     # RunPod nightly training
     #
-    # kick_off_runpod_training() is called once per trading day, right
-    # when DIGESTION opens (scripts/run_kronos.py). It starts
-    # runpod_trigger.trigger_training_and_wait() on a background thread -
-    # a real, hours-long, blocking job - so Digestion/Nightmare/Evolution/
-    # Adaptation/Report all keep running on their existing schedule,
-    # completely untouched. None of them need the GPU checkpoint; only
-    # ReflexArc.snn (actual trade decisions) does.
+    # RunPod pod orchestration (create/train/pull/delete) runs entirely
+    # in GitHub Actions now - .github/workflows/train-runpod.yml is
+    # scheduled nightly and scp's the resulting checkpoint straight onto
+    # this box. Kronos no longer talks to the RunPod API or holds an SSH
+    # key for it at all; its only job is noticing a newer checkpoint file
+    # has appeared locally and adopting it.
     #
     # maybe_adopt_runpod_checkpoint() is polled every iteration of the
-    # main realtime loop - cheap, non-blocking (thread.is_alive()), never
-    # a long join. The moment the background thread finishes, or a fixed
-    # budget expires, it adopts the result (or explicitly doesn't) and
-    # sets _runpod_adopted_today so it stops checking until tomorrow.
-    # This split is what keeps a multi-hour GPU job from ever blocking
-    # phase dispatch, catch_up() bursts, or REFLEX ticks.
+    # main realtime loop (scripts/run_kronos.py) - a cheap os.path.getmtime()
+    # check, never a blocking wait, since there's nothing to wait ON
+    # anymore: by the time this box sees the file, training already
+    # finished on GitHub's infrastructure.
     # ------------------------------------------------------------------
 
     def _active_snn_path(self) -> str:
@@ -770,67 +692,30 @@ class KronosOrchestrator:
         except Exception as e:
             logger.warning("[orchestrator] failed to persist active SNN weights: %s", e)
 
-    def kick_off_runpod_training(self, today: ddate) -> None:
-        """Start tonight's RunPod GPU training run in the background.
-        No-op on weekends/holidays, when RUNPOD_API_KEY isn't set, or if
-        a run is already in flight. Call once per trading day, at
-        DIGESTION - see scripts/run_kronos.py."""
-        if not self._runpod_enabled:
-            return
-        if not is_trading_day(today):
-            logger.info("[orchestrator] %s is not a trading day - skipping RunPod training", today)
-            return
-        if self._runpod_thread is not None and self._runpod_thread.is_alive():
-            logger.warning("[orchestrator] RunPod training thread already running - not starting another")
-            return
-
-        n_assets = len(self.cfg.data.tickers)
-        self._runpod_result = None
-        self._runpod_adopted_today = False
-        self._runpod_kickoff_monotonic = time.monotonic()
-
-        def _worker():
-            self._runpod_result = trigger_training_and_wait(n_assets=n_assets)
-
-        self._runpod_thread = threading.Thread(target=_worker, name="runpod-trainer", daemon=True)
-        self._runpod_thread.start()
-        logger.info("[orchestrator] RunPod nightly training kicked off in the background (day %d)", self.state.day)
+    def _current_runpod_checkpoint_mtime(self) -> Optional[float]:
+        path = os.path.join(RUNPOD_CHECKPOINT_DIR, "meta", "snn.pt")
+        try:
+            return os.path.getmtime(path)
+        except OSError:
+            return None
 
     def maybe_adopt_runpod_checkpoint(self) -> None:
         """Non-blocking - safe to call every iteration of the main loop.
-        Adopts tonight's RunPod-trained SNN into self.reflex.snn the
-        moment it's ready, or gives up (keeping today's existing weights,
-        i.e. yesterday's) once RUNPOD_EVOLUTION_BUDGET_SECONDS has
-        elapsed since kick-off, so market open is never missed."""
-        if self._runpod_thread is None or self._runpod_adopted_today:
+        If checkpoints/runpod/meta/snn.pt exists and is newer than the
+        last one adopted, loads it into self.reflex.snn. No-op otherwise
+        (including "file hasn't shown up yet" and "same file as last
+        time" - GitHub Actions overwrites it in place each night)."""
+        mtime = self._current_runpod_checkpoint_mtime()
+        if mtime is None or mtime == self._runpod_last_adopted_mtime:
             return
-
-        if self._runpod_thread.is_alive():
-            elapsed = time.monotonic() - (self._runpod_kickoff_monotonic or time.monotonic())
-            if elapsed < RUNPOD_EVOLUTION_BUDGET_SECONDS:
-                return   # still within budget - keep waiting, don't block
-            logger.critical(
-                "[orchestrator] RunPod training still running after %dh - "
-                "giving up and keeping today's existing SNN weights so "
-                "market open is never missed", RUNPOD_EVOLUTION_BUDGET_SECONDS // 3600,
-            )
-            self._runpod_adopted_today = True
-            return
-
-        # thread has finished, one way or another
-        self._runpod_adopted_today = True
-        result = self._runpod_result
-        self._runpod_result = None
-        if result is None or not result.success:
-            reason = result.reason if result else "unknown"
-            logger.critical(
-                "[orchestrator] RunPod training unavailable (%s) - keeping "
-                "today's existing SNN weights (yesterday's checkpoint)", reason,
-            )
-            return
-        if load_runpod_checkpoint(self.reflex.snn):
+        if load_runpod_checkpoint(self.reflex.snn, checkpoint_dir=RUNPOD_CHECKPOINT_DIR):
+            self._runpod_last_adopted_mtime = mtime
             self._persist_active_snn()
-            logger.info("[orchestrator] adopted tonight's RunPod-trained SNN weights")
+            logger.info("[orchestrator] adopted a new RunPod-trained SNN checkpoint")
+        else:
+            # Don't retry the same broken/mismatched file every 30s -
+            # remember it as "seen" so the warning logs once, not forever.
+            self._runpod_last_adopted_mtime = mtime
 
     # ------------------------------------------------------------------
     # Helpers

@@ -10,6 +10,7 @@ encoder, Kalman filter, and sentiment analyzer, and drives them through a
         -> reflex (market hours) -> logging -> repeat
 """
 
+from kronos.calendar_utils import is_trading_day, next_trading_day, nyse_holidays
 from kronos.config import KronosConfig, load_config
 from kronos.data_pipeline import (
     DailyMemory,
@@ -25,18 +26,11 @@ from kronos.nightmare_generator import (
     NightmareGenerator,
 )
 from kronos.notifier import TelegramNotifier
-from kronos.orchestrator import (
-    DayState,
-    KronosOrchestrator,
-    Phase,
-    is_trading_day,
-    next_trading_day,
-    nyse_holidays,
-)
+from kronos.orchestrator import DayState, KronosOrchestrator, Phase
 from kronos.paper_trader import PaperTrader
 from kronos.reflex import OrderBookSimulator, ReflexArc, RegimeSwitchGate
 from kronos.reporter import GodsEyeReporter
-from kronos.runpod_trigger import TrainingResult, load_runpod_checkpoint, trigger_training_and_wait
+from kronos.runpod_trigger import load_runpod_checkpoint
 from kronos.warmer import ClippedMAML, KronosWarmer, WarmupResult
 
 __all__ = [
@@ -50,5 +44,6 @@ __all__ = [
     "PaperTrader",
     "GodsEyeReporter",
     "KronosOrchestrator", "DayState", "Phase",
-    "TrainingResult", "trigger_training_and_wait", "load_runpod_checkpoint",
+    "is_trading_day", "next_trading_day", "nyse_holidays",
+    "load_runpod_checkpoint",
 ]

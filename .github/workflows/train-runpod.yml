@@ -1,29 +1,48 @@
 name: Train on RunPod GPU
 
-# Fully automated GPU training via RunPod's REST API (docs.runpod.io):
+# Runs every trading-day morning (UTC, well before US market open) AND
+# on manual dispatch. Fully automated GPU training via RunPod's REST API
+# (docs.runpod.io):
 #   1. POST /v1/pods           - create a fresh pod
 #   2. GET  /v1/pods/{id}      - poll until running, read its real IP:port
-#   3. ssh/scp                 - clone, train, pull the checkpoint back
+#   3. ssh/scp                 - push this checkout, train, pull the
+#                                 checkpoint back
 #   4. DELETE /v1/pods/{id}    - ALWAYS terminate (even on failure) - a
 #                                 fresh pod every run means zero idle
 #                                 billing between runs, no persistent
 #                                 infrastructure to maintain or forget about
+#   5. scp                     - deliver the checkpoint to the Hetzner box
+#                                 so Kronos (kronos/orchestrator.py:
+#                                 maybe_adopt_runpod_checkpoint) picks it up
 #
-# Needs only two repo secrets: RUNPOD_API_KEY and RUNPOD_SSH_PRIVATE_KEY
-# (the private half of a keypair registered under RunPod Settings -> SSH
-# Public Keys - RunPod bakes account-level keys into every new pod's
-# authorized_keys at boot automatically).
+# All pod orchestration lives here now, not on Hetzner - scheduling and
+# infra lifecycle belong in CI/CD, not embedded in the process that's
+# also responsible for trading every day. Kronos itself holds no RunPod
+# credentials at all; it only watches checkpoints/runpod/ for a file this
+# workflow delivered.
 #
-# PRIVATE REPO: the pod authenticates its git clone with the automatic,
-# job-scoped `secrets.GITHUB_TOKEN` GitHub provides to every Actions run
-# (no extra secret to create). It's short-lived - expires when this job
-# ends - and scoped to only this repo, so it's a better fit for a
-# throwaway pod than a long-lived personal access token would be.
+# Repo secrets needed:
+#   RUNPOD_API_KEY, RUNPOD_SSH_PRIVATE_KEY  - reach RunPod (private half of
+#     a keypair registered under RunPod Settings -> SSH Public Keys -
+#     RunPod bakes account-level keys into every new pod's authorized_keys
+#     at boot automatically)
+#   HETZNER_HOST, HETZNER_USER, HETZNER_SSH_KEY - already exist for
+#     deploy-hetzner.yml; reused here to deliver the checkpoint
+#
+# The scheduled trigger only fires Mon-Fri (cron day-of-week), and the
+# "Skip on non-trading days" step below additionally checks the real NYSE
+# holiday calendar (kronos/calendar_utils.py - the same code Kronos's own
+# phase gating uses, so this can never drift out of sync with it) and
+# skips the rest of the job - no pod is ever created on a day Kronos
+# wouldn't trade on anyway. Manual (workflow_dispatch) runs always run,
+# even on a non-trading day, since a human explicitly asked for one.
 
 permissions:
   contents: read
 
 on:
+  schedule:
+    - cron: "0 6 * * 1-5"   # 06:00 UTC, Mon-Fri - comfortably before US market open
   workflow_dispatch:
     inputs:
       mode:
@@ -52,13 +71,61 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 240
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve run parameters
+        id: params
+        run: |
+          set -euo pipefail
+          pip install -q pyyaml
+          echo "mode=${{ github.event.inputs.mode || 'full' }}" >> "$GITHUB_OUTPUT"
+          echo "gpu_type=${{ github.event.inputs.gpu_type || 'NVIDIA RTX A5000' }}" >> "$GITHUB_OUTPUT"
+          echo "cloud_type=${{ github.event.inputs.cloud_type || 'COMMUNITY' }}" >> "$GITHUB_OUTPUT"
+          N_ASSETS=$(python3 -c "
+          import yaml
+          cfg = yaml.safe_load(open('kronos/config.yaml'))
+          print(len(cfg['data']['tickers']))
+          ")
+          echo "n_assets=$N_ASSETS" >> "$GITHUB_OUTPUT"
+
+      - name: Skip on non-trading days (scheduled runs only)
+        id: gate
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Loaded as a standalone file, not `import kronos` - calendar_utils.py
+          # is the one module in this package with zero third-party
+          # dependencies, and it should stay that way: importing the `kronos`
+          # package normally would run kronos/__init__.py first, which pulls
+          # in torch/numpy/pandas/etc. just to check a weekday.
+          SHOULD_RUN=$(python3 -c "
+          import importlib.util
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+          spec = importlib.util.spec_from_file_location('calendar_utils', 'kronos/calendar_utils.py')
+          calendar_utils = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(calendar_utils)
+          today = datetime.now(ZoneInfo('America/New_York')).date()
+          print('true' if calendar_utils.is_trading_day(today) else 'false')
+          ")
+          echo "should_run=$SHOULD_RUN" >> "$GITHUB_OUTPUT"
+          if [ "$SHOULD_RUN" != "true" ]; then
+            echo "Not a trading day (weekend or NYSE holiday) - skipping, no pod will be created."
+          fi
+
       - name: Load RunPod SSH key
+        if: steps.gate.outputs.should_run == 'true'
         uses: webfactory/ssh-agent@v0.9.0
         with:
           ssh-private-key: ${{ secrets.RUNPOD_SSH_PRIVATE_KEY }}
 
       - name: Create pod
         id: create
+        if: steps.gate.outputs.should_run == 'true'
         run: |
           set -euo pipefail
           RESPONSE=$(curl -sS -X POST "$RUNPOD_API/pods" \
@@ -67,9 +134,9 @@ jobs:
             -d '{
               "name": "kronos-ci-${{ github.run_id }}",
               "imageName": "runpod/pytorch:2.8.0-py3.11-cuda12.8.1-devel-ubuntu22.04",
-              "gpuTypeIds": ["${{ inputs.gpu_type }}"],
+              "gpuTypeIds": ["${{ steps.params.outputs.gpu_type }}"],
               "gpuCount": 1,
-              "cloudType": "${{ inputs.cloud_type }}",
+              "cloudType": "${{ steps.params.outputs.cloud_type }}",
               "containerDiskInGb": 20,
               "ports": ["22/tcp"]
             }')
@@ -84,6 +151,7 @@ jobs:
 
       - name: Poll until the pod is running and reachable
         id: connect
+        if: steps.gate.outputs.should_run == 'true'
         run: |
           set -euo pipefail
           POD_ID="${{ steps.create.outputs.pod_id }}"
@@ -106,6 +174,7 @@ jobs:
           exit 1
 
       - name: Wait for sshd inside the container
+        if: steps.gate.outputs.should_run == 'true'
         run: |
           set -euo pipefail
           for i in $(seq 1 20); do
@@ -120,6 +189,7 @@ jobs:
           exit 1
 
       - name: Train
+        if: steps.gate.outputs.should_run == 'true'
         run: |
           set -euo pipefail
           ssh -p "${{ steps.connect.outputs.port }}" \
@@ -131,7 +201,7 @@ jobs:
             cd /opt/prometheus
             pip install -q -e .
             pip install -q pyyaml yfinance
-            python scripts/train.py --mode "'"${{ inputs.mode }}"'" --device cuda
+            python scripts/train.py --mode "'"${{ steps.params.outputs.mode }}"'" --device cuda --n-assets "'"${{ steps.params.outputs.n_assets }}"'"
             tar czf /tmp/checkpoints.tar.gz checkpoints
           '
           scp -P "${{ steps.connect.outputs.port }}" \
@@ -139,12 +209,29 @@ jobs:
               ./checkpoints.tar.gz
 
       - name: Upload checkpoint artifact
-        if: success()
+        if: success() && steps.gate.outputs.should_run == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: kronos-checkpoints-${{ github.run_id }}
           path: checkpoints.tar.gz
           retention-days: 30
+
+      - name: Deliver checkpoint to Hetzner
+        if: success() && steps.gate.outputs.should_run == 'true'
+        run: |
+          set -euo pipefail
+          eval "$(ssh-agent -s)"
+          ssh-add - <<< "${{ secrets.HETZNER_SSH_KEY }}"
+          ssh-keyscan -H "${{ secrets.HETZNER_HOST }}" >> ~/.ssh/known_hosts
+          scp checkpoints.tar.gz \
+              "${{ secrets.HETZNER_USER }}@${{ secrets.HETZNER_HOST }}:/tmp/runpod_checkpoint.tar.gz"
+          ssh "${{ secrets.HETZNER_USER }}@${{ secrets.HETZNER_HOST }}" '
+            set -euo pipefail
+            mkdir -p /opt/prometheus/checkpoints/runpod
+            tar xzf /tmp/runpod_checkpoint.tar.gz -C /opt/prometheus/checkpoints/runpod --strip-components=1
+            rm -f /tmp/runpod_checkpoint.tar.gz
+            echo "Delivered - Kronos will pick this up within its next 30-60s poll."
+          '
 
       - name: Terminate pod (ALWAYS - zero idle billing by design)
         if: always() && steps.create.outputs.pod_id != ''

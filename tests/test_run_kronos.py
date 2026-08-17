@@ -159,21 +159,11 @@ class TestCatchUp:
 
 
 class TestRunpodWiring:
-    """scripts/run_kronos.py must kick off RunPod training exactly once
-    per DIGESTION dispatch (both live and catch-up paths) and poll for
-    adoption every main-loop iteration - never block on it."""
-
-    def test_catch_up_kicks_off_runpod_training_on_digestion(self, config):
-        orch = KronosOrchestrator(config)
-        memory = make_memory(config)
-        mid_day = datetime(2026, 3, 2, 11, 0, tzinfo=timezone.utc)
-
-        with patch.object(orch.pipeline, "run_sync", return_value=memory), \
-             patch.object(orch, "kick_off_runpod_training") as mock_kickoff:
-            executed = set()
-            run_kronos.catch_up(orch, executed, day=1, now=mid_day)
-
-        mock_kickoff.assert_called_once_with(mid_day.date())
+    """RunPod pod orchestration now runs entirely in GitHub Actions
+    (.github/workflows/train-runpod.yml), which delivers a checkpoint
+    onto this box directly - scripts/run_kronos.py has nothing to kick
+    off, only maybe_adopt_runpod_checkpoint() to poll every main-loop
+    iteration, cheaply, never blocking."""
 
     def test_run_realtime_polls_adoption_every_iteration_without_blocking(self, config):
         from unittest.mock import patch as _patch

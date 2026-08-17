@@ -121,7 +121,7 @@ Three workflows live in `.github/workflows/`:
 |---|---|---|
 | `ci.yml` | every push/PR, any branch | Runs the full test suite |
 | `deploy-hetzner.yml` | push to the working branch | Tests must pass, then SSHes into Hetzner, pulls latest code, restarts `kronos.service` |
-| `train-runpod.yml` | manual button (Actions tab) | Creates a fresh RunPod pod via the REST API, trains, downloads the checkpoint as a workflow artifact, **always terminates the pod** - even on failure |
+| `train-runpod.yml` | **nightly schedule** (06:00 UTC, Mon-Fri) + manual button | Creates a fresh RunPod pod via the REST API, trains, **delivers the checkpoint straight to Hetzner over SSH**, uploads it as a workflow artifact too, **always terminates the pod** - even on failure |
 
 The Hetzner deploy is safe to fire on every push: Kronos's crash-recovery
 logic (`kronos/orchestrator.py` - `save_checkpoint`/`load_checkpoint`,
@@ -135,6 +135,22 @@ read its real IP/port, `DELETE /pods/{id}` to terminate. No CLI, no
 output-parsing, no persistent pod to keep configured between runs: every
 run gets a brand-new pod and it's gone by the time the workflow ends,
 successful or not.
+
+**Training and trading are fully automatic and fully decoupled.** The
+scheduled run checks the real NYSE holiday calendar
+(`kronos/calendar_utils.py` - the same code Kronos's own phase gating
+uses) before creating a pod, so nothing spins up on a weekend or market
+holiday. Once training finishes, the workflow `scp`s the checkpoint
+directly onto the Hetzner box (reusing the same `HETZNER_*` secrets as
+`deploy-hetzner.yml`) at `checkpoints/runpod/`. Kronos never talks to the
+RunPod API and holds no RunPod credentials at all - it just notices a
+newer checkpoint file has appeared (polled every 30-60s,
+`KronosOrchestrator.maybe_adopt_runpod_checkpoint()`) and loads it
+straight into `ReflexArc.snn`, the model that actually decides trades -
+not just the daily report. All pod lifecycle management (create, poll,
+delete-even-on-failure) lives in GitHub Actions on purpose: scheduling
+and infra orchestration belong in CI/CD, not embedded in the process
+that's also responsible for trading every day.
 
 ### Private repository? Read this first
 

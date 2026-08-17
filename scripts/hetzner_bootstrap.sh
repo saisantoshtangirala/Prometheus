@@ -85,27 +85,24 @@ pip install -q --upgrade pip
 pip install -q -e . || pip install -q torch numpy scipy scikit-learn networkx pandas
 pip install -q pyyaml yfinance
 
-echo "=== Setting up secrets env file (Telegram, RunPod nightly training) ==="
+echo "=== Setting up secrets env file (Telegram notifications, etc.) ==="
 # Kept OUTSIDE the git repo on purpose - never commit bot tokens or API
 # keys. The leading '-' on EnvironmentFile below means systemd starts
 # fine even if this file is empty or missing entirely.
+#
+# Note: nightly RunPod GPU training (kronos/runpod_trigger.py) needs NO
+# secrets here. Pod orchestration runs entirely in GitHub Actions
+# (.github/workflows/train-runpod.yml, on a schedule), which delivers
+# the trained checkpoint to this box over SSH using ITS OWN secrets
+# (HETZNER_SSH_KEY etc., already set up below). Kronos just watches
+# checkpoints/runpod/ for the file that shows up and adopts it - it never
+# talks to the RunPod API and holds no RunPod credentials at all.
 if [ ! -f /etc/kronos.env ]; then
     cat > /etc/kronos.env <<'ENVFILE'
 # Kronos secrets - not tracked in git. Uncomment and fill in to enable
 # daily Telegram progress reports (see kronos/notifier.py for setup):
 #KRONOS_TELEGRAM_BOT_TOKEN=123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ
 #KRONOS_TELEGRAM_CHAT_ID=987654321
-
-# Uncomment to enable nightly RunPod GPU training (see
-# kronos/runpod_trigger.py). Both are required - if RUNPOD_API_KEY is
-# unset, Kronos never touches RunPod at all and behaves exactly as
-# before this feature existed.
-#RUNPOD_API_KEY=rp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-# Private half of an SSH keypair whose PUBLIC half is registered under
-# RunPod Settings -> SSH Public Keys (RunPod bakes it into every new
-# pod's authorized_keys automatically). Generate with:
-#   ssh-keygen -t ed25519 -N "" -f /root/.ssh/runpod_key
-#RUNPOD_SSH_KEY_PATH=/root/.ssh/runpod_key
 ENVFILE
     chmod 600 /etc/kronos.env
 fi
