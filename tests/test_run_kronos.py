@@ -158,6 +158,55 @@ class TestCatchUp:
         }
 
 
+class TestRunpodWiring:
+    """scripts/run_kronos.py must kick off RunPod training exactly once
+    per DIGESTION dispatch (both live and catch-up paths) and poll for
+    adoption every main-loop iteration - never block on it."""
+
+    def test_catch_up_kicks_off_runpod_training_on_digestion(self, config):
+        orch = KronosOrchestrator(config)
+        memory = make_memory(config)
+        mid_day = datetime(2026, 3, 2, 11, 0, tzinfo=timezone.utc)
+
+        with patch.object(orch.pipeline, "run_sync", return_value=memory), \
+             patch.object(orch, "kick_off_runpod_training") as mock_kickoff:
+            executed = set()
+            run_kronos.catch_up(orch, executed, day=1, now=mid_day)
+
+        mock_kickoff.assert_called_once_with(mid_day.date())
+
+    def test_run_realtime_polls_adoption_every_iteration_without_blocking(self, config):
+        from unittest.mock import patch as _patch
+        from zoneinfo import ZoneInfo
+
+        orch = KronosOrchestrator(config)
+        et_tz = ZoneInfo("America/New_York")
+        during_market_hours = datetime(2026, 3, 2, 10, 0, tzinfo=et_tz)
+
+        call_count = {"n": 0}
+
+        def fake_sleep(seconds):
+            call_count["n"] += 1
+            if call_count["n"] >= 3:
+                run_kronos._shutdown = True
+
+        with _patch("run_kronos._exchange_now", return_value=during_market_hours), \
+             _patch.object(orch, "phase_for", return_value=Phase.REFLEX), \
+             _patch.object(orch.pipeline, "run_sync", return_value=make_memory(config)), \
+             _patch("run_kronos.fetch_live_bar", return_value=({}, {})), \
+             _patch.object(orch, "maybe_adopt_runpod_checkpoint") as mock_adopt, \
+             _patch("run_kronos.time.sleep", side_effect=fake_sleep):
+            try:
+                run_kronos.run_realtime(orch, n_days=1)
+            finally:
+                run_kronos._shutdown = False
+
+        assert mock_adopt.call_count == 3, (
+            "must be polled once per loop iteration, cheaply - not skipped, "
+            "not blocked on"
+        )
+
+
 class TestExchangeTimezone:
     """Regression: run_realtime()/catch_up() used to feed raw UTC wall-clock
     time into orchestrator.phase_for(), which reads only the wall-clock

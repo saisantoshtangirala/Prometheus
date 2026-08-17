@@ -25,6 +25,8 @@ import json
 import logging
 import os
 import pickle
+import threading
+import time
 import traceback
 from dataclasses import dataclass, field
 from datetime import date as ddate, datetime, time as dtime, timedelta, timezone
@@ -42,7 +44,16 @@ from kronos.notifier import TelegramNotifier
 from kronos.paper_trader import PaperTrader
 from kronos.reflex import ReflexArc
 from kronos.reporter import GodsEyeReporter
+from kronos.runpod_trigger import TrainingResult, load_runpod_checkpoint, trigger_training_and_wait
 from kronos.warmer import KronosWarmer, WarmupResult
+
+# How long, from kick-off, KronosOrchestrator will keep waiting on a
+# background RunPod run before giving up and keeping today's existing
+# reflex.snn weights - the "never miss market open" cap. Deliberately
+# smaller than runpod_trigger's own JOB_TIMEOUT_SECONDS (3h): that timeout
+# governs the training job itself, this one governs how long the daily
+# cycle is willing to wait on it, including pod-boot and SSH overhead.
+RUNPOD_EVOLUTION_BUDGET_SECONDS = 6 * 60 * 60
 
 logger = logging.getLogger(__name__)
 
@@ -176,7 +187,15 @@ class KronosOrchestrator:
         self._completed_today: Set[str] = set()
         self.skip_trading: bool = False       # set on stale/unavailable data
 
+        # -- RunPod nightly training (kronos/runpod_trigger.py) ---------
+        self._runpod_enabled = bool(os.environ.get("RUNPOD_API_KEY", "").strip())
+        self._runpod_thread: Optional[threading.Thread] = None
+        self._runpod_result: Optional[TrainingResult] = None
+        self._runpod_kickoff_monotonic: Optional[float] = None
+        self._runpod_adopted_today: bool = True   # nothing pending until kick-off
+
         os.makedirs(self.cfg.orchestrator.checkpoint_dir, exist_ok=True)
+        self._load_persisted_snn()
 
     # ------------------------------------------------------------------
     # Phase resolution
@@ -707,6 +726,111 @@ class KronosOrchestrator:
             self.trader.audit(self.state.day, "checkpoint", path)
         except Exception as e:
             logger.warning("[orchestrator] checkpoint failed: %s", e)
+
+    # ------------------------------------------------------------------
+    # RunPod nightly training
+    #
+    # kick_off_runpod_training() is called once per trading day, right
+    # when DIGESTION opens (scripts/run_kronos.py). It starts
+    # runpod_trigger.trigger_training_and_wait() on a background thread -
+    # a real, hours-long, blocking job - so Digestion/Nightmare/Evolution/
+    # Adaptation/Report all keep running on their existing schedule,
+    # completely untouched. None of them need the GPU checkpoint; only
+    # ReflexArc.snn (actual trade decisions) does.
+    #
+    # maybe_adopt_runpod_checkpoint() is polled every iteration of the
+    # main realtime loop - cheap, non-blocking (thread.is_alive()), never
+    # a long join. The moment the background thread finishes, or a fixed
+    # budget expires, it adopts the result (or explicitly doesn't) and
+    # sets _runpod_adopted_today so it stops checking until tomorrow.
+    # This split is what keeps a multi-hour GPU job from ever blocking
+    # phase dispatch, catch_up() bursts, or REFLEX ticks.
+    # ------------------------------------------------------------------
+
+    def _active_snn_path(self) -> str:
+        return os.path.join(self.cfg.orchestrator.checkpoint_dir, "reflex_snn_active.pt")
+
+    def _load_persisted_snn(self) -> None:
+        """Best-effort restore of the last successfully-adopted RunPod SNN
+        checkpoint, so a service restart doesn't quietly lose it and fall
+        back to a fresh random init. Never raises."""
+        path = self._active_snn_path()
+        if not os.path.exists(path):
+            return
+        try:
+            state_dict = torch.load(path, map_location="cpu")
+            self.reflex.snn.load_state_dict(state_dict)
+            logger.info("[orchestrator] restored last-adopted RunPod SNN weights from %s", path)
+        except Exception as e:
+            logger.warning("[orchestrator] could not restore persisted SNN weights (%s) - starting from scratch", e)
+
+    def _persist_active_snn(self) -> None:
+        try:
+            torch.save(self.reflex.snn.state_dict(), self._active_snn_path())
+        except Exception as e:
+            logger.warning("[orchestrator] failed to persist active SNN weights: %s", e)
+
+    def kick_off_runpod_training(self, today: ddate) -> None:
+        """Start tonight's RunPod GPU training run in the background.
+        No-op on weekends/holidays, when RUNPOD_API_KEY isn't set, or if
+        a run is already in flight. Call once per trading day, at
+        DIGESTION - see scripts/run_kronos.py."""
+        if not self._runpod_enabled:
+            return
+        if not is_trading_day(today):
+            logger.info("[orchestrator] %s is not a trading day - skipping RunPod training", today)
+            return
+        if self._runpod_thread is not None and self._runpod_thread.is_alive():
+            logger.warning("[orchestrator] RunPod training thread already running - not starting another")
+            return
+
+        n_assets = len(self.cfg.data.tickers)
+        self._runpod_result = None
+        self._runpod_adopted_today = False
+        self._runpod_kickoff_monotonic = time.monotonic()
+
+        def _worker():
+            self._runpod_result = trigger_training_and_wait(n_assets=n_assets)
+
+        self._runpod_thread = threading.Thread(target=_worker, name="runpod-trainer", daemon=True)
+        self._runpod_thread.start()
+        logger.info("[orchestrator] RunPod nightly training kicked off in the background (day %d)", self.state.day)
+
+    def maybe_adopt_runpod_checkpoint(self) -> None:
+        """Non-blocking - safe to call every iteration of the main loop.
+        Adopts tonight's RunPod-trained SNN into self.reflex.snn the
+        moment it's ready, or gives up (keeping today's existing weights,
+        i.e. yesterday's) once RUNPOD_EVOLUTION_BUDGET_SECONDS has
+        elapsed since kick-off, so market open is never missed."""
+        if self._runpod_thread is None or self._runpod_adopted_today:
+            return
+
+        if self._runpod_thread.is_alive():
+            elapsed = time.monotonic() - (self._runpod_kickoff_monotonic or time.monotonic())
+            if elapsed < RUNPOD_EVOLUTION_BUDGET_SECONDS:
+                return   # still within budget - keep waiting, don't block
+            logger.critical(
+                "[orchestrator] RunPod training still running after %dh - "
+                "giving up and keeping today's existing SNN weights so "
+                "market open is never missed", RUNPOD_EVOLUTION_BUDGET_SECONDS // 3600,
+            )
+            self._runpod_adopted_today = True
+            return
+
+        # thread has finished, one way or another
+        self._runpod_adopted_today = True
+        result = self._runpod_result
+        self._runpod_result = None
+        if result is None or not result.success:
+            reason = result.reason if result else "unknown"
+            logger.critical(
+                "[orchestrator] RunPod training unavailable (%s) - keeping "
+                "today's existing SNN weights (yesterday's checkpoint)", reason,
+            )
+            return
+        if load_runpod_checkpoint(self.reflex.snn):
+            self._persist_active_snn()
+            logger.info("[orchestrator] adopted tonight's RunPod-trained SNN weights")
 
     # ------------------------------------------------------------------
     # Helpers

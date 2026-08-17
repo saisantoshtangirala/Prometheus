@@ -36,6 +36,7 @@ from kronos.orchestrator import (
 from kronos.paper_trader import PaperTrader
 from kronos.reflex import OrderBookSimulator, ReflexArc, RegimeSwitchGate
 from kronos.reporter import GodsEyeReporter
+from kronos.runpod_trigger import TrainingResult, load_runpod_checkpoint, trigger_training_and_wait
 from kronos.warmer import ClippedMAML, KronosWarmer, WarmupResult
 
 __all__ = [
@@ -49,4 +50,5 @@ __all__ = [
     "PaperTrader",
     "GodsEyeReporter",
     "KronosOrchestrator", "DayState", "Phase",
+    "TrainingResult", "trigger_training_and_wait", "load_runpod_checkpoint",
 ]

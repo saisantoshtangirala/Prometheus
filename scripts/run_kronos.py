@@ -182,6 +182,7 @@ def catch_up(orchestrator, executed_today: set, day: int, now=None) -> None:
         if phase == Phase.DIGESTION:
             orchestrator.state.day = day
             orchestrator.run_digestion()
+            orchestrator.kick_off_runpod_training(now.date())
         elif phase == Phase.NIGHTMARE:
             orchestrator.run_nightmare()
         elif phase == Phase.EVOLUTION:
@@ -214,6 +215,12 @@ def run_realtime(orchestrator, n_days: int):
 
         phase = orchestrator.phase_for(now)
 
+        # Cheap, non-blocking check every loop iteration (every 30-60s) -
+        # never a long join. Adopts tonight's RunPod-trained SNN the
+        # instant the background job finishes, whichever phase we're
+        # currently in, including during REFLEX ticks below.
+        orchestrator.maybe_adopt_runpod_checkpoint()
+
         if phase == Phase.REFLEX:
             # tick once per minute during market hours
             memory = orchestrator.state.memory
@@ -242,6 +249,7 @@ def run_realtime(orchestrator, n_days: int):
             if phase == Phase.DIGESTION:
                 orchestrator.state.day = day
                 orchestrator.run_digestion()
+                orchestrator.kick_off_runpod_training(now.date())
             elif phase == Phase.NIGHTMARE:
                 orchestrator.run_nightmare()
             elif phase == Phase.EVOLUTION:
