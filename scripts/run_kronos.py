@@ -26,6 +26,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from kronos import KronosOrchestrator, Phase, load_config
 
+# Must exist before FileHandler below opens it - logging.basicConfig runs at
+# import time, well before main()'s own Path("logs").mkdir() would run.
+Path("logs").mkdir(parents=True, exist_ok=True)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -144,7 +148,6 @@ def main():
     parser.add_argument("--config", default=None, help="path to config.yaml")
     args = parser.parse_args()
 
-    Path("logs").mkdir(exist_ok=True)
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
 
