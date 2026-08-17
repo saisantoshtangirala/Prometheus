@@ -17,8 +17,9 @@ import logging
 import signal
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import numpy as np
 
@@ -96,6 +97,20 @@ PRE_MARKET_PHASES = [Phase.DIGESTION, Phase.NIGHTMARE, Phase.EVOLUTION,
                      Phase.ADAPTATION, Phase.REPORT]
 
 
+def _exchange_now(orchestrator) -> datetime:
+    """Current wall-clock time in the exchange timezone (cfg.run.timezone,
+    e.g. America/New_York). orchestrator.phase_for() reads only the
+    wall-clock digits off whatever datetime it's given and compares them
+    against schedule boundaries that are documented - and tested - as
+    exchange-local times (config.yaml: "24h clock, exchange timezone").
+    Feeding it raw UTC (a server always runs in UTC) makes it compare UTC
+    digits against ET boundaries, which is wrong by the UTC/ET offset
+    every single day - it opens/closes the REFLEX trading window hours
+    off from when the market is actually open."""
+    tz = ZoneInfo(orchestrator.cfg.run.timezone)
+    return datetime.now(tz)
+
+
 def catch_up(orchestrator, executed_today: set, day: int, now=None) -> None:
     """
     Run any pre-market phase whose window has already opened today but
@@ -106,7 +121,7 @@ def catch_up(orchestrator, executed_today: set, day: int, now=None) -> None:
     adaptation/report and leave the reflex arc running with no memory
     until the next midnight UTC boundary.
     """
-    now = now or datetime.now(timezone.utc)
+    now = now or _exchange_now(orchestrator)
     current_phase = orchestrator.phase_for(now)
     try:
         cutoff = PRE_MARKET_PHASES.index(current_phase)
@@ -136,17 +151,19 @@ def run_realtime(orchestrator, n_days: int):
     """Wall-clock loop: execute each phase when its window opens."""
     executed_today = set()
     day = 1
-    current_date = datetime.now(timezone.utc).date()
+    current_date = _exchange_now(orchestrator).date()
     orchestrator.state.day = day
+    reflex_ticks = 0
 
     logger.info("Kronos realtime loop started (target %d days)", n_days)
     catch_up(orchestrator, executed_today, day)
 
     while day <= n_days and not _shutdown:
-        now = datetime.now(timezone.utc)
+        now = _exchange_now(orchestrator)
         if now.date() != current_date:
             current_date = now.date()
             executed_today.clear()
+            reflex_ticks = 0
             day += 1
             orchestrator.state.day = day
 
@@ -159,6 +176,15 @@ def run_realtime(orchestrator, n_days: int):
                 vix = memory.macro.get("vix_last", 20.0)
                 orchestrator.run_reflex_tick(vix)
                 orchestrator.heartbeat(now)
+            reflex_ticks += 1
+            if reflex_ticks % 15 == 0:
+                # REFLEX ticks are otherwise fully silent - this is the only
+                # sign of life in the log during the ~6.5h market session.
+                logger.info(
+                    "[main] reflex tick %d: equity=$%.2f regime=%s (day %d)",
+                    reflex_ticks, orchestrator.trader.equity(),
+                    orchestrator.reflex.gate.state.regime, day,
+                )
             time.sleep(60)
             continue
 

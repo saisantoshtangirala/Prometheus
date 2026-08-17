@@ -158,6 +158,101 @@ class TestCatchUp:
         }
 
 
+class TestExchangeTimezone:
+    """Regression: run_realtime()/catch_up() used to feed raw UTC wall-clock
+    time into orchestrator.phase_for(), which reads only the wall-clock
+    digits off whatever datetime it's given and compares them against
+    schedule boundaries that are exchange-local (America/New_York) by
+    design (config.yaml: "24h clock, exchange timezone"; see also
+    TestOrchestrator.test_orc01_normal_daily_cycle in test_kronos_chaos.py,
+    which feeds phase_for() naive ET wall-clock times directly). A server
+    always runs in UTC, so this silently ran the REFLEX trading window
+    hours off from real NYSE hours every single day."""
+
+    def test_exchange_now_returns_et_digits_not_utc_digits(self, config):
+        """At a known instant, _exchange_now() must return the ET wall
+        clock, not the server's UTC wall clock."""
+        from datetime import datetime, timezone
+        from unittest.mock import patch as _patch
+        from zoneinfo import ZoneInfo
+
+        orch = KronosOrchestrator(config)
+        # 2026-08-17 13:25 UTC = 09:25 ET (EDT, UTC-4 in August)
+        fixed_utc = datetime(2026, 8, 17, 13, 25, tzinfo=timezone.utc)
+
+        class _FixedDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return fixed_utc.astimezone(tz) if tz else fixed_utc
+
+        with _patch("run_kronos.datetime", _FixedDatetime):
+            et_now = run_kronos._exchange_now(orch)
+
+        assert et_now.tzinfo is not None
+        assert et_now.astimezone(ZoneInfo("America/New_York")).hour == 9
+        assert et_now.hour == 9, (
+            "_exchange_now() must return ET wall-clock digits (09:xx), "
+            "not the UTC wall-clock digits (13:xx) - phase_for() only "
+            "ever looks at .time(), it does not convert timezones itself"
+        )
+
+    def test_utc_digits_fed_directly_would_wrongly_resolve_to_reflex(self, config):
+        """Demonstrates the exact bug this fixes: feeding phase_for() the
+        raw UTC datetime at real ET market-open-minus-5-minutes wrongly
+        reports REFLEX (already trading) instead of REPORT (pre-market),
+        because 13:25 (UTC digits) >= the 09:30 REFLEX boundary even
+        though the real ET time is only 09:25 - market hasn't opened."""
+        from datetime import datetime, timezone
+
+        orch = KronosOrchestrator(config)
+        real_et_time_is_9_25_am = datetime(2026, 8, 17, 13, 25, tzinfo=timezone.utc)
+
+        buggy_phase = orch.phase_for(real_et_time_is_9_25_am)
+        assert buggy_phase == Phase.REFLEX, (
+            "sanity check: confirms phase_for() ignores tzinfo and reads "
+            "raw wall-clock digits, which is exactly why the caller must "
+            "convert to exchange time first"
+        )
+
+    def test_catch_up_default_now_resolves_via_exchange_time(self, config):
+        """catch_up() with no explicit now= must ask phase_for() using
+        exchange-local time (via _exchange_now), not datetime.now(utc)."""
+        from datetime import datetime, timezone
+        from unittest.mock import patch as _patch
+        from zoneinfo import ZoneInfo
+
+        orch = KronosOrchestrator(config)
+        memory = make_memory(config)
+        et_tz = ZoneInfo("America/New_York")
+        # Real ET time: 09:25 - five minutes before market open, still
+        # inside the REPORT window (opens 06:00, REFLEX opens 09:30).
+        fixed_et = datetime(2026, 3, 2, 9, 25, tzinfo=et_tz)
+
+        seen_now = []
+        real_phase_for = orch.phase_for
+
+        def spying_phase_for(now):
+            seen_now.append(now)
+            return real_phase_for(now)
+
+        with _patch.object(orch, "phase_for", side_effect=spying_phase_for), \
+             _patch("run_kronos._exchange_now", return_value=fixed_et), \
+             _patch.object(orch.pipeline, "run_sync", return_value=memory):
+            executed = set()
+            run_kronos.catch_up(orch, executed, day=1)
+
+        assert seen_now == [fixed_et], (
+            "catch_up() must resolve its own now via _exchange_now(), not "
+            "compute a fresh datetime.now(timezone.utc) internally"
+        )
+        # 09:25 ET is before REFLEX (09:30) - REPORT is the last window
+        # open, so catch-up must run all five pre-market phases, but must
+        # NOT have wrongly concluded the market was already open.
+        assert executed == {
+            "digestion", "nightmare", "evolution", "adaptation", "report",
+        }
+
+
 class TestLoggingSetup:
     def test_log_directory_created_before_file_handler(self, tmp_path, monkeypatch):
         """Regression: logging.FileHandler("logs/kronos.log") used to run
