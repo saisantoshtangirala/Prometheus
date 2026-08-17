@@ -103,6 +103,7 @@ class TelegramNotifier:
         quality_flags: Optional[List[str]] = None,
         phase_failures: Optional[Dict[str, str]] = None,
         reflex_regime: Optional[str] = None,
+        runpod_status: Optional[str] = None,
     ) -> str:
         """Build the plain-text Telegram message for one day's close."""
         total = total_days or int(self.cfg.run.total_days)
@@ -133,6 +134,10 @@ class TelegramNotifier:
             lines.append(f"NEAT best fitness: {top_fitness[0]:.3f}")
         if source_used:
             lines.append(f"Data source: {source_used}")
+        if runpod_status == "adopted":
+            lines.append("RunPod: adopted fresh checkpoint")
+        elif runpod_status == "unchanged":
+            lines.append("RunPod: none today (kept yesterday's)")
 
         if quality_flags:
             notable = [f for f in quality_flags if not f.startswith("kalman_repaired")]

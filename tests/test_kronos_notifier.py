@@ -198,6 +198,30 @@ class TestReportFormatting:
         assert "calm" not in calm_text.lower() or "Reflex gate" not in calm_text
         assert "PANIC" in panic_text
 
+    def test_runpod_status_adopted(self, config):
+        notifier = TelegramNotifier(config)
+        text = notifier.build_daily_report(
+            day=1, stats={"equity": 100000.0, "pnl": 0.0, "n_trades": 0},
+            total_days=365, runpod_status="adopted",
+        )
+        assert "RunPod: adopted fresh checkpoint" in text
+
+    def test_runpod_status_unchanged(self, config):
+        notifier = TelegramNotifier(config)
+        text = notifier.build_daily_report(
+            day=1, stats={"equity": 100000.0, "pnl": 0.0, "n_trades": 0},
+            total_days=365, runpod_status="unchanged",
+        )
+        assert "RunPod: none today (kept yesterday's)" in text
+
+    def test_runpod_status_omitted_when_none(self, config):
+        notifier = TelegramNotifier(config)
+        text = notifier.build_daily_report(
+            day=1, stats={"equity": 100000.0, "pnl": 0.0, "n_trades": 0},
+            total_days=365, runpod_status=None,
+        )
+        assert "RunPod" not in text
+
 
 class TestOrchestratorIntegration:
     def test_orchestrator_has_notifier(self):

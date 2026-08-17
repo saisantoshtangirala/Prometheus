@@ -121,6 +121,7 @@ class KronosOrchestrator:
         # on disk right now" so a checkpoint that arrived before this
         # process even started isn't treated as new on every restart.
         self._runpod_last_adopted_mtime: Optional[float] = self._current_runpod_checkpoint_mtime()
+        self._runpod_adopted_today: bool = False   # reset once per day in run_logging()
 
     # ------------------------------------------------------------------
     # Phase resolution
@@ -359,6 +360,10 @@ class KronosOrchestrator:
         stats = self.trader.close_day(self.state.day, prices)
         self.trader.audit(self.state.day, "logging", json.dumps(stats))
         self._send_daily_notification(stats)
+        # One digest per day covers it - reset regardless of whether a
+        # notification was actually sent (e.g. Telegram not configured),
+        # so this always reflects "since the last day boundary."
+        self._runpod_adopted_today = False
         return stats
 
     def _send_daily_notification(self, stats: Dict) -> None:
@@ -370,6 +375,11 @@ class KronosOrchestrator:
             memory = self.state.memory
             evo = self.state.evolution
             warm = self.state.warmup
+            runpod_status = None
+            if self._runpod_adopted_today:
+                runpod_status = "adopted"
+            elif self._runpod_last_adopted_mtime is not None:
+                runpod_status = "unchanged"
             text = self.notifier.build_daily_report(
                 day=self.state.day,
                 stats=stats,
@@ -379,6 +389,7 @@ class KronosOrchestrator:
                 quality_flags=memory.quality_flags if memory else None,
                 phase_failures=self.state.phase_failures or None,
                 reflex_regime=self.reflex.gate.state.regime,
+                runpod_status=runpod_status,
             )
             self.notifier.send(text)
         except Exception as e:
@@ -710,6 +721,7 @@ class KronosOrchestrator:
             return
         if load_runpod_checkpoint(self.reflex.snn, checkpoint_dir=RUNPOD_CHECKPOINT_DIR):
             self._runpod_last_adopted_mtime = mtime
+            self._runpod_adopted_today = True
             self._persist_active_snn()
             logger.info("[orchestrator] adopted a new RunPod-trained SNN checkpoint")
         else:

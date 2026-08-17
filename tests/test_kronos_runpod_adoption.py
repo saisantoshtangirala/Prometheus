@@ -192,3 +192,99 @@ class TestRestartPersistence:
         for k, v in orch2.reflex.snn.state_dict().items():
             assert torch.equal(v, expected[k])
         orch2.trader.close()
+
+
+class TestDailyDigestRunpodStatus:
+    """The daily Telegram digest should say whether a fresh RunPod
+    checkpoint was adopted that day, so the user learns the pipeline
+    worked from the one message they already read - not by checking
+    GitHub Actions separately."""
+
+    def test_reports_adopted_when_checkpoint_landed_today(self, config, monkeypatch, tmp_path):
+        from unittest.mock import MagicMock, patch
+
+        runpod_dir = tmp_path / "runpod"
+        monkeypatch.setattr("kronos.orchestrator.RUNPOD_CHECKPOINT_DIR", runpod_dir)
+        monkeypatch.setenv("KRONOS_TELEGRAM_BOT_TOKEN", "123:ABC")
+        monkeypatch.setenv("KRONOS_TELEGRAM_CHAT_ID", "999999")
+        config.override("notifications.enabled", True)
+
+        orch = KronosOrchestrator(config)
+        source = type(orch.reflex.snn)(
+            input_size=len(config.data.tickers), layer_sizes=[32, 16],
+            output_size=len(config.data.tickers),
+        )
+        _write_snn_checkpoint(runpod_dir, source)
+        orch.maybe_adopt_runpod_checkpoint()
+        assert orch._runpod_adopted_today is True
+
+        mock_resp = MagicMock(status_code=200, text="ok")
+        with patch("requests.post", return_value=mock_resp) as mock_post:
+            orch.run_logging()
+
+        sent_text = mock_post.call_args.kwargs["json"]["text"]
+        assert "RunPod: adopted fresh checkpoint" in sent_text
+        orch.trader.close()
+
+    def test_flag_resets_after_run_logging(self, config, monkeypatch, tmp_path):
+        runpod_dir = tmp_path / "runpod"
+        monkeypatch.setattr("kronos.orchestrator.RUNPOD_CHECKPOINT_DIR", runpod_dir)
+        orch = KronosOrchestrator(config)
+
+        source = type(orch.reflex.snn)(
+            input_size=len(config.data.tickers), layer_sizes=[32, 16],
+            output_size=len(config.data.tickers),
+        )
+        _write_snn_checkpoint(runpod_dir, source)
+        orch.maybe_adopt_runpod_checkpoint()
+        assert orch._runpod_adopted_today is True
+
+        orch.run_logging()
+        assert orch._runpod_adopted_today is False, (
+            "must reset once the day's digest has gone out, so day 2 "
+            "doesn't wrongly claim day 1's adoption"
+        )
+        orch.trader.close()
+
+    def test_reports_unchanged_when_no_new_checkpoint_but_one_exists(self, config, monkeypatch, tmp_path):
+        from unittest.mock import MagicMock, patch
+
+        runpod_dir = tmp_path / "runpod"
+        monkeypatch.setattr("kronos.orchestrator.RUNPOD_CHECKPOINT_DIR", runpod_dir)
+        monkeypatch.setenv("KRONOS_TELEGRAM_BOT_TOKEN", "123:ABC")
+        monkeypatch.setenv("KRONOS_TELEGRAM_CHAT_ID", "999999")
+        config.override("notifications.enabled", True)
+
+        orch = KronosOrchestrator(config)
+        source = type(orch.reflex.snn)(
+            input_size=len(config.data.tickers), layer_sizes=[32, 16],
+            output_size=len(config.data.tickers),
+        )
+        _write_snn_checkpoint(runpod_dir, source)
+        orch.maybe_adopt_runpod_checkpoint()
+        orch.run_logging()   # day 1: adopted, then flag resets
+
+        mock_resp = MagicMock(status_code=200, text="ok")
+        with patch("requests.post", return_value=mock_resp) as mock_post:
+            orch.run_logging()   # day 2: nothing new landed
+
+        sent_text = mock_post.call_args.kwargs["json"]["text"]
+        assert "RunPod: none today (kept yesterday's)" in sent_text
+        orch.trader.close()
+
+    def test_no_runpod_line_when_never_adopted_anything(self, config, monkeypatch, tmp_path):
+        from unittest.mock import MagicMock, patch
+
+        monkeypatch.setattr("kronos.orchestrator.RUNPOD_CHECKPOINT_DIR", tmp_path / "runpod")
+        monkeypatch.setenv("KRONOS_TELEGRAM_BOT_TOKEN", "123:ABC")
+        monkeypatch.setenv("KRONOS_TELEGRAM_CHAT_ID", "999999")
+        config.override("notifications.enabled", True)
+
+        orch = KronosOrchestrator(config)   # no checkpoint ever appears
+        mock_resp = MagicMock(status_code=200, text="ok")
+        with patch("requests.post", return_value=mock_resp) as mock_post:
+            orch.run_logging()
+
+        sent_text = mock_post.call_args.kwargs["json"]["text"]
+        assert "RunPod" not in sent_text
+        orch.trader.close()
