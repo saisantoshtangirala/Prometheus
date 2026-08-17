@@ -483,6 +483,41 @@ class TestNeatEvolution:
     def _buffer(self, config, memory):
         return NightmareGenerator(config).generate(memory, n_futures=32)
 
+    def test_attention_first_layer_matches_true_input_dim(self):
+        """
+        Regression: seen live on the Hetzner deployment -
+        'mat1 and mat2 shapes cannot be multiplied (10000x50 and 48x512)'.
+        An attention gene as the FIRST layer used to silently redefine
+        current_dim to make it divisible by n_heads (50 -> 48), then built
+        Linear(48, ...) while the network is actually called with the true
+        50-wide input - guaranteed mismatch whenever input_dim isn't
+        already a multiple of a valid head count. input_dim=50 reproduces
+        it exactly (Kronos's n_assets=10 * horizon=5 on the live config).
+        """
+        from prometheus.meta.neat_evolver import GenomeDecoder, LayerGene
+
+        genome = [LayerGene(1, "attention", 512, "relu", 0.1, n_heads=8)]
+        model = GenomeDecoder.decode(genome, input_dim=50, output_dim=10)
+
+        x = torch.randn(4, 50)
+        out = model(x)  # must not raise a shape-mismatch RuntimeError
+        assert out.shape == (4, 10)
+        assert torch.isfinite(out).all()
+
+    def test_attention_layer_output_evenly_divisible_by_heads(self):
+        """The attention block's own working width must still divide
+        cleanly by its head count, even though it's no longer allowed to
+        silently redefine the true input width to achieve that."""
+        from prometheus.meta.neat_evolver import GenomeDecoder, LayerGene
+
+        genome = [LayerGene(1, "attention", 100, "relu", 0.0, n_heads=8)]
+        # hidden_dim=100 isn't itself divisible by 8; attn_dim must be
+        # derived (100 // 8 * 8 = 96), not taken from input_dim at all.
+        model = GenomeDecoder.decode(genome, input_dim=17, output_dim=3)
+        x = torch.randn(2, 17)
+        out = model(x)
+        assert out.shape == (2, 3)
+
     def test_nea01_population_stagnation_broken(self, config, memory):
         """NEA-01: an all-tie population gets 5 mutated variants."""
         evolver = KronosEvolver(config)

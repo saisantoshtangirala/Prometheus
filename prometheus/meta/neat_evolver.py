@@ -120,15 +120,22 @@ class GenomeDecoder:
                     modules.append(nn.Dropout(gene.dropout))
                 current_dim = gene.hidden_dim
             elif gene.layer_type == "attention":
-                # Simplified: linear projection + multi-head attn
-                n_heads = min(gene.n_heads, current_dim // 8)
+                # Simplified: linear projection + multi-head attn.
+                # n_heads/attn_dim are derived from hidden_dim (this layer's
+                # OWN working width), never from current_dim (the true
+                # input width this layer must accept from upstream) -
+                # current_dim must never be silently redefined here, or the
+                # Linear's in_features stops matching what it actually
+                # receives at runtime.
+                n_heads = min(gene.n_heads, max(gene.hidden_dim // 8, 1))
                 if n_heads < 1:
                     n_heads = 1
-                if current_dim % n_heads != 0:
-                    current_dim = (current_dim // n_heads) * n_heads
-                modules.append(nn.Linear(current_dim, gene.hidden_dim))
+                attn_dim = (gene.hidden_dim // n_heads) * n_heads
+                if attn_dim < 1:
+                    attn_dim = gene.hidden_dim
+                modules.append(nn.Linear(current_dim, attn_dim))
                 modules.append(copy.deepcopy(ACTIVATION_MAP[gene.activation]))
-                current_dim = gene.hidden_dim
+                current_dim = attn_dim
 
         modules.append(nn.Linear(current_dim, output_dim))
         return nn.Sequential(*modules)
