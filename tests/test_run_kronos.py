@@ -1,0 +1,178 @@
+"""
+Tests for scripts/run_kronos.py - the actual CLI entry point, not just the
+KronosOrchestrator class underneath it.
+
+This file exists because of a real bug: the FileHandler crash and the
+realtime-loop mid-day-restart gap were BOTH invisible to every other test
+in this repo, since every other test exercises KronosOrchestrator directly
+and never actually runs this script. Testing the entry point separately is
+the fix for that blind spot, not just a fix for the bugs it found.
+"""
+
+from __future__ import annotations
+
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from unittest.mock import patch
+
+import numpy as np
+import pandas as pd
+import pytest
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
+
+from kronos import KronosOrchestrator, Phase, load_config
+from kronos.data_pipeline import DailyMemory
+import run_kronos
+
+
+@pytest.fixture
+def config(tmp_path):
+    cfg = load_config()
+    cfg.override("data.tickers", ["AAA", "BBB", "CCC"])
+    cfg.override("nightmare.n_futures", 32)
+    cfg.override("nightmare.batch_size", 16)
+    cfg.override("evolution.population_size", 6)
+    cfg.override("evolution.n_generations", 1)
+    cfg.override("evolution.top_k", 3)
+    cfg.override("trading.db_path", str(tmp_path / "trades.db"))
+    cfg.override("orchestrator.checkpoint_dir", str(tmp_path / "models"))
+    cfg.override("orchestrator.report_dir", str(tmp_path / "reports"))
+    cfg.override("orchestrator.veto_file", str(tmp_path / "veto.txt"))
+    cfg.override("run.log_dir", str(tmp_path))
+    return cfg
+
+
+def make_memory(config) -> DailyMemory:
+    rng = np.random.default_rng(4)
+    tickers = list(config.data.tickers)
+    dates = pd.bdate_range("2026-01-01", periods=30)
+    prices = pd.DataFrame(
+        100 * np.exp(np.cumsum(rng.normal(0.0005, 0.01, (30, len(tickers))), axis=0)),
+        index=dates, columns=tickers,
+    )
+    volumes = pd.DataFrame(
+        rng.integers(1_000_000, 50_000_000, (30, len(tickers))).astype(float),
+        index=dates, columns=tickers,
+    )
+    returns = prices.pct_change().fillna(0.0)
+    vix = pd.Series(20.0, index=dates, name="VIX")
+    return DailyMemory(
+        as_of=datetime.now(timezone.utc),
+        prices=prices, volumes=volumes, returns=returns, vix=vix,
+        sentiment={t: 0.0 for t in tickers},
+        macro={"vix_last": 20.0, "vix_mean_20d": 20.0,
+               "market_return_1d": 0.0, "market_vol_20d": 0.01},
+        source_used="synthetic",
+    )
+
+
+class TestCatchUp:
+    def test_starting_mid_reflex_window_catches_up_all_pre_market_phases(self, config):
+        """The exact bug: booting at 11:49 UTC (inside REFLEX) must not
+        skip today's digestion/nightmare/evolution/adaptation/report."""
+        orch = KronosOrchestrator(config)
+        memory = make_memory(config)
+        mid_day = datetime(2026, 3, 2, 11, 49, tzinfo=timezone.utc)
+
+        with patch.object(orch.pipeline, "run_sync", return_value=memory):
+            executed = set()
+            run_kronos.catch_up(orch, executed, day=1, now=mid_day)
+
+        assert executed == {
+            "digestion", "nightmare", "evolution", "adaptation", "report",
+        }
+        assert orch.state.memory is not None, (
+            "Digestion must have actually run - this is what REFLEX ticks "
+            "depend on for the rest of the day"
+        )
+        assert orch.master_model is not None
+
+    def test_starting_early_only_catches_up_phases_already_open(self, config):
+        """Booting at 03:00 UTC (inside NIGHTMARE, before EVOLUTION opens
+        at 04:00) must run digestion+nightmare only - not jump ahead."""
+        orch = KronosOrchestrator(config)
+        memory = make_memory(config)
+        early = datetime(2026, 3, 2, 3, 0, tzinfo=timezone.utc)
+
+        with patch.object(orch.pipeline, "run_sync", return_value=memory):
+            executed = set()
+            run_kronos.catch_up(orch, executed, day=1, now=early)
+
+        assert executed == {"digestion", "nightmare"}
+        assert "evolution" not in executed
+        assert orch.state.evolution is None, (
+            "Evolution's window hasn't opened yet - catch-up must not run it early"
+        )
+
+    def test_starting_at_midnight_catches_up_nothing(self, config):
+        """Booting exactly at 00:00 (DIGESTION just opened) needs no
+        catch-up beyond what the main loop will do on its own."""
+        orch = KronosOrchestrator(config)
+        memory = make_memory(config)
+        midnight = datetime(2026, 3, 2, 0, 0, tzinfo=timezone.utc)
+
+        with patch.object(orch.pipeline, "run_sync", return_value=memory):
+            executed = set()
+            run_kronos.catch_up(orch, executed, day=1, now=midnight)
+
+        assert executed == {"digestion"}
+
+    def test_already_executed_phases_are_not_rerun(self, config):
+        """If digestion already ran (e.g. a prior catch-up), a second call
+        must not repeat it."""
+        orch = KronosOrchestrator(config)
+        memory = make_memory(config)
+        mid_day = datetime(2026, 3, 2, 11, 0, tzinfo=timezone.utc)
+
+        call_count = {"n": 0}
+
+        def counting_run_sync(filings=None):
+            call_count["n"] += 1
+            return memory
+
+        with patch.object(orch.pipeline, "run_sync", side_effect=counting_run_sync):
+            executed = {"digestion"}
+            run_kronos.catch_up(orch, executed, day=1, now=mid_day)
+
+        assert call_count["n"] == 0, "Already-executed digestion must not re-run"
+        assert executed == {
+            "digestion", "nightmare", "evolution", "adaptation", "report",
+        }
+
+    def test_starting_in_logging_window_still_catches_up_everything(self, config):
+        """Booting at 23:00 UTC (LOGGING window) must still catch up the
+        full pre-market sequence, not skip it entirely."""
+        orch = KronosOrchestrator(config)
+        memory = make_memory(config)
+        late = datetime(2026, 3, 2, 23, 0, tzinfo=timezone.utc)
+
+        with patch.object(orch.pipeline, "run_sync", return_value=memory):
+            executed = set()
+            run_kronos.catch_up(orch, executed, day=1, now=late)
+
+        assert executed == {
+            "digestion", "nightmare", "evolution", "adaptation", "report",
+        }
+
+
+class TestLoggingSetup:
+    def test_log_directory_created_before_file_handler(self, tmp_path, monkeypatch):
+        """Regression: logging.FileHandler("logs/kronos.log") used to run
+        at import time, before the logs/ directory existed, crashing
+        every single start under systemd (WorkingDirectory=/opt/prometheus,
+        fresh checkout, no logs/ dir yet). Simulates that exact scenario:
+        a cwd with no logs/ directory."""
+        monkeypatch.chdir(tmp_path)
+        assert not (tmp_path / "logs").exists()
+
+        import importlib
+        import run_kronos as rk
+        importlib.reload(rk)
+
+        assert (tmp_path / "logs").is_dir(), (
+            "logs/ must exist by the time the module-level FileHandler runs"
+        )
+        assert (tmp_path / "logs" / "kronos.log").exists()

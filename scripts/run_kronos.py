@@ -92,13 +92,56 @@ def run_accelerated(orchestrator, n_days: int):
         orchestrator.run_logging()
 
 
+PRE_MARKET_PHASES = [Phase.DIGESTION, Phase.NIGHTMARE, Phase.EVOLUTION,
+                     Phase.ADAPTATION, Phase.REPORT]
+
+
+def catch_up(orchestrator, executed_today: set, day: int, now=None) -> None:
+    """
+    Run any pre-market phase whose window has already opened today but
+    hasn't executed yet - covers starting (or restarting) the service
+    mid-day, past one or more phase boundaries. Without this, a restart
+    during market hours (e.g. every deploy-hetzner.yml redeploy) would
+    silently skip that entire day's digestion/nightmare/evolution/
+    adaptation/report and leave the reflex arc running with no memory
+    until the next midnight UTC boundary.
+    """
+    now = now or datetime.now(timezone.utc)
+    current_phase = orchestrator.phase_for(now)
+    try:
+        cutoff = PRE_MARKET_PHASES.index(current_phase)
+    except ValueError:
+        # REFLEX or LOGGING: every pre-market phase's window has passed
+        cutoff = len(PRE_MARKET_PHASES) - 1
+
+    for phase in PRE_MARKET_PHASES[: cutoff + 1]:
+        if phase.value in executed_today:
+            continue
+        executed_today.add(phase.value)
+        logger.info("[main] catch-up: entering phase: %s (day %d)", phase.value, day)
+        if phase == Phase.DIGESTION:
+            orchestrator.state.day = day
+            orchestrator.run_digestion()
+        elif phase == Phase.NIGHTMARE:
+            orchestrator.run_nightmare()
+        elif phase == Phase.EVOLUTION:
+            orchestrator.run_evolution()
+        elif phase == Phase.ADAPTATION:
+            orchestrator.run_adaptation()
+        elif phase == Phase.REPORT:
+            orchestrator.run_report()
+
+
 def run_realtime(orchestrator, n_days: int):
     """Wall-clock loop: execute each phase when its window opens."""
     executed_today = set()
     day = 1
     current_date = datetime.now(timezone.utc).date()
+    orchestrator.state.day = day
 
     logger.info("Kronos realtime loop started (target %d days)", n_days)
+    catch_up(orchestrator, executed_today, day)
+
     while day <= n_days and not _shutdown:
         now = datetime.now(timezone.utc)
         if now.date() != current_date:
