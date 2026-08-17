@@ -282,6 +282,53 @@ and `scripts/aws_train.py`). The nightly pattern:
   yesterday's checkpoint.
 - **Human panic** -> `veto.txt`, 24-hour delay, fully audit-logged.
 
+## Daily WhatsApp Progress Reports (optional)
+
+Kronos can text you a short progress digest to your own phone once a
+day, right after market close: current day and % through the 365-day
+run, today's equity/PnL/Sharpe/trade count, market regime, NEAT's best
+fitness, and any warnings from that day.
+
+Sent via [CallMeBot](https://www.callmebot.com/blog/free-api-whatsapp-messages/) -
+a free, unofficial service built specifically for "let my script message
+my own WhatsApp." Not affiliated with WhatsApp/Meta, no business account
+needed, but also no uptime guarantee - fine for a personal digest, not
+something to depend on for anything time-critical. (Twilio's WhatsApp
+Business API is the paid, official alternative if you ever need one.)
+
+### Setup
+
+1. **On your phone**, save this contact: `+34 644 84 71 64`
+2. WhatsApp it exactly: `I allow callmebot to send me messages`
+3. CallMeBot replies with your personal API key.
+4. **On the Hetzner box**, edit the secrets file `hetzner_bootstrap.sh`
+   already created for you:
+   ```bash
+   nano /etc/kronos.env
+   ```
+   Uncomment and fill in:
+   ```
+   KRONOS_WHATSAPP_PHONE=15551234567    # your number, digits only, with country code
+   KRONOS_WHATSAPP_APIKEY=123456        # the key CallMeBot sent you
+   ```
+5. Turn it on in `kronos/config.yaml`:
+   ```yaml
+   notifications:
+     enabled: true
+   ```
+6. Test it immediately, without waiting for a real day to close:
+   ```bash
+   python scripts/test_whatsapp.py
+   ```
+7. Restart the service so it picks up the new environment file:
+   ```bash
+   systemctl restart kronos
+   ```
+
+Notifications are fully optional and fail silently - a broken API key or
+a CallMeBot outage logs a warning and moves on, it never affects trading
+or the daily cycle.
+
 ## The Audit Trail
 
 Everything lands in `logs/`:

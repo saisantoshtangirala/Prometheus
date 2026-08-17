@@ -84,3 +84,8 @@ orchestrator:
 reporting:
   top_movers: 3
   volatility_windows: [5, 20]
+
+notifications:
+  enabled: false                 # opt-in - also needs KRONOS_WHATSAPP_PHONE
+                                  # and KRONOS_WHATSAPP_APIKEY env vars set
+  send_daily_digest: true        # sent once per day, after market close

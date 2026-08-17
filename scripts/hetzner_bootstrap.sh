@@ -85,6 +85,20 @@ pip install -q --upgrade pip
 pip install -q -e . || pip install -q torch numpy scipy scikit-learn networkx pandas
 pip install -q pyyaml yfinance
 
+echo "=== Setting up secrets env file (WhatsApp notifications, etc.) ==="
+# Kept OUTSIDE the git repo on purpose - never commit phone numbers or
+# API keys. The leading '-' on EnvironmentFile below means systemd
+# starts fine even if this file is empty or missing entirely.
+if [ ! -f /etc/kronos.env ]; then
+    cat > /etc/kronos.env <<'ENVFILE'
+# Kronos secrets - not tracked in git. Uncomment and fill in to enable
+# daily WhatsApp progress reports (see kronos/notifier.py for setup):
+#KRONOS_WHATSAPP_PHONE=15551234567
+#KRONOS_WHATSAPP_APIKEY=123456
+ENVFILE
+    chmod 600 /etc/kronos.env
+fi
+
 echo "=== Installing systemd service ==="
 cat > /etc/systemd/system/kronos.service <<UNIT
 [Unit]
@@ -95,6 +109,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=$INSTALL_DIR
+EnvironmentFile=-/etc/kronos.env
 ExecStart=$INSTALL_DIR/.venv/bin/python scripts/run_kronos.py --mode=paper
 Restart=always
 RestartSec=30
@@ -142,4 +157,9 @@ echo ""
 echo " Also set these repo secrets:"
 echo "   HETZNER_HOST = $(curl -s ifconfig.me 2>/dev/null || echo '<this server IP>')"
 echo "   HETZNER_USER = root"
+echo ""
+echo " Want daily WhatsApp progress reports? Edit /etc/kronos.env with"
+echo " your CallMeBot phone/apikey, set notifications.enabled: true in"
+echo " kronos/config.yaml, then: systemctl restart kronos"
+echo " Test it anytime with: python scripts/test_whatsapp.py"
 echo "============================================================"

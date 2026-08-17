@@ -38,6 +38,7 @@ from kronos.config import KronosConfig, load_config
 from kronos.data_pipeline import DataPipeline, DailyMemory, DataUnavailableError
 from kronos.evolver import KronosEvolver, EvolutionResult
 from kronos.nightmare_generator import NightmareGenerator, NightmareBuffer
+from kronos.notifier import WhatsAppNotifier
 from kronos.paper_trader import PaperTrader
 from kronos.reflex import ReflexArc
 from kronos.reporter import GodsEyeReporter
@@ -164,6 +165,7 @@ class KronosOrchestrator:
         self.reflex = ReflexArc(self.cfg)
         self.trader = PaperTrader(self.cfg)
         self.reporter = GodsEyeReporter(self.cfg)
+        self.notifier = WhatsAppNotifier(self.cfg)
 
         self.state = DayState()
         self.master_model: Optional[torch.nn.Module] = None
@@ -412,7 +414,31 @@ class KronosOrchestrator:
         prices = closing_prices or dict(self.trader.last_prices)
         stats = self.trader.close_day(self.state.day, prices)
         self.trader.audit(self.state.day, "logging", json.dumps(stats))
+        self._send_daily_notification(stats)
         return stats
+
+    def _send_daily_notification(self, stats: Dict) -> None:
+        """Best-effort WhatsApp digest - never let a notification problem
+        affect trading. Fully silent no-op if notifications aren't configured."""
+        if not (self.notifier.enabled and self.cfg.notifications.send_daily_digest):
+            return
+        try:
+            memory = self.state.memory
+            evo = self.state.evolution
+            warm = self.state.warmup
+            text = self.notifier.build_daily_report(
+                day=self.state.day,
+                stats=stats,
+                regime=warm.regime_estimate if warm else None,
+                top_fitness=evo.top_fitness if evo else None,
+                source_used=memory.source_used if memory else None,
+                quality_flags=memory.quality_flags if memory else None,
+                phase_failures=self.state.phase_failures or None,
+                reflex_regime=self.reflex.gate.state.regime,
+            )
+            self.notifier.send(text)
+        except Exception as e:
+            logger.warning("[orchestrator] daily notification failed: %s", e)
 
     # ------------------------------------------------------------------
     # Full-day driver (used by run_kronos.py and the e2e test)

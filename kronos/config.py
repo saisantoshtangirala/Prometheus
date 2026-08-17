@@ -103,4 +103,5 @@ def _builtin_defaults() -> Dict[str, Any]:
                          "checkpoint_dir": "logs/models",
                          "report_dir": "logs/reports"},
         "reporting": {"top_movers": 3, "volatility_windows": [5, 20]},
+        "notifications": {"enabled": False, "send_daily_digest": True},
     }

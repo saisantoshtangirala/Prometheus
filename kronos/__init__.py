@@ -24,6 +24,7 @@ from kronos.nightmare_generator import (
     NightmareCollapseError,
     NightmareGenerator,
 )
+from kronos.notifier import WhatsAppNotifier
 from kronos.orchestrator import (
     DayState,
     KronosOrchestrator,
@@ -41,6 +42,7 @@ __all__ = [
     "KronosConfig", "load_config",
     "DailyMemory", "DataPipeline",
     "NightmareBuffer", "NightmareGenerator",
+    "WhatsAppNotifier",
     "EvolutionResult", "KronosEvolver", "WeightedEnsemble",
     "KronosWarmer", "WarmupResult",
     "ReflexArc", "RegimeSwitchGate", "OrderBookSimulator",
