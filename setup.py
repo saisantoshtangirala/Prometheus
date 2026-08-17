@@ -17,13 +17,15 @@ setup(
         "loguru>=0.7.0",
         "rich>=13.6.0",
         "pydantic>=2.4.0",
+        "requests>=2.31.0",
+        "yfinance>=0.2.31",
+        "pyyaml>=6.0",
     ],
     extras_require={
         "full": [
             "dowhy>=0.11.0",
             "diffusers>=0.24.0",
             "transformers>=4.35.0",
-            "yfinance>=0.2.31",
             "torch-geometric>=2.4.0",
         ],
         "dev": [
