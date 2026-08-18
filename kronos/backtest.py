@@ -229,7 +229,14 @@ class KronosStrategy(Strategy):
         x = torch.tensor(window.reshape(1, -1), dtype=torch.float32)
         with torch.no_grad():
             pred = self.model(x).squeeze(0).numpy()
-        w = np.tanh(pred * 50.0) * self.max_weight
+        # No scaling multiplier before tanh - matches ReflexArc.infer()
+        # (kronos/reflex.py), the actual live signal path this strategy is
+        # meant to approximate. A "* 50.0" here previously saturated tanh
+        # on pure noise (verified: 68% of max_weight on average, 40% of
+        # calls landing above 90% of cap, on synthetic white-noise input
+        # with zero real signal) - it bet near-maximum size almost every
+        # rebalance regardless of actual model confidence.
+        w = np.tanh(pred) * self.max_weight
         return np.clip(w, -self.max_weight, self.max_weight)
 
 
