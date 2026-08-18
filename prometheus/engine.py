@@ -56,6 +56,7 @@ class PrometheusConfig:
         d_ff: int = 512,
         ltc_hidden: List[int] = None,
         snn_layer_sizes: List[int] = None,
+        snn_output_size: Optional[int] = None,
         memory_dim: int = 64,
         device: str = "cpu",
         output_dir: str = "output",
@@ -70,6 +71,13 @@ class PrometheusConfig:
         self.d_ff = d_ff
         self.ltc_hidden = ltc_hidden or [128, 64]
         self.snn_layer_sizes = snn_layer_sizes or [128, 64]
+        # Defaults to a half-size encoding (this engine's own general-purpose
+        # use of the SNN); callers producing a checkpoint for a specific
+        # downstream consumer with its own shape contract - e.g.
+        # scripts/train.py, whose SNN checkpoint must match
+        # kronos/reflex.py's ReflexArc (output_size == n_assets exactly) -
+        # pass this explicitly instead.
+        self.snn_output_size = snn_output_size if snn_output_size is not None else n_assets // 2
         self.memory_dim = memory_dim
         self.device = device
         self.output_dir = output_dir
@@ -115,7 +123,7 @@ class PrometheusEngine:
         self.snn = SpikingMarketEncoder(
             input_size=cfg.n_assets,
             layer_sizes=cfg.snn_layer_sizes,
-            output_size=cfg.n_assets // 2,
+            output_size=cfg.snn_output_size,
         ).to(self.device)
 
         self.htm = HierarchicalTemporalMemory(

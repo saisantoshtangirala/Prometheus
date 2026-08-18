@@ -35,6 +35,13 @@ def parse_args():
     p.add_argument("--mode", choices=["pretrain", "finetune", "meta", "evolve", "full"],
                    default="pretrain")
     p.add_argument("--n-assets", type=int, default=20)
+    p.add_argument("--snn-layer-sizes", default="32,16",
+                   help="comma-separated SNN hidden layer sizes, e.g. '32,16'. "
+                        "Defaults to kronos/reflex.py ReflexArc's hardcoded "
+                        "shape (not PrometheusEngine's own general-purpose "
+                        "default of [128, 64]) since this script's checkpoint "
+                        "output is loaded straight into ReflexArc.snn and "
+                        "must match its architecture exactly to be adopted.")
     p.add_argument("--seq-len", type=int, default=64)
     p.add_argument("--horizon", type=int, default=5)
     p.add_argument("--d-model", type=int, default=128)
@@ -225,6 +232,14 @@ def main():
         n_layers=args.n_layers,
         device=args.device,
         output_dir=args.output_dir,
+        # Must match kronos/reflex.py's ReflexArc.snn exactly (layer_sizes
+        # and output_size == n_assets, not PrometheusEngine's own default
+        # of n_assets // 2) - this checkpoint's only consumer is Kronos's
+        # maybe_adopt_runpod_checkpoint(), and a shape mismatch there fails
+        # closed (logs a warning, keeps training from scratch) rather than
+        # loudly, so a silent drift here would go unnoticed indefinitely.
+        snn_layer_sizes=[int(x) for x in args.snn_layer_sizes.split(",")],
+        snn_output_size=args.n_assets,
     )
 
     logger.info("Initializing Prometheus Engine...")
