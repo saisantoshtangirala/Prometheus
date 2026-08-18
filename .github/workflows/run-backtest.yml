@@ -1,0 +1,72 @@
+name: Run Walk-Forward Backtest (read-only)
+
+# Runs kronos/backtest.py's walk-forward harness on Hetzner (which has
+# proven yfinance/internet access - this sandbox's own network doesn't
+# reach Yahoo Finance through its proxy) against real NSE history, with
+# strict no-look-ahead train/test splits per window. Answers the actual
+# question a training-set DirAcc number can't: does Kronos's strategy
+# beat a dumb momentum baseline and buy-and-hold on data it never saw,
+# net of transaction costs, with a deflated Sharpe that discounts for
+# having tried more than one strategy. Does not touch the live
+# kronos.service process or its checkpoints/state at all - runs in a
+# scratch directory and only reads the repo checkout.
+#
+# Manual trigger only. CPU-only (no GPU needed for this).
+
+on:
+  workflow_dispatch:
+    inputs:
+      tickers:
+        description: "space-separated tickers (defaults to Kronos's live NSE universe)"
+        required: false
+        default: "RELIANCE.NS TCS.NS HDFCBANK.NS INFY.NS ICICIBANK.NS HINDUNILVR.NS ITC.NS SBIN.NS BHARTIARTL.NS KOTAKBANK.NS"
+        type: string
+      start:
+        description: "history start date (YYYY-MM-DD)"
+        required: false
+        default: "2015-01-01"
+        type: string
+      strategies:
+        description: "space-separated: kronos momentum buy_hold"
+        required: false
+        default: "kronos momentum buy_hold"
+        type: string
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Load Hetzner deploy key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.HETZNER_SSH_KEY }}
+
+      - name: Trust Hetzner host key
+        run: ssh-keyscan -H "${{ secrets.HETZNER_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Run the backtest in a scratch checkout
+        run: |
+          ssh "${{ secrets.HETZNER_USER }}@${{ secrets.HETZNER_HOST }}" '
+            set -euo pipefail
+            rm -rf /tmp/kronos-backtest
+            git clone --branch claude/prometheus-causal-market-ol2pau --depth 1 \
+              /opt/prometheus /tmp/kronos-backtest
+            cd /tmp/kronos-backtest
+            source /opt/prometheus/.venv/bin/activate
+            python scripts/run_backtest.py \
+              --tickers '"${{ github.event.inputs.tickers || 'RELIANCE.NS TCS.NS HDFCBANK.NS INFY.NS ICICIBANK.NS HINDUNILVR.NS ITC.NS SBIN.NS BHARTIARTL.NS KOTAKBANK.NS' }}"' \
+              --start '"${{ github.event.inputs.start || '2015-01-01' }}"' \
+              --strategies '"${{ github.event.inputs.strategies || 'kronos momentum buy_hold' }}"' \
+              --out-dir /tmp/kronos-backtest-report
+            echo
+            echo "=== full markdown report ==="
+            cat /tmp/kronos-backtest-report/*.md
+          '
+
+      - name: Clean up scratch checkout
+        if: always()
+        run: |
+          ssh "${{ secrets.HETZNER_USER }}@${{ secrets.HETZNER_HOST }}" '
+            rm -rf /tmp/kronos-backtest /tmp/kronos-backtest-report
+          '
