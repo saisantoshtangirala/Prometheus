@@ -38,6 +38,18 @@ jobs:
             ls -la /opt/prometheus/logs/models/reflex_snn_active.pt 2>&1
 
             echo
-            echo "=== Recent log lines mentioning RunPod adoption ==="
-            journalctl -u kronos.service --no-pager -n 5000 | grep -i "runpod\|adopted" || echo "(no matching log lines in the last 5000)"
+            echo "=== journalctl (unit lifecycle only - StandardOutput is redirected to a file, not journald) ==="
+            journalctl -u kronos.service --no-pager -n 20
+
+            echo
+            echo "=== /var/log/kronos-service.log (systemd StandardOutput/StandardError target) - RunPod/adoption lines ==="
+            tail -n 5000 /var/log/kronos-service.log 2>&1 | grep -i "runpod\|adopted" || echo "(no matching log lines in the last 5000)"
+
+            echo
+            echo "=== /opt/prometheus/logs/kronos.log (app FileHandler) - RunPod/adoption lines ==="
+            tail -n 5000 /opt/prometheus/logs/kronos.log 2>&1 | grep -i "runpod\|adopted" || echo "(no matching log lines in the last 5000)"
+
+            echo
+            echo "=== last 15 lines of /var/log/kronos-service.log, unfiltered ==="
+            tail -n 15 /var/log/kronos-service.log 2>&1
           '
