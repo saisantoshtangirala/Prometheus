@@ -3,12 +3,20 @@ name: Train on RunPod GPU
 # Runs every trading-day morning (UTC, well before US market open) AND
 # on manual dispatch. Fully automated GPU training via RunPod's REST API
 # (docs.runpod.io):
-#   1. POST /v1/pods           - create a fresh pod (Community Cloud by
-#                                 default; if it has no capacity, retries
-#                                 once on Secure Cloud automatically - see
-#                                 the "Create pod" step - an unattended
-#                                 nightly run has no one around to notice
-#                                 and retry by hand)
+#   1. POST /v1/pods           - create a fresh pod. By default (gpu_type
+#                                 input left as "auto") the "Pick GPU" step
+#                                 queries RunPod's catalog (api.runpod.io/v2
+#                                 /catalog/gpus) for what's actually in
+#                                 stock right now and tries candidates
+#                                 cheapest-first across both Community and
+#                                 Secure Cloud, so a single GPU type/cloud
+#                                 having no capacity (routine - Community is
+#                                 peer-hosted and fluctuates) doesn't fail
+#                                 an unattended nightly run that has no one
+#                                 around to retry by hand. Passing an
+#                                 explicit gpu_type still forces that one
+#                                 type (tried on its requested cloud, then
+#                                 Secure as a fallback).
 #   2. GET  /v1/pods/{id}      - poll until running, read its real IP:port
 #   3. ssh/scp                 - push this checkout, train, pull the
 #                                 checkpoint back
@@ -57,12 +65,12 @@ on:
         type: choice
         options: [pretrain, finetune, meta, evolve, full]
       gpu_type:
-        description: "RunPod GPU type ID (exact API name, e.g. from the console's GPU list)"
+        description: "\"auto\" = pick the cheapest in-stock GPU that fits (recommended), or an exact RunPod GPU type ID to force one"
         required: false
-        default: "NVIDIA RTX A5000"
+        default: "auto"
         type: string
       cloud_type:
-        description: "COMMUNITY (cheaper) or SECURE"
+        description: "COMMUNITY (cheaper) or SECURE - ignored when gpu_type is \"auto\" (both are considered)"
         required: false
         default: "COMMUNITY"
         type: choice
@@ -85,7 +93,7 @@ jobs:
           set -euo pipefail
           pip install -q pyyaml
           echo "mode=${{ github.event.inputs.mode || 'full' }}" >> "$GITHUB_OUTPUT"
-          echo "gpu_type=${{ github.event.inputs.gpu_type || 'NVIDIA RTX A5000' }}" >> "$GITHUB_OUTPUT"
+          echo "gpu_type=${{ github.event.inputs.gpu_type || 'auto' }}" >> "$GITHUB_OUTPUT"
           echo "cloud_type=${{ github.event.inputs.cloud_type || 'COMMUNITY' }}" >> "$GITHUB_OUTPUT"
           N_ASSETS=$(python3 -c "
           import yaml
@@ -128,6 +136,75 @@ jobs:
         with:
           ssh-private-key: ${{ secrets.RUNPOD_SSH_PRIVATE_KEY }}
 
+      - name: Pick GPU (cheapest in-stock option that fits, unless forced)
+        id: pick
+        if: steps.gate.outputs.should_run == 'true'
+        env:
+          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+        run: |
+          set -euo pipefail
+          python3 -c "
+          import json
+          import os
+          import sys
+          import urllib.request
+
+          # Kronos's SNN/evolution training is small - 16GB is comfortable
+          # headroom, not a measured floor. \$1/hr is a sanity cap so a
+          # catalog quirk never books something like an H100 by accident.
+          MIN_MEMORY_GB = 16
+          MAX_PRICE_PER_HR = 1.00
+          # known-good, generally well-stocked types - used only if the
+          # catalog lookup itself fails or returns nothing usable
+          FALLBACK_GPU_IDS = ['NVIDIA GeForce RTX 4090', 'NVIDIA RTX A4000', 'NVIDIA RTX A5000']
+
+          requested_gpu = '${{ steps.params.outputs.gpu_type }}'
+          requested_cloud = '${{ steps.params.outputs.cloud_type }}'
+
+          candidates = []
+          if requested_gpu != 'auto':
+              clouds = [requested_cloud] if requested_cloud == 'SECURE' else [requested_cloud, 'SECURE']
+              for cloud in dict.fromkeys(clouds):
+                  candidates.append((0.0, cloud, requested_gpu))
+          else:
+              try:
+                  req = urllib.request.Request(
+                      'https://api.runpod.io/v2/catalog/gpus?include=AVAILABILITY',
+                      headers={'Authorization': 'Bearer ' + os.environ['RUNPOD_API_KEY']},
+                  )
+                  with urllib.request.urlopen(req, timeout=30) as resp:
+                      catalog = json.load(resp)
+                  for gpu in catalog.get('gpus', []):
+                      if (gpu.get('memory') or 0) < MIN_MEMORY_GB:
+                          continue
+                      if gpu.get('availability') == 'NONE':
+                          continue
+                      price = gpu.get('price') or {}
+                      for cloud_key, cloud_name in (('community', 'COMMUNITY'), ('secure', 'SECURE')):
+                          p = price.get(cloud_key)
+                          if p is None or p <= 0 or p > MAX_PRICE_PER_HR:
+                              continue
+                          candidates.append((p, cloud_name, gpu['id']))
+                  candidates.sort(key=lambda c: c[0])
+              except Exception as exc:
+                  print(f'::warning::GPU catalog lookup failed ({exc}) - using the fixed fallback list.', file=sys.stderr)
+              if not candidates:
+                  for gpu_id in FALLBACK_GPU_IDS:
+                      for cloud_name in ('COMMUNITY', 'SECURE'):
+                          candidates.append((0.0, cloud_name, gpu_id))
+
+          if not candidates:
+              print('::error::No GPU candidates to try.', file=sys.stderr)
+              sys.exit(1)
+
+          candidates = candidates[:8]  # cap pod-creation attempts per run
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write('candidates=' + json.dumps(candidates) + chr(10))
+          print('GPU candidates to try in order (price/hr, cloud, gpu_id):')
+          for c in candidates:
+              print(' ', c)
+          "
+
       - name: Create pod
         id: create
         if: steps.gate.outputs.should_run == 'true'
@@ -135,14 +212,15 @@ jobs:
           set -euo pipefail
 
           create_pod() {
-            local cloud_type="$1"
+            local gpu_id="$1"
+            local cloud_type="$2"
             curl -sS -X POST "$RUNPOD_API/pods" \
               -H "Authorization: Bearer ${{ secrets.RUNPOD_API_KEY }}" \
               -H "Content-Type: application/json" \
               -d '{
                 "name": "kronos-ci-${{ github.run_id }}",
                 "imageName": "runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04",
-                "gpuTypeIds": ["${{ steps.params.outputs.gpu_type }}"],
+                "gpuTypeIds": ["'"$gpu_id"'"],
                 "gpuCount": 1,
                 "cloudType": "'"$cloud_type"'",
                 "containerDiskInGb": 20,
@@ -150,31 +228,29 @@ jobs:
               }'
           }
 
-          PRIMARY_CLOUD="${{ steps.params.outputs.cloud_type }}"
-          RESPONSE=$(create_pod "$PRIMARY_CLOUD")
-          echo "$RESPONSE"
-          POD_ID=$(echo "$RESPONSE" | jq -r '.id')
-
-          # Community Cloud is peer-hosted - capacity fluctuates and "no
-          # instances currently available" is a routine, expected failure
-          # mode there, not a bug. An unattended nightly run has no human
-          # around to notice and retry manually (as we did once by hand),
-          # so fall back to Secure Cloud (dedicated capacity, reliably
-          # available, higher per-hour rate) automatically instead of
-          # just failing the night's training silently.
-          if { [ -z "$POD_ID" ] || [ "$POD_ID" = "null" ]; } && [ "$PRIMARY_CLOUD" != "SECURE" ]; then
-            echo "::warning::$PRIMARY_CLOUD had no capacity - falling back to SECURE cloud."
-            RESPONSE=$(create_pod "SECURE")
+          POD_ID=""
+          CHOSEN_GPU=""
+          CHOSEN_CLOUD=""
+          while IFS=$'\t' read -r PRICE CLOUD GPU_ID; do
+            echo "Trying $GPU_ID on $CLOUD (\$${PRICE}/hr)..."
+            RESPONSE=$(create_pod "$GPU_ID" "$CLOUD")
             echo "$RESPONSE"
-            POD_ID=$(echo "$RESPONSE" | jq -r '.id')
-          fi
+            ID=$(echo "$RESPONSE" | jq -r '.id // empty')
+            if [ -n "$ID" ]; then
+              POD_ID="$ID"
+              CHOSEN_GPU="$GPU_ID"
+              CHOSEN_CLOUD="$CLOUD"
+              break
+            fi
+            echo "::warning::$GPU_ID on $CLOUD had no capacity - trying the next candidate."
+          done < <(echo '${{ steps.pick.outputs.candidates }}' | jq -r '.[] | @tsv')
 
-          if [ -z "$POD_ID" ] || [ "$POD_ID" = "null" ]; then
-            echo "::error::Pod creation failed on both $PRIMARY_CLOUD and SECURE - no id in response above."
+          if [ -z "$POD_ID" ]; then
+            echo "::error::Pod creation failed on every GPU/cloud candidate tried."
             exit 1
           fi
           echo "pod_id=$POD_ID" >> "$GITHUB_OUTPUT"
-          echo "Created pod: $POD_ID"
+          echo "Created pod: $POD_ID ($CHOSEN_GPU on $CHOSEN_CLOUD)"
 
       - name: Poll until the pod is running and reachable
         id: connect
