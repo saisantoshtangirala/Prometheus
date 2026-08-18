@@ -1,0 +1,43 @@
+name: Check Hetzner Status (read-only)
+
+# Ad-hoc diagnostic: SSHs into the Hetzner box and reports whether the
+# latest RunPod-trained checkpoint (checkpoints/runpod/meta/snn.pt) was
+# actually adopted by the live kronos.service process, without touching
+# the service in any way - no restart, no code pull, purely read-only.
+# Manual trigger only.
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Load Hetzner deploy key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.HETZNER_SSH_KEY }}
+
+      - name: Trust Hetzner host key
+        run: ssh-keyscan -H "${{ secrets.HETZNER_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Report checkpoint and adoption status
+        run: |
+          ssh "${{ secrets.HETZNER_USER }}@${{ secrets.HETZNER_HOST }}" '
+            set -uo pipefail
+            echo "=== kronos.service ==="
+            systemctl is-active kronos.service
+            systemctl show kronos.service -p ActiveEnterTimestamp
+
+            echo
+            echo "=== RunPod checkpoint on disk ==="
+            ls -la /opt/prometheus/checkpoints/runpod/meta/snn.pt 2>&1
+
+            echo
+            echo "=== Persisted active SNN (only written after a successful adoption) ==="
+            ls -la /opt/prometheus/logs/models/reflex_snn_active.pt 2>&1
+
+            echo
+            echo "=== Recent log lines mentioning RunPod adoption ==="
+            journalctl -u kronos.service --no-pager -n 5000 | grep -i "runpod\|adopted" || echo "(no matching log lines in the last 5000)"
+          '
