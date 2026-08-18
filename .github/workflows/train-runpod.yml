@@ -186,7 +186,7 @@ jobs:
           else:
               try:
                   req = urllib.request.Request(
-                      'https://api.runpod.io/v2/catalog/gpus?include=AVAILABILITY',
+                      'https://api.runpod.io/v2/catalog/gpus?include=AVAILABILITY&product=POD',
                       headers={'Authorization': 'Bearer ' + os.environ['RUNPOD_API_KEY']},
                   )
                   with urllib.request.urlopen(req, timeout=30) as resp:
@@ -198,6 +198,13 @@ jobs:
                           continue
                       price = gpu.get('price') or {}
                       for cloud_key, cloud_name in (('community', 'COMMUNITY'), ('secure', 'SECURE')):
+                          # gpu[cloud_key] (bool) is whether that cloud
+                          # actually offers this GPU at all - price[cloud_key]
+                          # can be a nonzero number even when the bool is
+                          # False (seen live: MI300X has community=False but
+                          # still lists a community price), so check both.
+                          if not gpu.get(cloud_key):
+                              continue
                           p = price.get(cloud_key)
                           if p is None or p <= 0 or p > MAX_PRICE_PER_HR:
                               continue
