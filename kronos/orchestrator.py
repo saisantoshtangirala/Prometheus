@@ -56,6 +56,7 @@ from kronos.notifier import TelegramNotifier
 from kronos.paper_trader import PaperTrader
 from kronos.reflex import ReflexArc
 from kronos.reporter import GodsEyeReporter
+from kronos.bias_estimator import compute_daily_bias
 from kronos.runpod_trigger import CHECKPOINT_DIR as RUNPOD_CHECKPOINT_DIR, load_runpod_checkpoint
 from kronos.warmer import KronosWarmer, WarmupResult
 
@@ -126,6 +127,7 @@ class KronosOrchestrator:
 
         os.makedirs(self.cfg.orchestrator.checkpoint_dir, exist_ok=True)
         self._load_persisted_snn()
+        self._load_persisted_daily_bias()
         # RunPod training runs entirely in GitHub Actions now (scheduled
         # in .github/workflows/train-runpod.yml), which scp's the result
         # straight onto this box. Kronos's only job is noticing when a
@@ -716,6 +718,34 @@ class KronosOrchestrator:
         except Exception as e:
             logger.warning("[orchestrator] failed to persist active SNN weights: %s", e)
 
+    def _daily_bias_path(self) -> str:
+        return os.path.join(self.cfg.orchestrator.checkpoint_dir, "reflex_daily_bias.npy")
+
+    def _load_persisted_daily_bias(self) -> None:
+        """Mirrors _load_persisted_snn() - a restart (deploy-hetzner.yml
+        redeploys frequently) would otherwise silently drop the confidence
+        blend until the next checkpoint adoption, which can be up to a day
+        away. Never raises."""
+        path = self._daily_bias_path()
+        if not os.path.exists(path):
+            return
+        try:
+            self.reflex.set_daily_bias(np.load(path))
+            logger.info("[orchestrator] restored last-computed daily bias from %s", path)
+        except Exception as e:
+            logger.warning("[orchestrator] could not restore persisted daily bias (%s) - none until next adoption", e)
+
+    def _persist_daily_bias(self, bias: Optional[np.ndarray]) -> None:
+        path = self._daily_bias_path()
+        try:
+            if bias is None:
+                if os.path.exists(path):
+                    os.remove(path)
+                return
+            np.save(path, bias)
+        except Exception as e:
+            logger.warning("[orchestrator] failed to persist daily bias: %s", e)
+
     def _current_runpod_checkpoint_mtime(self) -> Optional[float]:
         path = os.path.join(RUNPOD_CHECKPOINT_DIR, "meta", "snn.pt")
         try:
@@ -737,6 +767,20 @@ class KronosOrchestrator:
             self._runpod_adopted_today = True
             self._persist_active_snn()
             logger.info("[orchestrator] adopted a new RunPod-trained SNN checkpoint")
+            # Recompute the causal_transformer "second opinion" ReflexArc
+            # checks its own signal against - tied to this exact checkpoint,
+            # so it must be refreshed whenever the SNN is (compute_daily_bias
+            # fails closed to None on any missing/mismatched file, which
+            # set_daily_bias(None) correctly reads as "no confidence
+            # blending until the next successful computation").
+            bias = None
+            if self.state.memory is not None:
+                bias = compute_daily_bias(
+                    self.state.memory.returns_window(self.cfg.data.lookback_days),
+                    checkpoint_dir=RUNPOD_CHECKPOINT_DIR,
+                )
+            self.reflex.set_daily_bias(bias)
+            self._persist_daily_bias(bias)
         else:
             # Don't retry the same broken/mismatched file every 30s -
             # remember it as "seen" so the warning logs once, not forever.

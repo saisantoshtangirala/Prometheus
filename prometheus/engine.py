@@ -15,6 +15,7 @@ Wires together:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from datetime import datetime
@@ -560,6 +561,24 @@ class PrometheusEngine:
         torch.save(self.optimizer.state_dict(), f"{path}/optimizer.pt")
         torch.save(self.snn_loss_fn.state_dict(), f"{path}/snn_loss_fn.pt")
         torch.save(self.snn_optimizer.state_dict(), f"{path}/snn_optimizer.pt")
+        # Architecture sidecar - lets a consumer that only wants to load
+        # ltc.pt/causal_transformer.pt standalone (kronos/bias_estimator.py,
+        # not the full PrometheusEngine) reconstruct matching module shapes
+        # without hardcoding/duplicating these hyperparameters a second
+        # time, the same class of bug the SNN shape mismatch fix addressed.
+        cfg = self.config
+        arch = {
+            "n_assets": cfg.n_assets,
+            "seq_len": cfg.seq_len,
+            "horizon": cfg.horizon,
+            "d_model": cfg.d_model,
+            "n_heads": cfg.n_heads,
+            "n_layers": cfg.n_layers,
+            "d_ff": cfg.d_ff,
+            "ltc_hidden": cfg.ltc_hidden,
+        }
+        with open(f"{path}/arch.json", "w") as f:
+            json.dump(arch, f)
         logger.info("Saved Prometheus engine to %s", path)
 
     def load(self, path: str) -> None:

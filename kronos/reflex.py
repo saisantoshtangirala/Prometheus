@@ -170,6 +170,7 @@ class ReflexDecision:
     )
     asset_caps: Dict[str, float] = field(default_factory=dict)
     fallback_mode: bool = False    # REF-04: SNN OOM -> lookup-table signals
+    confidence_blended: bool = False   # daily_bias was available and applied
 
 
 class ReflexArc:
@@ -201,6 +202,13 @@ class ReflexArc:
             hidden_size=16, lockout_duration=lockout_bars
         )
         self._prev_prices: Dict[str, float] = {}
+        # Set by KronosOrchestrator once per checkpoint adoption via
+        # set_daily_bias() - kronos/bias_estimator.py's once-per-day
+        # causal_transformer forecast, checked against the SNN's own
+        # per-tick signal below as a confidence modifier. None until the
+        # first adoption computes one; infer() degrades to SNN-only when
+        # unset, same behavior as before this existed.
+        self._daily_bias: Optional[np.ndarray] = None
 
     # -- per-asset flash-crash handling (REF-01 / REF-02) -------------------
 
@@ -218,6 +226,13 @@ class ReflexArc:
                     )
                     self.cortisol.trigger_flash_crash_lockout(asset=ticker)
             self._prev_prices[ticker] = price
+
+    def set_daily_bias(self, bias: Optional[np.ndarray]) -> None:
+        """Called by KronosOrchestrator after each checkpoint adoption
+        with kronos/bias_estimator.py's output (or None if it couldn't
+        be computed this time - clears any stale prior-day bias rather
+        than silently keeping it)."""
+        self._daily_bias = bias
 
     def asset_position_cap(self, ticker: str) -> float:
         """0.0 while the asset's flash-crash lockout is active, else gate cap."""
@@ -264,6 +279,27 @@ class ReflexArc:
                 np.asarray(recent_returns).mean(axis=0) * 50.0
             ) * 0.5
 
+        # 2b. Confidence blend against the daily bias (kronos/bias_estimator.py's
+        #     once-per-adoption causal_transformer forecast) - the "second
+        #     opinion" ReflexArc had no way to check itself against before.
+        #     Skipped in fallback_mode (the OOM lookup-table signal isn't
+        #     really comparable) and whenever no bias is available yet
+        #     (before the first adoption computes one, or the checkpoint's
+        #     arch.json/weights were missing - see compute_daily_bias).
+        #     Disagreement dampens rather than vetoes: the SNN is still the
+        #     faster, primary signal, and a slower end-of-day forecast
+        #     disagreeing with a fresh tick isn't grounds to silence it.
+        confidence_blended = False
+        if (
+            not fallback_mode
+            and self._daily_bias is not None
+            and len(self._daily_bias) == len(signals)
+        ):
+            agree = np.sign(signals) == np.sign(self._daily_bias)
+            scale = np.where(agree, 1.15, 0.7)
+            signals = np.clip(signals * scale, -1.0, 1.0)
+            confidence_blended = True
+
         # 3. Microstructure scan
         alerts: Dict[str, MicrostructureSignal] = {}
         if bar_prices:
@@ -299,4 +335,5 @@ class ReflexArc:
             microstructure_alerts=alerts,
             asset_caps=asset_caps,
             fallback_mode=fallback_mode,
+            confidence_blended=confidence_blended,
         )
