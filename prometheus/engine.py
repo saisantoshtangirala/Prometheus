@@ -161,6 +161,10 @@ class PrometheusEngine:
 
         # Loss and optimization
         self.loss_fn = AsymmetricUtilityLoss(alpha=0.5, beta=2.0, gamma=3.0)
+        # Separate instance (not shared with self.loss_fn) so its learnable
+        # log_alpha/log_beta calibrate to the SNN's own one-step-ahead signal
+        # rather than being pulled by causal_transformer's multi-step gradient.
+        self.snn_loss_fn = AsymmetricUtilityLoss(alpha=0.5, beta=2.0, gamma=3.0)
         self.kelly = KellyCriterionOptimizer(n_assets=cfg.n_assets)
 
         # Meta-learning
@@ -195,6 +199,18 @@ class PrometheusEngine:
         )
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer, T_max=1000, eta_min=1e-6
+        )
+
+        # SNN optimizer (for self.snn - the network ReflexArc.snn actually
+        # loads live). Deliberately separate from self.optimizer above:
+        # train_step() below never touched self.snn's parameters at all, so
+        # every previously-produced checkpoint's SNN weights were whatever
+        # torch's default init happened to give them - correctly shaped
+        # (once loaded into ReflexArc) but never trained on anything.
+        self.snn_optimizer = torch.optim.AdamW(
+            list(self.snn.parameters()) + list(self.snn_loss_fn.parameters()),
+            lr=1e-3,
+            weight_decay=1e-5,
         )
 
     # ------------------------------------------------------------------
@@ -297,6 +313,51 @@ class PrometheusEngine:
         self.scheduler.step()
 
         loss_detail = self.loss_fn.get_loss_breakdown(preds.detach(), y.detach())
+        return {
+            "loss": float(loss.item()),
+            "directional_accuracy": loss_detail["directional_accuracy"],
+            "n_wrong_direction": loss_detail["n_wrong_direction"],
+        }
+
+    def train_snn_step(
+        self,
+        x: torch.Tensor,
+        y_next: torch.Tensor,
+    ) -> Dict:
+        """
+        Single training step for self.snn - the network that ends up as
+        ReflexArc.snn in production. Separate from train_step() above
+        (which only ever updated causal_transformer/ltc) because
+        ReflexArc.infer() (kronos/reflex.py) uses the SNN differently: a
+        window of recent per-asset returns in, a single per-asset signal
+        out (tanh(snn(x))), used immediately for that tick's decision -
+        not a multi-step-ahead forecast like the causal transformer's.
+        Trains on the same real-market windows run_finetune already
+        builds, one bar ahead, to match that usage exactly.
+        """
+        self.snn.train()
+        self.snn_optimizer.zero_grad()
+
+        if not isinstance(x, torch.Tensor):
+            x = torch.tensor(x, dtype=torch.float32)
+        if x.dim() == 2:
+            x = x.unsqueeze(0)
+        if not isinstance(y_next, torch.Tensor):
+            y_next = torch.tensor(y_next, dtype=torch.float32)
+        if y_next.dim() == 1:
+            y_next = y_next.unsqueeze(0)
+
+        out = self.snn(x)
+        pred = out[0] if isinstance(out, tuple) else out   # [B, n_assets]
+        pred = torch.tanh(pred)
+
+        loss = self.snn_loss_fn(pred, y_next)
+        loss.backward()
+        nn.utils.clip_grad_norm_(self.snn.parameters(), max_norm=1.0)
+        self.snn_optimizer.step()
+
+        loss_detail = self.snn_loss_fn.get_loss_breakdown(pred.detach(), y_next.detach())
+        self.snn.eval()
         return {
             "loss": float(loss.item()),
             "directional_accuracy": loss_detail["directional_accuracy"],
@@ -497,6 +558,8 @@ class PrometheusEngine:
         torch.save(self.snn.state_dict(), f"{path}/snn.pt")
         torch.save(self.loss_fn.state_dict(), f"{path}/loss_fn.pt")
         torch.save(self.optimizer.state_dict(), f"{path}/optimizer.pt")
+        torch.save(self.snn_loss_fn.state_dict(), f"{path}/snn_loss_fn.pt")
+        torch.save(self.snn_optimizer.state_dict(), f"{path}/snn_optimizer.pt")
         logger.info("Saved Prometheus engine to %s", path)
 
     def load(self, path: str) -> None:
@@ -509,5 +572,15 @@ class PrometheusEngine:
         )
         self.loss_fn.load_state_dict(
             torch.load(f"{path}/loss_fn.pt", map_location=self.device)
+        )
+        # self.snn - previously never saved back into by any train step, so
+        # never worth loading either; now that train_snn_step() exists, a
+        # --resume run must pick its progress back up, or every resume would
+        # silently reset it to a fresh random init.
+        self.snn.load_state_dict(
+            torch.load(f"{path}/snn.pt", map_location=self.device)
+        )
+        self.snn_loss_fn.load_state_dict(
+            torch.load(f"{path}/snn_loss_fn.pt", map_location=self.device)
         )
         logger.info("Loaded Prometheus engine from %s", path)

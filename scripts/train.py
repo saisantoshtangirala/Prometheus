@@ -110,6 +110,7 @@ def run_finetune(engine: PrometheusEngine, args) -> None:
     history = []
     for epoch in range(args.finetune_epochs):
         epoch_losses = []
+        snn_epoch_losses = []
         # Rolling window mini-batches
         for start in range(0, n_bars - args.seq_len - args.horizon, args.seq_len):
             end = start + args.seq_len
@@ -129,12 +130,27 @@ def run_finetune(engine: PrometheusEngine, args) -> None:
             step_result = engine.train_step(x, y)
             epoch_losses.append(step_result["loss"])
 
+            # self.snn (ReflexArc's live model, kronos/reflex.py) is a
+            # separate network from causal_transformer/ltc above and needs
+            # its own training step - see PrometheusEngine.train_snn_step.
+            # ReflexArc.infer() feeds it a returns window and reads a
+            # single next-tick signal back out, so its target is one bar
+            # ahead (y's first horizon step), not the full horizon.
+            snn_result = engine.train_snn_step(x, y[:, 0, :])
+            snn_epoch_losses.append(snn_result["loss"])
+
         mean_loss = float(np.mean(epoch_losses)) if epoch_losses else 0.0
         dir_acc = step_result.get("directional_accuracy", 0.0) if epoch_losses else 0.0
-        history.append({"epoch": epoch, "loss": mean_loss, "dir_acc": dir_acc})
+        snn_mean_loss = float(np.mean(snn_epoch_losses)) if snn_epoch_losses else 0.0
+        snn_dir_acc = snn_result.get("directional_accuracy", 0.0) if snn_epoch_losses else 0.0
+        history.append({
+            "epoch": epoch, "loss": mean_loss, "dir_acc": dir_acc,
+            "snn_loss": snn_mean_loss, "snn_dir_acc": snn_dir_acc,
+        })
         logger.info(
-            "  [Finetune] Epoch %d | Loss: %.4f | DirAcc: %.2f%%",
-            epoch, mean_loss, dir_acc * 100
+            "  [Finetune] Epoch %d | Loss: %.4f | DirAcc: %.2f%% | "
+            "SNN Loss: %.4f | SNN DirAcc: %.2f%%",
+            epoch, mean_loss, dir_acc * 100, snn_mean_loss, snn_dir_acc * 100,
         )
 
     engine.save(f"{args.checkpoint_dir}/finetune")
