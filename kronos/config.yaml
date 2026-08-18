@@ -5,26 +5,31 @@
 
 run:
   total_days: 365
-  timezone: "America/New_York"
+  timezone: "Asia/Kolkata"       # NSE - India Standard Time, no DST
   mode: "paper"                  # paper | replay (no live mode by design)
   log_dir: "logs"
   seed: 42
 
-# Daily phase schedule (24h clock, exchange timezone)
+# Daily phase schedule (24h clock, exchange timezone). Pre-market phases
+# (digestion..report) keep the same 00:00-06:00 offsets used for NYSE -
+# NSE opens later in the day (09:15 IST vs 09:30 ET) so the same budget
+# fits with even more margin.
 schedule:
   digestion_start: "00:00"
   nightmare_start: "02:00"
   evolution_start: "04:00"
   adaptation_start: "05:00"
   report_time: "06:00"
-  market_open: "09:30"
-  market_close: "16:00"
+  market_open: "09:15"           # NSE regular session
+  market_close: "15:30"          # NSE regular session (excludes the
+                                  # Aug-2026 15:15-15:35 closing auction)
 
 data:
-  tickers: ["SPY", "QQQ", "IWM", "GLD", "TLT", "AAPL", "MSFT", "NVDA", "AMZN", "TSLA"]
-  vix_ticker: "^VIX"
+  tickers: ["RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "ICICIBANK.NS",
+            "HINDUNILVR.NS", "ITC.NS", "SBIN.NS", "BHARTIARTL.NS", "KOTAKBANK.NS"]
+  vix_ticker: "^INDIAVIX"
   lookback_days: 30              # rolling window kept in DailyMemory
-  sources: ["yfinance", "polygon", "alphavantage"]   # priority order
+  sources: ["yfinance"]          # Polygon/Alpha Vantage don't meaningfully cover NSE
   cross_validation_tolerance_pct: 1.0   # max % close-price disagreement between sources
   max_missing_pct: 20.0          # discard a ticker's day if more data is missing
   kalman_process_noise: 0.001

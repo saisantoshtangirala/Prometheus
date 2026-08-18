@@ -35,6 +35,13 @@ def parse_args():
     p.add_argument("--mode", choices=["pretrain", "finetune", "meta", "evolve", "full"],
                    default="pretrain")
     p.add_argument("--n-assets", type=int, default=20)
+    p.add_argument("--tickers", default=None,
+                   help="comma-separated ticker list to fetch for the real-data "
+                        "phases (run_finetune), e.g. 'RELIANCE.NS,TCS.NS,...'. "
+                        "Overrides MarketDataFetcher's default combined US+India "
+                        "universe. Must match the live trading ticker list, in "
+                        "the same order, for a produced checkpoint to load "
+                        "correctly into ReflexArc.snn (kronos/orchestrator.py).")
     p.add_argument("--snn-layer-sizes", default="32,16",
                    help="comma-separated SNN hidden layer sizes, e.g. '32,16'. "
                         "Defaults to kronos/reflex.py ReflexArc's hardcoded "
@@ -87,7 +94,8 @@ def run_finetune(engine: PrometheusEngine, args) -> None:
     logger.info("=" * 60)
 
     fetcher = MarketDataFetcher()
-    raw_data = fetcher.fetch_all()
+    explicit_tickers = args.tickers.split(",") if args.tickers else None
+    raw_data = fetcher.fetch_all(tickers=explicit_tickers)
     if raw_data.empty:
         logger.warning("Could not fetch real market data — using synthetic fallback")
         raw_data = MarketDataFetcher._synthetic_data(

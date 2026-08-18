@@ -143,6 +143,7 @@ class TestOrchestratorStateTransition:
 class TestDataPipelineFallback:
     def test_data_pipeline_fallback(self, config, memory):
         """If the primary source fails, the next source wins - no crash."""
+        config.override("data.sources", ["yfinance", "polygon", "alphavantage"])
         pipeline = DataPipeline(config)
 
         # Simulate: yfinance fails, polygon succeeds

@@ -30,11 +30,22 @@ EQUITY_TICKERS = [
     "GLD", "SLV", "USO", "TLT", "HYG", "LQD",
 ]
 
+# NSE (India) large caps, fetched via yfinance's ".NS" suffix - same
+# fetch_all()/get_returns() pipeline as the US tickers above, no separate
+# code path needed. Kept as a distinct list (rather than folded into
+# EQUITY_TICKERS) so callers that want a US-only or India-only universe
+# can still compose one explicitly.
+INDIA_EQUITY_TICKERS = [
+    "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "ICICIBANK.NS",
+    "HINDUNILVR.NS", "ITC.NS", "SBIN.NS", "BHARTIARTL.NS", "KOTAKBANK.NS",
+]
+
 FX_TICKERS = ["USDJPY=X", "EURUSD=X", "GBPUSD=X", "DX-Y.NYB"]
 
 CRYPTO_TICKERS = ["BTC-USD", "ETH-USD"]
 
 VIX_TICKER = "^VIX"
+INDIA_VIX_TICKER = "^INDIAVIX"
 
 
 class TickerNotFoundError(Exception):
@@ -76,10 +87,13 @@ class MarketDataFetcher:
             import yfinance as yf
         except ImportError:
             logger.warning("yfinance not installed — returning synthetic data")
-            return self._synthetic_data(tickers or EQUITY_TICKERS)
+            return self._synthetic_data(tickers or (EQUITY_TICKERS + INDIA_EQUITY_TICKERS))
 
         if tickers is None:
-            tickers = EQUITY_TICKERS + FX_TICKERS + CRYPTO_TICKERS + [VIX_TICKER]
+            tickers = (
+                EQUITY_TICKERS + INDIA_EQUITY_TICKERS + FX_TICKERS + CRYPTO_TICKERS
+                + [VIX_TICKER, INDIA_VIX_TICKER]
+            )
 
         if end is None:
             end = datetime.now().strftime("%Y-%m-%d")

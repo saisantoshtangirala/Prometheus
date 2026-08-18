@@ -1,8 +1,8 @@
 name: Train on RunPod GPU
 
-# Runs every trading-day morning (UTC, well before US market open) AND
-# on manual dispatch. Fully automated GPU training via RunPod's REST API
-# (docs.runpod.io):
+# Runs every trading-day morning (well before NSE - India - market open)
+# AND on manual dispatch. Fully automated GPU training via RunPod's REST
+# API (docs.runpod.io):
 #   1. POST /v1/pods           - create a fresh pod. By default (gpu_type
 #                                 input left as "auto") the "Pick GPU" step
 #                                 queries RunPod's catalog (api.runpod.io/v2
@@ -42,20 +42,31 @@ name: Train on RunPod GPU
 #   HETZNER_HOST, HETZNER_USER, HETZNER_SSH_KEY - already exist for
 #     deploy-hetzner.yml; reused here to deliver the checkpoint
 #
-# The scheduled trigger only fires Mon-Fri (cron day-of-week), and the
-# "Skip on non-trading days" step below additionally checks the real NYSE
-# holiday calendar (kronos/calendar_utils.py - the same code Kronos's own
-# phase gating uses, so this can never drift out of sync with it) and
-# skips the rest of the job - no pod is ever created on a day Kronos
-# wouldn't trade on anyway. Manual (workflow_dispatch) runs always run,
-# even on a non-trading day, since a human explicitly asked for one.
+# The scheduled trigger fires at 22:00 UTC Sun-Thu, which is 03:30 IST
+# Mon-Fri the following calendar day - comfortably (~5h45m) before NSE's
+# 09:15 IST open. The "Skip on non-trading days" step below additionally
+# checks the real NSE holiday calendar (kronos/calendar_utils.py - the
+# same code Kronos's own phase gating uses, so this can never drift out
+# of sync with it) and skips the rest of the job - no pod is ever created
+# on a day Kronos wouldn't trade on anyway. Manual (workflow_dispatch)
+# runs always run, even on a non-trading day, since a human explicitly
+# asked for one.
+#
+# The Train step below passes --tickers explicitly, read from
+# kronos/config.yaml, rather than relying on scripts/train.py's own
+# default (broader, US+India combined) universe - the produced
+# checkpoint's per-position semantics must exactly match Kronos's live
+# ticker order for load_runpod_checkpoint() to load it correctly into
+# ReflexArc.snn (kronos/orchestrator.py). The broader default universe
+# (prometheus/data/market_fetcher.py) is still there for anyone running
+# train.py by hand without --tickers.
 
 permissions:
   contents: read
 
 on:
   schedule:
-    - cron: "0 6 * * 1-5"   # 06:00 UTC, Mon-Fri - comfortably before US market open
+    - cron: "0 22 * * 0-4"   # 22:00 UTC Sun-Thu = 03:30 IST Mon-Fri, well before NSE 09:15 open
   workflow_dispatch:
     inputs:
       mode:
@@ -101,6 +112,12 @@ jobs:
           print(len(cfg['data']['tickers']))
           ")
           echo "n_assets=$N_ASSETS" >> "$GITHUB_OUTPUT"
+          TICKERS=$(python3 -c "
+          import yaml
+          cfg = yaml.safe_load(open('kronos/config.yaml'))
+          print(','.join(cfg['data']['tickers']))
+          ")
+          echo "tickers=$TICKERS" >> "$GITHUB_OUTPUT"
 
       - name: Skip on non-trading days (scheduled runs only)
         id: gate
@@ -122,12 +139,12 @@ jobs:
           spec = importlib.util.spec_from_file_location('calendar_utils', 'kronos/calendar_utils.py')
           calendar_utils = importlib.util.module_from_spec(spec)
           spec.loader.exec_module(calendar_utils)
-          today = datetime.now(ZoneInfo('America/New_York')).date()
-          print('true' if calendar_utils.is_trading_day(today) else 'false')
+          today = datetime.now(ZoneInfo('Asia/Kolkata')).date()
+          print('true' if calendar_utils.is_nse_trading_day(today) else 'false')
           ")
           echo "should_run=$SHOULD_RUN" >> "$GITHUB_OUTPUT"
           if [ "$SHOULD_RUN" != "true" ]; then
-            echo "Not a trading day (weekend or NYSE holiday) - skipping, no pod will be created."
+            echo "Not a trading day (weekend or NSE holiday) - skipping, no pod will be created."
           fi
 
       - name: Load RunPod SSH key
@@ -304,7 +321,7 @@ jobs:
             cd /opt/prometheus
             pip install -q -e .
             pip install -q pyyaml yfinance
-            python scripts/train.py --mode "'"${{ steps.params.outputs.mode }}"'" --device cuda --n-assets "'"${{ steps.params.outputs.n_assets }}"'"
+            python scripts/train.py --mode "'"${{ steps.params.outputs.mode }}"'" --device cuda --n-assets "'"${{ steps.params.outputs.n_assets }}"'" --tickers "'"${{ steps.params.outputs.tickers }}"'"
             tar czf /tmp/checkpoints.tar.gz checkpoints
           '
           scp -P "${{ steps.connect.outputs.port }}" \

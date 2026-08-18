@@ -34,7 +34,20 @@ from typing import Callable, Dict, Optional, Set, Tuple
 import numpy as np
 import torch
 
-from kronos.calendar_utils import is_trading_day, next_trading_day, nyse_holidays
+from kronos.calendar_utils import (
+    is_nse_trading_day,
+    is_trading_day,
+    next_nse_trading_day,
+    next_trading_day,
+    nse_holidays,
+    nyse_holidays,
+)
+
+# This deployment trades NSE (India), not NYSE - the live phase-gating
+# calendar below is deliberately the NSE one. is_trading_day/nyse_holidays
+# stay imported (and still exported from kronos/__init__.py) since
+# scripts/train.py's broader training universe and some tests still
+# reference the US calendar; they're just not what gates trading here.
 from kronos.config import KronosConfig, load_config
 from kronos.data_pipeline import DataPipeline, DailyMemory, DataUnavailableError
 from kronos.evolver import KronosEvolver, EvolutionResult
@@ -146,7 +159,7 @@ class KronosOrchestrator:
         digestion + nightmare only (stay sharp, save compute, and never
         hit market APIs for data that does not exist).
         """
-        if is_trading_day(d):
+        if is_nse_trading_day(d):
             return set(Phase)
         return set(self.LOW_POWER_PHASES)
 
@@ -578,8 +591,8 @@ class KronosOrchestrator:
             if now >= effective:
                 # VET-03: never execute a veto on a closed market -
                 # postpone to the next trading day.
-                if not is_trading_day(now.date()):
-                    postponed = next_trading_day(now.date())
+                if not is_nse_trading_day(now.date()):
+                    postponed = next_nse_trading_day(now.date())
                     new_effective = datetime.combine(
                         postponed, effective.timetz()
                     )

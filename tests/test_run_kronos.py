@@ -209,12 +209,16 @@ class TestExchangeTimezone:
     hours off from real NYSE hours every single day."""
 
     def test_exchange_now_returns_et_digits_not_utc_digits(self, config):
-        """At a known instant, _exchange_now() must return the ET wall
-        clock, not the server's UTC wall clock."""
+        """At a known instant, _exchange_now() must return the configured
+        exchange's wall clock, not the server's UTC wall clock. Uses ET
+        explicitly here (independent of Kronos's actual deployed
+        exchange) since this is testing the generic UTC-to-exchange-time
+        conversion mechanism, not any particular timezone."""
         from datetime import datetime, timezone
         from unittest.mock import patch as _patch
         from zoneinfo import ZoneInfo
 
+        config.override("run.timezone", "America/New_York")
         orch = KronosOrchestrator(config)
         # 2026-08-17 13:25 UTC = 09:25 ET (EDT, UTC-4 in August)
         fixed_utc = datetime(2026, 8, 17, 13, 25, tzinfo=timezone.utc)
