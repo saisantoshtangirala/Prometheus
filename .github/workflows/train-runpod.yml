@@ -3,7 +3,12 @@ name: Train on RunPod GPU
 # Runs every trading-day morning (UTC, well before US market open) AND
 # on manual dispatch. Fully automated GPU training via RunPod's REST API
 # (docs.runpod.io):
-#   1. POST /v1/pods           - create a fresh pod
+#   1. POST /v1/pods           - create a fresh pod (Community Cloud by
+#                                 default; if it has no capacity, retries
+#                                 once on Secure Cloud automatically - see
+#                                 the "Create pod" step - an unattended
+#                                 nightly run has no one around to notice
+#                                 and retry by hand)
 #   2. GET  /v1/pods/{id}      - poll until running, read its real IP:port
 #   3. ssh/scp                 - push this checkout, train, pull the
 #                                 checkpoint back
@@ -128,22 +133,44 @@ jobs:
         if: steps.gate.outputs.should_run == 'true'
         run: |
           set -euo pipefail
-          RESPONSE=$(curl -sS -X POST "$RUNPOD_API/pods" \
-            -H "Authorization: Bearer ${{ secrets.RUNPOD_API_KEY }}" \
-            -H "Content-Type: application/json" \
-            -d '{
-              "name": "kronos-ci-${{ github.run_id }}",
-              "imageName": "runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04",
-              "gpuTypeIds": ["${{ steps.params.outputs.gpu_type }}"],
-              "gpuCount": 1,
-              "cloudType": "${{ steps.params.outputs.cloud_type }}",
-              "containerDiskInGb": 20,
-              "ports": ["22/tcp"]
-            }')
+
+          create_pod() {
+            local cloud_type="$1"
+            curl -sS -X POST "$RUNPOD_API/pods" \
+              -H "Authorization: Bearer ${{ secrets.RUNPOD_API_KEY }}" \
+              -H "Content-Type: application/json" \
+              -d '{
+                "name": "kronos-ci-${{ github.run_id }}",
+                "imageName": "runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04",
+                "gpuTypeIds": ["${{ steps.params.outputs.gpu_type }}"],
+                "gpuCount": 1,
+                "cloudType": "'"$cloud_type"'",
+                "containerDiskInGb": 20,
+                "ports": ["22/tcp"]
+              }'
+          }
+
+          PRIMARY_CLOUD="${{ steps.params.outputs.cloud_type }}"
+          RESPONSE=$(create_pod "$PRIMARY_CLOUD")
           echo "$RESPONSE"
           POD_ID=$(echo "$RESPONSE" | jq -r '.id')
+
+          # Community Cloud is peer-hosted - capacity fluctuates and "no
+          # instances currently available" is a routine, expected failure
+          # mode there, not a bug. An unattended nightly run has no human
+          # around to notice and retry manually (as we did once by hand),
+          # so fall back to Secure Cloud (dedicated capacity, reliably
+          # available, higher per-hour rate) automatically instead of
+          # just failing the night's training silently.
+          if { [ -z "$POD_ID" ] || [ "$POD_ID" = "null" ]; } && [ "$PRIMARY_CLOUD" != "SECURE" ]; then
+            echo "::warning::$PRIMARY_CLOUD had no capacity - falling back to SECURE cloud."
+            RESPONSE=$(create_pod "SECURE")
+            echo "$RESPONSE"
+            POD_ID=$(echo "$RESPONSE" | jq -r '.id')
+          fi
+
           if [ -z "$POD_ID" ] || [ "$POD_ID" = "null" ]; then
-            echo "::error::Pod creation failed - no id in response above."
+            echo "::error::Pod creation failed on both $PRIMARY_CLOUD and SECURE - no id in response above."
             exit 1
           fi
           echo "pod_id=$POD_ID" >> "$GITHUB_OUTPUT"
