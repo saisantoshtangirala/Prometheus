@@ -371,6 +371,48 @@ def deflated_sharpe(
 # ---------------------------------------------------------------------------
 
 @dataclass
+class TickerSignalStats:
+    n_obs: int
+    hit_rate: float
+
+
+@dataclass
+class SignalDiagnostic:
+    """
+    Isolates ONE question from the full backtest: does the strategy's
+    predicted DIRECTION correlate with the REALIZED direction of the
+    asset it's predicting, at all - stripped of position sizing,
+    turnover costs, and cross-asset netting.
+
+    BacktestResult.hit_rate is a different thing: the fraction of trading
+    DAYS with positive NET PORTFOLIO PnL (after costs, after summing
+    across assets, after however much or little the strategy chose to
+    bet). A strategy can score low there for reasons that have nothing to
+    do with whether its individual per-asset calls point the right way -
+    tiny positions plus transaction costs can tip a correctly-directional
+    but low-conviction day into a net loss. This diagnostic pairs
+    (predicted sign, realized sign) and (predicted weight, realized
+    return) directly, per asset per day, with nothing else in between.
+
+    Ties (a predicted weight of exactly 0.0 - "no call") are excluded
+    from hit_rate, matching kronos/paper_trader.py's own
+    directional_accuracy convention (`if p != 0`) elsewhere in this
+    codebase.
+    """
+    strategy: str
+    n_obs: int
+    n_calls: int              # n_obs minus exact-zero-prediction ties
+    hit_rate: float
+    hit_rate_p_value: float   # two-sided binomial test against p=0.5
+    hit_rate_if_sign_inverted: float
+    pearson_r: float
+    pearson_p: float
+    spearman_r: float
+    spearman_p: float
+    per_ticker: Dict[str, TickerSignalStats] = field(default_factory=dict)
+
+
+@dataclass
 class BacktestResult:
     strategy: str
     daily_returns: pd.Series
@@ -480,6 +522,52 @@ class WalkForwardBacktester:
             cost_bps_per_turnover=self.cfg.cost_bps,
         )
 
+    # -- signal-direction diagnostic -----------------------------------------
+
+    def diagnose_signal_direction(self, strategy: Strategy) -> SignalDiagnostic:
+        """
+        Same walk-forward loop as run() - identical train/test windows, the
+        SAME strategy.fit()/weights_for() calls - but records raw
+        (predicted weight, realized return) pairs per asset per day instead
+        of simulating a portfolio. See SignalDiagnostic's docstring for why
+        this answers a different, more fundamental question than
+        BacktestResult.hit_rate does.
+
+        weights_for()'s returned weight is tanh(raw_prediction *
+        size_scale) * max_weight. tanh is monotonic increasing and
+        size_scale is always > 0 by construction (KronosStrategy's
+        _calibrate_size_scale floors it at a 1.0 fallback, never negative
+        or zero) - so sign(weight) == sign(raw_prediction) always, and
+        Spearman rank correlation is identical whether computed on the
+        weight or the raw prediction (rank-invariant under any monotonic
+        transform). Testing weights_for()'s own public output is therefore
+        exactly equivalent to testing the model's raw prediction, and more
+        honest: it's literally what the deployed strategy does, not a
+        hypothetical bypass of it.
+        """
+        rets = self.returns.values
+        tickers = list(self.returns.columns)
+
+        preds: List[float] = []
+        actuals: List[float] = []
+        ticker_preds: Dict[str, List[float]] = {t: [] for t in tickers}
+        ticker_actuals: Dict[str, List[float]] = {t: [] for t in tickers}
+
+        for (s, e, te) in self.windows():
+            strategy.fit(rets[s:e])
+            for t in range(e, te):
+                w = np.asarray(strategy.weights_for(rets[:t]), dtype=float)
+                w = np.nan_to_num(w, nan=0.0)
+                for i, ticker in enumerate(tickers):
+                    preds.append(float(w[i]))
+                    actuals.append(float(rets[t, i]))
+                    ticker_preds[ticker].append(float(w[i]))
+                    ticker_actuals[ticker].append(float(rets[t, i]))
+
+        return _compute_signal_diagnostic(
+            strategy.name, preds, actuals, ticker_preds, ticker_actuals,
+        )
+
     # -- full comparison ----------------------------------------------------
 
     def compare(
@@ -491,6 +579,108 @@ class WalkForwardBacktester:
             logger.info("[backtest] running strategy: %s", name)
             results[name] = self.run(STRATEGIES[name]())
         return results
+
+
+def _hit_rate(preds: List[float], actuals: List[float]) -> Tuple[float, int, int]:
+    """Returns (hit_rate, n_calls, n_hits) over ties-excluded (pred != 0)
+    observations - a predicted weight of exactly 0.0 is "no call", not a
+    wrong call, matching kronos/paper_trader.py's directional_accuracy
+    convention."""
+    n_calls = 0
+    n_hits = 0
+    for p, a in zip(preds, actuals):
+        if p == 0.0:
+            continue
+        n_calls += 1
+        if (p > 0) == (a > 0):
+            n_hits += 1
+    rate = n_hits / n_calls if n_calls else 0.0
+    return rate, n_calls, n_hits
+
+
+def _compute_signal_diagnostic(
+    name: str,
+    preds: List[float],
+    actuals: List[float],
+    ticker_preds: Dict[str, List[float]],
+    ticker_actuals: Dict[str, List[float]],
+) -> SignalDiagnostic:
+    from scipy.stats import binomtest, pearsonr, spearmanr
+
+    hit_rate, n_calls, n_hits = _hit_rate(preds, actuals)
+    inverted_rate, _, _ = _hit_rate([-p for p in preds], actuals)
+    p_value = (
+        binomtest(n_hits, n_calls, p=0.5).pvalue if n_calls > 0 else 1.0
+    )
+
+    if len(preds) >= 2 and np.std(preds) > 0 and np.std(actuals) > 0:
+        pr, pp = pearsonr(preds, actuals)
+        sr, sp = spearmanr(preds, actuals)
+    else:
+        pr = pp = sr = sp = 0.0
+
+    per_ticker = {}
+    for ticker in ticker_preds:
+        t_rate, t_calls, _ = _hit_rate(
+            ticker_preds[ticker], ticker_actuals[ticker]
+        )
+        per_ticker[ticker] = TickerSignalStats(n_obs=t_calls, hit_rate=t_rate)
+
+    return SignalDiagnostic(
+        strategy=name,
+        n_obs=len(preds),
+        n_calls=n_calls,
+        hit_rate=hit_rate,
+        hit_rate_p_value=float(p_value),
+        hit_rate_if_sign_inverted=inverted_rate,
+        pearson_r=float(pr), pearson_p=float(pp),
+        spearman_r=float(sr), spearman_p=float(sp),
+        per_ticker=per_ticker,
+    )
+
+
+def render_signal_diagnostic_report(diag: SignalDiagnostic) -> str:
+    """Plain-text summary - meant for the CLI, not a saved artifact."""
+    lines = [
+        f"Signal-direction diagnostic: {diag.strategy}",
+        f"  observations: {diag.n_obs} (calls, pred != 0: {diag.n_calls})",
+        f"  hit rate: {diag.hit_rate:.1%}  (binomial p-value vs 50%: {diag.hit_rate_p_value:.4f})",
+        f"  hit rate if sign INVERTED: {diag.hit_rate_if_sign_inverted:.1%}",
+        f"  Pearson r: {diag.pearson_r:+.4f} (p={diag.pearson_p:.4f})",
+        f"  Spearman r: {diag.spearman_r:+.4f} (p={diag.spearman_p:.4f})",
+        "",
+        "  per-ticker hit rate:",
+    ]
+    for ticker, stats in sorted(diag.per_ticker.items()):
+        lines.append(f"    {ticker:14s} {stats.hit_rate:.1%}  (n={stats.n_obs})")
+    lines.append("")
+    if diag.n_calls == 0:
+        lines.append("  VERDICT: the strategy never made a directional call "
+                     "(every prediction was exactly 0) - nothing to diagnose.")
+    elif diag.hit_rate_p_value >= 0.05:
+        lines.append(
+            f"  VERDICT: hit rate {diag.hit_rate:.1%} is NOT statistically "
+            f"distinguishable from 50% (p={diag.hit_rate_p_value:.4f} >= 0.05). "
+            "No detectable directional signal, in either direction - a real "
+            "no-edge result, not a sign bug."
+        )
+    elif diag.hit_rate > 0.5:
+        lines.append(
+            f"  VERDICT: hit rate {diag.hit_rate:.1%} is statistically "
+            f"significant (p={diag.hit_rate_p_value:.4f}) and POSITIVE - "
+            "genuine directional signal in the predicted direction."
+        )
+    else:
+        lines.append(
+            f"  VERDICT: hit rate {diag.hit_rate:.1%} is statistically "
+            f"significant (p={diag.hit_rate_p_value:.4f}) but BELOW 50% - "
+            f"the model is systematically anti-correlated with realized "
+            f"direction. Inverting the sign would flip this to "
+            f"{diag.hit_rate_if_sign_inverted:.1%}. This points at a "
+            f"sign/orientation bug or a training objective that's actively "
+            f"learning the wrong direction, not random noise."
+        )
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
