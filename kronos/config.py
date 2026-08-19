@@ -108,6 +108,7 @@ def _builtin_defaults() -> Dict[str, Any]:
                  "halt_file": "logs/risk_halt.flag",
                  "kill_switch_file": "KILL_SWITCH"},
         "reporting": {"top_movers": 3, "volatility_windows": [5, 20]},
+        "execution": {"mode": "simulated"},
         "notifications": {"enabled": False, "send_daily_digest": True,
                           "large_pnl_alert_pct": 0.10},
         "backup": {"dir": "logs/backups", "max_backups": 30},

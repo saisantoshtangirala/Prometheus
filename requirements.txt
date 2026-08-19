@@ -75,6 +75,11 @@ sqlalchemy>=2.0.0
 pyyaml>=6.0
 requests>=2.31.0
 
+# Broker execution (kronos/execution_adapter.py) - only needed once
+# execution.mode is switched to "ibkr"; lazy-imported so its absence
+# never breaks the default simulated-execution path.
+ib_insync>=0.9.86
+
 # Testing
 pytest>=7.4.0
 pytest-asyncio>=0.21.0

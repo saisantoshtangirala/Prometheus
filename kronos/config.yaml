@@ -104,6 +104,12 @@ reporting:
   top_movers: 3
   volatility_windows: [5, 20]
 
+# Not yet wired into KronosOrchestrator - see kronos/execution_adapter.py's
+# module docstring for why (needs the operator's real IBKR paper-account
+# credentials and weeks of proven stability before any live wiring).
+execution:
+  mode: "simulated"    # simulated | ibkr
+
 notifications:
   enabled: false                 # opt-in - also needs KRONOS_TELEGRAM_BOT_TOKEN
                                   # and KRONOS_TELEGRAM_CHAT_ID env vars set
