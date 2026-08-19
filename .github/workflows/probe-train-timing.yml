@@ -1,0 +1,49 @@
+name: Probe RunPod Training Timing (read-only)
+
+# Ad-hoc timing probe for scripts/train.py's real cost on real data, so a
+# walk-forward backtest of the ACTUAL production SNN (ReflexArc, trained
+# via pretrain->finetune->meta) can be scoped with real numbers instead
+# of guessed ones. Does not touch kronos.service or its checkpoints/state
+# - runs in a scratch directory, writes its own throwaway checkpoints.
+#
+# Manual trigger only. CPU-only.
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Load Hetzner deploy key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.HETZNER_SSH_KEY }}
+
+      - name: Trust Hetzner host key
+        run: ssh-keyscan -H "${{ secrets.HETZNER_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Time one finetune window on real data
+        run: |
+          ssh "${{ secrets.HETZNER_USER }}@${{ secrets.HETZNER_HOST }}" '
+            set -euo pipefail
+            SCRATCH=/tmp/kronos-train-probe-${{ github.run_id }}
+            rm -rf "$SCRATCH"
+            git clone --branch claude/prometheus-causal-market-ol2pau --depth 1 \
+              /opt/prometheus "$SCRATCH"
+            cd "$SCRATCH"
+            source /opt/prometheus/.venv/bin/activate
+            echo "=== finetune: 1 window, 10-ticker real universe, 2 epochs (timing probe) ==="
+            time python scripts/train.py --mode finetune \
+              --tickers RELIANCE.NS,TCS.NS,HDFCBANK.NS,INFY.NS,ICICIBANK.NS,HINDUNILVR.NS,ITC.NS,SBIN.NS,BHARTIARTL.NS,KOTAKBANK.NS \
+              --n-assets 10 --finetune-epochs 2 --seq-len 64 --horizon 5 \
+              --checkpoint-dir /tmp/probe-checkpoints-${{ github.run_id }}
+          '
+
+      - name: Clean up scratch checkout
+        if: always()
+        run: |
+          ssh "${{ secrets.HETZNER_USER }}@${{ secrets.HETZNER_HOST }}" '
+            rm -rf /tmp/kronos-train-probe-${{ github.run_id }} /tmp/probe-checkpoints-${{ github.run_id }}
+          '
