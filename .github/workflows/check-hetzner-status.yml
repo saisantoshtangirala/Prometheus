@@ -56,4 +56,12 @@ jobs:
             echo
             echo "=== most recent Traceback/ERROR/CRITICAL in /var/log/kronos-service.log (with context) ==="
             grep -n -B2 -A30 "Traceback\|\[ERROR\]\|\[CRITICAL\]" /var/log/kronos-service.log 2>&1 | tail -n 200 || echo "(none found)"
+
+            echo
+            echo "=== disk usage (df -h) ==="
+            df -h /
+
+            echo
+            echo "=== largest contributors under /opt/prometheus and /var/log ==="
+            du -sh /opt/prometheus/logs/* /var/log/kronos-service.log 2>&1 | sort -rh
           '
