@@ -153,6 +153,10 @@ class KronosStrategy(Strategy):
         self.seed = seed
         self.model: Optional[torch.nn.Module] = None
         self._n_assets: int = 0
+        # See _calibrate_size_scale() below - mirrors kronos/reflex.py's
+        # ReflexArc.calibrate_size_scale() exactly, so this harness's
+        # sizing behavior matches what production actually does.
+        self._size_scale: float = 1.0
 
     # -- internal: nightmare bootstrap (block resample of train returns) ----
 
@@ -218,6 +222,38 @@ class KronosStrategy(Strategy):
             )
         self.model = master
         self.model.eval()
+        self._size_scale = self._calibrate_size_scale(train_returns)
+
+    def _calibrate_size_scale(self, train_returns: np.ndarray) -> float:
+        """Mirrors kronos/reflex.py's ReflexArc.calibrate_size_scale() -
+        see its docstring for the full rationale (a normalize-by-its-own-
+        volatility scaler was tested and rejected: it's scale-invariant
+        and can't tell noise from signal). This fits the same pooled OLS
+        slope of actual next-bar return on raw prediction, using ONLY the
+        train window fit() already has (no look-ahead - test data is
+        never touched here)."""
+        from kronos.reflex import MAX_SIZE_SCALE, MIN_CALIBRATION_SAMPLES
+        T = train_returns.shape[0]
+        preds, actuals = [], []
+        with torch.no_grad():
+            for t in range(self.horizon, T - 1):
+                window = train_returns[t - self.horizon:t]
+                x = torch.tensor(window.reshape(1, -1), dtype=torch.float32)
+                pred = self.model(x).squeeze(0).numpy()
+                preds.append(pred)
+                actuals.append(train_returns[t + 1])
+        if not preds:
+            return 1.0
+        p_arr = np.asarray(preds).ravel()
+        a_arr = np.asarray(actuals).ravel()
+        if p_arr.size < MIN_CALIBRATION_SAMPLES:
+            return 1.0
+        var_p = float(p_arr.var())
+        if var_p < 1e-12:
+            return 1.0
+        scale = float(np.cov(p_arr, a_arr, bias=True)[0, 1] / var_p)
+        scale = max(0.0, min(scale, MAX_SIZE_SCALE))
+        return scale if scale > 0.0 else 1.0
 
     def weights_for(self, recent_returns: np.ndarray) -> np.ndarray:
         if self.model is None:
@@ -229,14 +265,15 @@ class KronosStrategy(Strategy):
         x = torch.tensor(window.reshape(1, -1), dtype=torch.float32)
         with torch.no_grad():
             pred = self.model(x).squeeze(0).numpy()
-        # No scaling multiplier before tanh - matches ReflexArc.infer()
-        # (kronos/reflex.py), the actual live signal path this strategy is
-        # meant to approximate. A "* 50.0" here previously saturated tanh
-        # on pure noise (verified: 68% of max_weight on average, 40% of
-        # calls landing above 90% of cap, on synthetic white-noise input
-        # with zero real signal) - it bet near-maximum size almost every
-        # rebalance regardless of actual model confidence.
-        w = np.tanh(pred) * self.max_weight
+        # size_scale: see _calibrate_size_scale() - fit once per
+        # walk-forward window from train-only data, mirrors
+        # ReflexArc.infer()'s use of calibrate_size_scale() in production.
+        # A flat "* 50.0" here previously saturated tanh on pure noise
+        # (verified: 68% of max_weight on average, 40% of calls landing
+        # above 90% of cap) regardless of actual model confidence; the
+        # calibrated scale only grows when the model's raw predictions
+        # actually correlate with realized outcomes.
+        w = np.tanh(pred * self._size_scale) * self.max_weight
         return np.clip(w, -self.max_weight, self.max_weight)
 
 

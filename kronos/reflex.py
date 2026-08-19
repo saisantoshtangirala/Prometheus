@@ -28,6 +28,11 @@ logger = logging.getLogger(__name__)
 
 FLASH_CRASH_DROP_PCT = 0.20    # single-tick drop that triggers per-asset lockout
 
+# -- Size calibration (see calibrate_size_scale below) ----------------------
+DEFAULT_SIZE_SCALE = 1.0       # safe fallback: today's plain tanh(pred), no scaling
+MIN_CALIBRATION_SAMPLES = 100  # pooled (bars * assets) - below this, trust nothing
+MAX_SIZE_SCALE = 40.0          # hard ceiling regardless of what the fit says
+
 
 # ---------------------------------------------------------------------------
 # Regime Switch Gate (two-state volatility HMM approximation)
@@ -209,6 +214,11 @@ class ReflexArc:
         # first adoption computes one; infer() degrades to SNN-only when
         # unset, same behavior as before this existed.
         self._daily_bias: Optional[np.ndarray] = None
+        # Set by KronosOrchestrator once per checkpoint adoption via
+        # calibrate_size_scale() - see that method for why this exists.
+        # 1.0 (no scaling, today's already-verified-non-saturating
+        # tanh(pred)) until the first successful calibration.
+        self._size_scale: float = DEFAULT_SIZE_SCALE
 
     # -- per-asset flash-crash handling (REF-01 / REF-02) -------------------
 
@@ -233,6 +243,74 @@ class ReflexArc:
         be computed this time - clears any stale prior-day bias rather
         than silently keeping it)."""
         self._daily_bias = bias
+
+    def calibrate_size_scale(self, recent_returns: np.ndarray) -> None:
+        """Once-per-checkpoint-adoption recalibration of the raw SNN
+        prediction -> position-size scale.
+
+        Earlier approach considered and REJECTED after empirical testing:
+        normalizing each prediction by the rolling std of its OWN recent
+        history. That's mathematically scale-invariant - fed 400 ticks of
+        pure white noise (zero real information by construction), it still
+        produced avg 57% of cap conviction, 15% of calls >90% of cap,
+        identical regardless of the noise's absolute scale (x1 vs x10).
+        It can't distinguish a genuine signal from noise because it only
+        ever compares the signal to itself.
+
+        This version instead fits against something external: the SNN's
+        OWN realized track record. Pools (raw_pred_t, actual_return_{t+1})
+        pairs across every asset and the trailing lookback window, and
+        fits scale = cov(pred, actual) / var(pred) - a pooled OLS slope.
+        Simulated (see scratchpad probe, 500 replicates per case, pooled
+        n=250 matching this project's real lookback_days=30/horizon_days=5/
+        10-ticker universe): a pred stream with zero genuine correlation to
+        outcomes fits scale with median ~0.4 (never saturates, and does NOT
+        reproduce the old bug when pred's absolute scale is 10x bigger -
+        it's anchored to realized outcomes, not to itself). A pred stream
+        with genuine correlation (~0.15) fits scale ~3.0, and stronger
+        correlation (~0.40) fits ~8.0 - it responds monotonically to real
+        signal strength instead of being flat/saturated like the rejected
+        approach.
+
+        Floors at 0.0 (a confirmed non-positive relationship falls back to
+        the safe default rather than inverting signal direction on a live
+        system), caps at MAX_SIZE_SCALE, and falls back to
+        DEFAULT_SIZE_SCALE whenever there isn't enough history or pred has
+        ~zero variance to regress against. Never raises.
+        """
+        try:
+            horizon = int(self.cfg.nightmare.horizon_days)
+            T, n_assets = recent_returns.shape
+            preds, actuals = [], []
+            with torch.no_grad():
+                for t in range(horizon, T - 1):
+                    window = recent_returns[t - horizon:t]
+                    x = torch.tensor(window, dtype=torch.float32).unsqueeze(0)
+                    out = self.snn(x)
+                    pred = out[0] if isinstance(out, tuple) else out
+                    p = pred.squeeze(0).numpy()
+                    if p.ndim > 1:
+                        p = p[-1]
+                    preds.append(p)
+                    actuals.append(recent_returns[t + 1])
+            if not preds:
+                self._size_scale = DEFAULT_SIZE_SCALE
+                return
+            p_arr = np.asarray(preds).ravel()
+            a_arr = np.asarray(actuals).ravel()
+            if p_arr.size < MIN_CALIBRATION_SAMPLES:
+                self._size_scale = DEFAULT_SIZE_SCALE
+                return
+            var_p = float(p_arr.var())
+            if var_p < 1e-12:
+                self._size_scale = DEFAULT_SIZE_SCALE
+                return
+            scale = float(np.cov(p_arr, a_arr, bias=True)[0, 1] / var_p)
+            scale = max(0.0, min(scale, MAX_SIZE_SCALE))
+            self._size_scale = scale if scale > 0.0 else DEFAULT_SIZE_SCALE
+            logger.info("[reflex] recalibrated size scale: %.3f (n=%d)", self._size_scale, p_arr.size)
+        except Exception as e:
+            logger.warning("[reflex] size-scale calibration failed (%s) - keeping %.3f", e, self._size_scale)
 
     def asset_position_cap(self, ticker: str) -> float:
         """0.0 while the asset's flash-crash lockout is active, else gate cap."""
@@ -265,7 +343,10 @@ class ReflexArc:
             with torch.no_grad():
                 out = self.snn(x)
             pred = out[0] if isinstance(out, tuple) else out
-            signals = torch.tanh(pred.squeeze(0)).numpy()
+            # size_scale: see calibrate_size_scale() - defaults to 1.0
+            # (identical to plain tanh(pred)) until the first successful
+            # calibration.
+            signals = torch.tanh(pred.squeeze(0) * self._size_scale).numpy()
             if signals.ndim > 1:
                 signals = signals[-1]
         except (MemoryError, torch.cuda.OutOfMemoryError) as e:

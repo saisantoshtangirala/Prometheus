@@ -187,6 +187,21 @@ class TestStrategies:
         w = strat.weights_for(rets[:300])
         assert np.all(np.abs(w) <= 0.25 + 1e-9), "Kelly cap must bind"
 
+    def test_kronos_size_scale_calibrated_and_bounded(self, closes):
+        """fit() calibrates _size_scale from the train window only (see
+        _calibrate_size_scale's docstring - it replaced a rejected
+        normalize-by-own-volatility approach). Whatever it lands on must
+        be non-negative and within MAX_SIZE_SCALE, and the resulting
+        weights must still respect the cap."""
+        from kronos.reflex import MAX_SIZE_SCALE
+        strat = KronosStrategy(population=4, generations=1, top_k=2,
+                               n_futures=16, max_weight=0.25)
+        rets = closes.pct_change().dropna().values
+        strat.fit(rets[:252])
+        assert 0.0 <= strat._size_scale <= MAX_SIZE_SCALE
+        w = strat.weights_for(rets[:300])
+        assert np.all(np.abs(w) <= 0.25 + 1e-9)
+
     def test_momentum_deterministic(self, closes):
         rets = closes.pct_change().dropna().values
         a = MomentumStrategy().weights_for(rets[:300])

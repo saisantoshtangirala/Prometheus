@@ -117,3 +117,81 @@ class TestReflexArcConfidenceBlend:
         reflex.set_daily_bias(None)
         decision = reflex.infer(recent_returns, vix_value=15.0)
         assert decision.confidence_blended is False
+
+
+class TestReflexArcSizeCalibration:
+    """calibrate_size_scale() - fits raw-pred -> position-size scaling
+    against the SNN's own realized track record. Replaces an earlier
+    normalize-by-its-own-volatility approach that was built and rejected:
+    it was mathematically scale-invariant (400 ticks of pure white noise
+    still produced 57% of cap average conviction, identical whether the
+    noise was scaled x1 or x10) because it only ever compared a signal to
+    itself. This version is anchored to actual realized outcomes instead."""
+
+    @pytest.fixture
+    def reflex(self, tmp_path):
+        cfg = load_config()
+        cfg.override("trading.db_path", str(tmp_path / "trades.db"))
+        return ReflexArc(cfg)
+
+    def test_default_scale_before_any_calibration(self, reflex):
+        from kronos.reflex import DEFAULT_SIZE_SCALE
+        assert reflex._size_scale == DEFAULT_SIZE_SCALE
+
+    def test_insufficient_samples_falls_back_to_default(self, reflex):
+        from kronos.reflex import DEFAULT_SIZE_SCALE
+        n_assets = len(reflex.cfg.data.tickers)
+        reflex._size_scale = 5.0   # simulate a prior real calibration
+        tiny_returns = np.random.randn(3, n_assets).astype(np.float32) * 0.01
+        reflex.calibrate_size_scale(tiny_returns)
+        assert reflex._size_scale == DEFAULT_SIZE_SCALE
+
+    def test_pure_noise_calibration_stays_safe_not_saturated(self, reflex):
+        """The critical regression test: pure noise in, and the RESULTING
+        inference signals must stay well short of saturation - not
+        reproduce the rejected approach's 57%-of-cap-on-noise behavior.
+        torch's global RNG is seeded so the SNN's untrained init weights
+        (unrelated to the noise_returns seeding below) don't make this
+        flaky run to run."""
+        import torch
+        torch.manual_seed(0)
+        n_assets = len(reflex.cfg.data.tickers)
+        rng = np.random.default_rng(3)
+        noise_returns = rng.standard_normal(
+            (reflex.cfg.data.lookback_days, n_assets)
+        ).astype(np.float32) * 0.01
+        reflex.calibrate_size_scale(noise_returns)
+
+        mags = []
+        for _ in range(50):
+            recent = rng.standard_normal((30, n_assets)).astype(np.float32) * 0.01
+            decision = reflex.infer(recent, vix_value=15.0)
+            mags.append(np.abs(decision.signals))
+        mags = np.array(mags)
+        # 0.3 still leaves a wide margin under the rejected approach's 0.57
+        # mean-of-cap on the same kind of pure-noise input.
+        assert mags.mean() < 0.3
+        assert (mags > 0.9).mean() < 0.05  # no near-saturation on pure noise
+
+    def test_calibration_never_raises_on_malformed_input(self, reflex):
+        from kronos.reflex import DEFAULT_SIZE_SCALE
+        reflex.calibrate_size_scale(np.zeros((0, 0)))
+        assert reflex._size_scale == DEFAULT_SIZE_SCALE
+
+    def test_infer_applies_size_scale_before_tanh(self, reflex, monkeypatch):
+        """Directly verifies the wiring in infer(): with size_scale set,
+        signals must equal tanh(raw_pred * size_scale), not plain
+        tanh(raw_pred)."""
+        import torch
+        n_assets = len(reflex.cfg.data.tickers)
+        raw = torch.full((1, n_assets), 0.01)
+
+        def fake_forward(x):
+            return raw
+
+        monkeypatch.setattr(reflex.snn, "forward", fake_forward)
+        reflex._size_scale = 3.0
+        recent_returns = np.random.randn(30, n_assets).astype(np.float32) * 0.01
+        decision = reflex.infer(recent_returns, vix_value=15.0)
+        expected = np.tanh(0.01 * 3.0)
+        assert np.allclose(decision.signals, expected, atol=1e-5)

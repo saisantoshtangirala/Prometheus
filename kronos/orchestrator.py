@@ -128,6 +128,7 @@ class KronosOrchestrator:
         os.makedirs(self.cfg.orchestrator.checkpoint_dir, exist_ok=True)
         self._load_persisted_snn()
         self._load_persisted_daily_bias()
+        self._load_persisted_size_scale()
         # RunPod training runs entirely in GitHub Actions now (scheduled
         # in .github/workflows/train-runpod.yml), which scp's the result
         # straight onto this box. Kronos's only job is noticing when a
@@ -746,6 +747,31 @@ class KronosOrchestrator:
         except Exception as e:
             logger.warning("[orchestrator] failed to persist daily bias: %s", e)
 
+    def _size_scale_path(self) -> str:
+        return os.path.join(self.cfg.orchestrator.checkpoint_dir, "reflex_size_scale.txt")
+
+    def _load_persisted_size_scale(self) -> None:
+        """Mirrors _load_persisted_daily_bias() - a restart shouldn't
+        silently drop the calibrated size scale and fall back to the
+        default until the next adoption. Never raises."""
+        path = self._size_scale_path()
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path) as f:
+                self.reflex._size_scale = float(f.read().strip())
+            logger.info("[orchestrator] restored last-calibrated size scale (%.3f) from %s",
+                        self.reflex._size_scale, path)
+        except Exception as e:
+            logger.warning("[orchestrator] could not restore persisted size scale (%s) - using default", e)
+
+    def _persist_size_scale(self) -> None:
+        try:
+            with open(self._size_scale_path(), "w") as f:
+                f.write(str(self.reflex._size_scale))
+        except Exception as e:
+            logger.warning("[orchestrator] failed to persist size scale: %s", e)
+
     def _current_runpod_checkpoint_mtime(self) -> Optional[float]:
         path = os.path.join(RUNPOD_CHECKPOINT_DIR, "meta", "snn.pt")
         try:
@@ -781,6 +807,17 @@ class KronosOrchestrator:
                 )
             self.reflex.set_daily_bias(bias)
             self._persist_daily_bias(bias)
+            # Recalibrate the raw-pred -> position-size scale against this
+            # checkpoint's own realized track record (kronos/reflex.py's
+            # calibrate_size_scale - see its docstring for why this replaces
+            # a naive "normalize by the prediction's own volatility"
+            # approach, which was tested and rejected). Tied to this exact
+            # checkpoint for the same reason the daily bias is.
+            if self.state.memory is not None:
+                self.reflex.calibrate_size_scale(
+                    self.state.memory.returns_window(self.cfg.data.lookback_days)
+                )
+                self._persist_size_scale()
         else:
             # Don't retry the same broken/mismatched file every 30s -
             # remember it as "seen" so the warning logs once, not forever.
