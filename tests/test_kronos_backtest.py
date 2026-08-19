@@ -187,6 +187,46 @@ class TestStrategies:
         w = strat.weights_for(rets[:300])
         assert np.all(np.abs(w) <= 0.25 + 1e-9), "Kelly cap must bind"
 
+    def test_default_construction_matches_production_evolution_config(self):
+        """KronosStrategy() with no args (how scripts/run_backtest.py's
+        STRATEGIES factory actually instantiates it) must pick up
+        production's real evolution/nightmare budget from kronos/config.yaml,
+        not the old separately-hardcoded, smaller stand-in values."""
+        from kronos.config import load_config
+        cfg = load_config()
+        strat = KronosStrategy()
+        assert strat.population == int(cfg.evolution.population_size)
+        assert strat.generations == int(cfg.evolution.n_generations)
+        assert strat.n_futures == int(cfg.nightmare.n_futures)
+        # Explicit args must still override, for tests that need speed.
+        fast = KronosStrategy(population=4, generations=1, n_futures=16)
+        assert (fast.population, fast.generations, fast.n_futures) == (4, 1, 16)
+
+    def test_bootstrap_futures_preserves_temporal_structure(self):
+        """_bootstrap_futures used to resample each of the `horizon` days
+        independently, destroying real autocorrelation/momentum in what
+        the NEAT population is evolved against. Now draws a contiguous
+        block from a random start point instead. Verify directly against
+        a synthetic AR(1) series with a known, real lag-1 autocorrelation."""
+        n_days = 200
+        rng = np.random.default_rng(11)
+        ar = np.zeros((n_days, 3))
+        for t in range(1, n_days):
+            ar[t] = 0.3 * ar[t - 1] + rng.standard_normal(3) * 0.01
+        true_autocorr = np.corrcoef(ar[:-1, 0], ar[1:, 0])[0, 1]
+
+        strat = KronosStrategy(horizon=5, seed=42)
+        futures = strat._bootstrap_futures(ar).numpy()   # [N, horizon, A]
+        x = futures[:, :-1, 0].reshape(-1)
+        y = futures[:, 1:, 0].reshape(-1)
+        resampled_autocorr = np.corrcoef(x, y)[0, 1]
+
+        assert true_autocorr > 0.15, "test setup sanity check"
+        assert resampled_autocorr > 0.5 * true_autocorr, (
+            f"block bootstrap should preserve most of the true autocorr "
+            f"({true_autocorr:.3f}), got {resampled_autocorr:.3f}"
+        )
+
     def test_kronos_size_scale_calibrated_and_bounded(self, closes):
         """fit() calibrates _size_scale from the train window only (see
         _calibrate_size_scale's docstring - it replaced a rejected

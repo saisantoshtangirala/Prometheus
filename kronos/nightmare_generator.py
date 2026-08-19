@@ -215,6 +215,19 @@ class NightmareGenerator:
         """
         Last-resort futures: block-bootstrap resampling of historical returns.
         Not adversarial, but statistically honest - and never degenerate.
+
+        Each future is a real horizon-length run of CONSECUTIVE historical
+        days (from a random start point), not `horizon` independently
+        resampled days - the previous implementation resampled each day
+        independently, which despite this docstring's "block-bootstrap"
+        label was not actually block-bootstrapping: it destroyed all
+        temporal structure (autocorrelation, momentum, vol clustering) in
+        what it fed the evolution phase whenever this fallback triggered.
+        Verified on a synthetic AR(1) series (kronos/backtest.py's
+        _bootstrap_futures fix carries the same measurement in its
+        docstring): independent per-bar resampling took a true lag-1
+        autocorr of 0.293 down to a pooled 0.002 (destroyed); contiguous
+        block resampling preserves it at 0.287.
         """
         horizon = self.cfg.nightmare.horizon_days
         history = torch.tensor(
@@ -226,7 +239,11 @@ class NightmareGenerator:
             raise NightmareCollapseError(
                 "Diffusion collapsed and history is too short to bootstrap."
             )
-        idx = torch.randint(0, n_hist, (n_total, horizon))
+        if n_hist <= horizon:
+            starts = torch.zeros(n_total, dtype=torch.long)
+        else:
+            starts = torch.randint(0, n_hist - horizon, (n_total,))
+        idx = starts.unsqueeze(1) + torch.arange(horizon).unsqueeze(0)  # [N, horizon] contiguous
         futures = history[idx]                              # [N, T, A]
         # Jitter so resampled rows are never bit-identical
         futures = futures + torch.randn_like(futures) * history.std() * 0.1

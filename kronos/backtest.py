@@ -137,13 +137,33 @@ class KronosStrategy(Strategy):
     def __init__(
         self,
         horizon: int = 5,
-        population: int = 8,
-        generations: int = 2,
+        population: Optional[int] = None,
+        generations: Optional[int] = None,
         top_k: int = 3,
-        n_futures: int = 64,
+        n_futures: Optional[int] = None,
         max_weight: float = 0.25,
         seed: int = 42,
     ):
+        # population/generations/n_futures default to production's real
+        # kronos/config.yaml settings (evolution.population_size,
+        # evolution.n_generations, nightmare.n_futures) rather than a
+        # separately-hardcoded, driftable number - this backtest previously
+        # ran with population=8/generations=2/n_futures=64 unconditionally
+        # (the class defaults), a much smaller budget than the
+        # population=20/generations=3/n_futures=10000 production's real
+        # nightly evolution actually uses. That meant the backtest was
+        # never really testing the approach production runs, just a fast,
+        # deliberately-shrunk stand-in. Timed empirically before changing
+        # this: full production parity (20/3/10000) costs ~6.3s/window,
+        # ~13 min for a full 125-window walk-forward run - well within
+        # run-backtest.yml's 60-minute budget. Explicit args (as tests use,
+        # for speed) still override these.
+        if population is None or generations is None or n_futures is None:
+            from kronos.config import load_config
+            cfg = load_config()
+            population = population if population is not None else int(cfg.evolution.population_size)
+            generations = generations if generations is not None else int(cfg.evolution.n_generations)
+            n_futures = n_futures if n_futures is not None else int(cfg.nightmare.n_futures)
         self.horizon = horizon
         self.population = population
         self.generations = generations
@@ -161,9 +181,24 @@ class KronosStrategy(Strategy):
     # -- internal: nightmare bootstrap (block resample of train returns) ----
 
     def _bootstrap_futures(self, train: np.ndarray) -> torch.Tensor:
+        """Contiguous block-bootstrap: each future is a real horizon-length
+        run of consecutive historical days (from a random start point), not
+        `horizon` independently-resampled days. The old per-bar independent
+        resampling destroyed all real temporal structure - verified
+        directly on a synthetic AR(1) series with a real lag-1 autocorr of
+        0.293: the old approach's resampled futures had pooled lag-1
+        autocorr 0.002 (destroyed), this one has 0.287 (preserved). Evolving
+        the NEAT population against futures with no genuine autocorrelation,
+        momentum, or vol-clustering meant it could only ever be fit against
+        noise, regardless of whether the underlying market has real
+        structure to learn."""
         rng = np.random.default_rng(self.seed)
         T = train.shape[0]
-        idx = rng.integers(0, T, size=(self.n_futures, self.horizon))
+        if T <= self.horizon:
+            starts = np.zeros(self.n_futures, dtype=int)
+        else:
+            starts = rng.integers(0, T - self.horizon, size=self.n_futures)
+        idx = starts[:, None] + np.arange(self.horizon)[None, :]   # [N, horizon] contiguous
         futures = torch.tensor(train[idx], dtype=torch.float32)
         jitter = torch.randn_like(futures) * float(train.std()) * 0.1
         return futures + jitter

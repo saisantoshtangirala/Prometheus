@@ -439,6 +439,57 @@ class TestNightmareGenerator:
         assert buffer.variance > 0, "Bootstrap fallback must produce variance"
         assert buffer.n_futures == 32
 
+    def test_bootstrap_fallback_preserves_temporal_structure(self, config):
+        """_bootstrap_from_history's docstring has long claimed
+        'block-bootstrap' - verify it actually is one now (each future is a
+        run of CONSECUTIVE historical days), not `horizon` independently
+        resampled days, which would destroy real autocorrelation/momentum
+        the evolution phase is meant to learn from. Builds a memory with a
+        deliberately autocorrelated (AR(1)) return series and checks the
+        fallback's resampled futures preserve a comparable lag-1 autocorr,
+        rather than washing it out to ~0."""
+        tickers = list(config.data.tickers)
+        n_days = 200
+        rng = np.random.default_rng(11)
+        dates = pd.bdate_range("2026-01-01", periods=n_days)
+        ar = np.zeros((n_days, len(tickers)))
+        for t in range(1, n_days):
+            ar[t] = 0.3 * ar[t - 1] + rng.standard_normal(len(tickers)) * 0.01
+        returns = pd.DataFrame(ar, index=dates, columns=tickers)
+        prices = (1 + returns).cumprod() * 100
+        volumes = pd.DataFrame(
+            rng.integers(1_000_000, 50_000_000, (n_days, len(tickers))).astype(float),
+            index=dates, columns=tickers,
+        )
+        vix = pd.Series(rng.uniform(15, 25, n_days), index=dates, name="VIX")
+        mem = DailyMemory(
+            as_of=datetime.now(timezone.utc),
+            prices=prices, volumes=volumes, returns=returns, vix=vix,
+            sentiment={t: 0.0 for t in tickers},
+            macro={"vix_last": float(vix.iloc[-1]),
+                   "vix_mean_20d": float(vix.tail(20).mean()),
+                   "market_return_1d": float(returns.iloc[-1].mean()),
+                   "market_vol_20d": float(returns.tail(20).std().mean())},
+            source_used="synthetic",
+        )
+        true_autocorr = np.corrcoef(ar[:-1, 0], ar[1:, 0])[0, 1]
+
+        gen = NightmareGenerator(config)
+        weights = torch.zeros(len(tickers))
+        buffer = gen._bootstrap_from_history(mem, n_total=3000, weights=weights)
+
+        futures = buffer.futures  # [N, horizon, A]
+        x = futures[:, :-1, 0].reshape(-1).numpy()
+        y = futures[:, 1:, 0].reshape(-1).numpy()
+        resampled_autocorr = np.corrcoef(x, y)[0, 1]
+
+        assert true_autocorr > 0.15, "test setup sanity: the synthetic series must be genuinely autocorrelated"
+        assert resampled_autocorr > 0.5 * true_autocorr, (
+            f"block bootstrap should preserve most of the true autocorr "
+            f"({true_autocorr:.3f}), got {resampled_autocorr:.3f} - "
+            f"looks like independent-bar resampling destroyed it"
+        )
+
     def test_nig03_inf_nan_sanitized(self, config, memory):
         """NIG-03: inf clipped to 1e6, NaN to 0.0 - NEAT never sees poison."""
         gen = NightmareGenerator(config)
