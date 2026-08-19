@@ -108,3 +108,8 @@ notifications:
   enabled: false                 # opt-in - also needs KRONOS_TELEGRAM_BOT_TOKEN
                                   # and KRONOS_TELEGRAM_CHAT_ID env vars set
   send_daily_digest: true        # sent once per day, after market close
+  large_pnl_alert_pct: 0.10      # a single day's |pnl| this fraction of day-start equity -> extra out-of-band alert, not just the daily digest
+
+backup:
+  dir: "logs/backups"            # trades.db copied here once per day, after close_day()
+  max_backups: 30                # oldest copies beyond this count are deleted

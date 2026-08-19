@@ -435,11 +435,56 @@ class KronosOrchestrator:
         stats = self.trader.close_day(self.state.day, prices)
         self.trader.audit(self.state.day, "logging", json.dumps(stats))
         self._send_daily_notification(stats)
+        self._check_large_pnl_move(stats)
+        self._backup_trades_db()
         # One digest per day covers it - reset regardless of whether a
         # notification was actually sent (e.g. Telegram not configured),
         # so this always reflects "since the last day boundary."
         self._runpod_adopted_today = False
         return stats
+
+    def _check_large_pnl_move(self, stats: Dict) -> None:
+        """A single day's PnL swinging past notifications.large_pnl_alert_pct
+        of that day's opening equity gets an immediate out-of-band alert,
+        not just a line buried in the daily digest - exactly the kind of
+        thing that's easy to miss if you're not reading every digest."""
+        equity = stats.get("equity", 0.0)
+        pnl = stats.get("pnl", 0.0)
+        day_start = equity - pnl
+        if day_start <= 0:
+            return
+        move_pct = abs(pnl) / day_start
+        limit = float(self.cfg.notifications.get("large_pnl_alert_pct", 0.10))
+        if move_pct >= limit:
+            self._alert(
+                f"Kronos large PnL move: day {stats.get('day')} "
+                f"{'gained' if pnl >= 0 else 'lost'} {move_pct:.1%} of opening "
+                f"equity ({pnl:+,.2f}, now ${equity:,.2f})."
+            )
+
+    def _backup_trades_db(self) -> None:
+        """Copies trades.db into backup.dir once per day, after close_day()
+        has already committed - a corrupted or accidentally-deleted live DB
+        (this box has already crashed on sqlite errors once) shouldn't be
+        able to erase the whole paper-trading history. Best-effort: a
+        backup failure must never affect trading. Keeps only the most
+        recent backup.max_backups copies."""
+        try:
+            import shutil
+            backup_dir = self.cfg.backup.dir
+            os.makedirs(backup_dir, exist_ok=True)
+            dest = os.path.join(
+                backup_dir, f"trades_day{self.state.day:04d}.db"
+            )
+            shutil.copyfile(self.trader.db_path, dest)
+            max_backups = int(self.cfg.backup.max_backups)
+            existing = sorted(
+                f for f in os.listdir(backup_dir) if f.startswith("trades_day")
+            )
+            for stale in existing[:-max_backups] if max_backups > 0 else []:
+                os.remove(os.path.join(backup_dir, stale))
+        except Exception as e:
+            logger.warning("[orchestrator] trades.db backup failed: %s", e)
 
     def _send_daily_notification(self, stats: Dict) -> None:
         """Best-effort Telegram digest - never let a notification problem
@@ -879,8 +924,15 @@ class KronosOrchestrator:
                 self._persist_size_scale()
         else:
             # Don't retry the same broken/mismatched file every 30s -
-            # remember it as "seen" so the warning logs once, not forever.
+            # remember it as "seen" so the warning (and this alert) fires
+            # once per distinct bad file, not forever.
             self._runpod_last_adopted_mtime = mtime
+            self._alert(
+                "Kronos: RunPod checkpoint adoption FAILED - a new "
+                "checkpoints/runpod/meta/snn.pt appeared but failed to "
+                "load (shape mismatch or corrupt file). Keeping "
+                "yesterday's weights; see the service log for the traceback."
+            )
 
     # ------------------------------------------------------------------
     # Helpers

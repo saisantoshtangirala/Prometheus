@@ -318,10 +318,27 @@ def main():
     logger.info("Kronos initialized: mode=%s days=%d accelerated=%s",
                 args.mode, args.days, args.accelerated)
 
-    if args.accelerated or args.mode == "replay":
-        run_accelerated(orchestrator, args.days)
-    else:
-        run_realtime(orchestrator, args.days)
+    try:
+        if args.accelerated or args.mode == "replay":
+            run_accelerated(orchestrator, args.days)
+        else:
+            run_realtime(orchestrator, args.days)
+    except Exception as e:
+        # The process is about to die on an exception systemd will restart
+        # it from (e.g. the sqlite fd-leak crash this alert was added
+        # after) - a best-effort Telegram ping before re-raising is the
+        # only way to find out about that without SSHing in. Never lets a
+        # notifier problem swallow the real exception.
+        try:
+            if orchestrator.notifier.enabled:
+                orchestrator.notifier.send(
+                    f"Kronos CRASHED: {type(e).__name__}: {e}\n"
+                    f"Day {orchestrator.state.day}, equity "
+                    f"${orchestrator.trader.equity():.2f}. systemd will restart it."
+                )
+        except Exception:
+            logger.warning("[main] crash alert itself failed", exc_info=True)
+        raise
 
     logger.info("Kronos loop finished. Equity: $%.2f", orchestrator.trader.equity())
     orchestrator.trader.close()
