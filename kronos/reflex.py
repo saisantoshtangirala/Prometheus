@@ -21,6 +21,7 @@ from collections import deque
 import numpy as np
 import torch
 
+from kronos.features import build_features, n_input_features
 from prometheus.neuro.neuromodulation import CortisolSystem
 from prometheus.neuro.spiking_network import SpikingMarketEncoder
 
@@ -194,7 +195,7 @@ class ReflexArc:
         self.cfg = config
         n_assets = len(config.data.tickers)
         self.snn = snn or SpikingMarketEncoder(
-            input_size=n_assets,
+            input_size=n_input_features(n_assets),
             layer_sizes=[32, 16],
             output_size=n_assets,
         )
@@ -244,7 +245,11 @@ class ReflexArc:
         than silently keeping it)."""
         self._daily_bias = bias
 
-    def calibrate_size_scale(self, recent_returns: np.ndarray) -> None:
+    def calibrate_size_scale(
+        self,
+        recent_returns: np.ndarray,
+        recent_volumes: Optional[np.ndarray] = None,
+    ) -> None:
         """Once-per-checkpoint-adoption recalibration of the raw SNN
         prediction -> position-size scale.
 
@@ -285,7 +290,9 @@ class ReflexArc:
             with torch.no_grad():
                 for t in range(horizon, T - 1):
                     window = recent_returns[t - horizon:t]
-                    x = torch.tensor(window, dtype=torch.float32).unsqueeze(0)
+                    vol_window = recent_volumes[t - horizon:t] if recent_volumes is not None else None
+                    feats = build_features(window, vol_window)
+                    x = torch.tensor(feats, dtype=torch.float32).unsqueeze(0)
                     out = self.snn(x)
                     pred = out[0] if isinstance(out, tuple) else out
                     p = pred.squeeze(0).numpy()
@@ -325,8 +332,17 @@ class ReflexArc:
         bar_prices: Optional[Dict[str, float]] = None,
         bar_volumes: Optional[Dict[str, float]] = None,
         now: Optional[datetime] = None,
+        recent_volumes: Optional[np.ndarray] = None,   # [T, n_assets] - see kronos/features.py
     ) -> ReflexDecision:
-        """One low-latency inference tick. Budget: reflex.inference_budget_ms."""
+        """One low-latency inference tick. Budget: reflex.inference_budget_ms.
+
+        recent_volumes is the windowed volume HISTORY feeding the model
+        input (kronos/features.py.build_features) - distinct from
+        bar_volumes above, which is today's single-tick volume used only
+        for the microstructure order-book scan below. None falls back to
+        an all-zeros volume channel (build_features' own contract), so
+        omitting it degrades gracefully rather than raising.
+        """
         t0 = time.perf_counter()
 
         # 1. Kill-switches first - a panic print must never wait on the SNN.
@@ -339,7 +355,8 @@ class ReflexArc:
         #    momentum lookup instead of killing market-hour operations.
         fallback_mode = False
         try:
-            x = torch.tensor(recent_returns, dtype=torch.float32).unsqueeze(0)
+            feats = build_features(recent_returns, recent_volumes)
+            x = torch.tensor(feats, dtype=torch.float32).unsqueeze(0)
             with torch.no_grad():
                 out = self.snn(x)
             pred = out[0] if isinstance(out, tuple) else out

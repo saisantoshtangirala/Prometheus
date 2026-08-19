@@ -20,6 +20,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from kronos.features import build_features, n_input_features
 from prometheus.engine import PrometheusEngine, PrometheusConfig
 from prometheus.data import MarketDataFetcher
 
@@ -101,15 +102,26 @@ def run_finetune(engine: PrometheusEngine, args) -> None:
         raw_data = MarketDataFetcher._synthetic_data(
             [f"ASSET_{i}" for i in range(args.n_assets)]
         )
-        returns = fetcher.get_returns(raw_data)
-    else:
-        returns = fetcher.get_returns(raw_data)
+    returns = fetcher.get_returns(raw_data)
+
+    # Volume, aligned to whatever subset/order of tickers get_returns kept
+    # (it drops columns with too much missing data) - see
+    # kronos/features.py. None (an all-zeros volume channel) if this
+    # fetch has no Volume field at all.
+    volumes = None
+    if "Volume" in raw_data.columns.get_level_values(0):
+        volumes = raw_data["Volume"].reindex(
+            index=returns.index, columns=returns.columns
+        ).fillna(0.0)
 
     # Prepare training tensors
     ret_array = returns.fillna(0).values
+    vol_array = volumes.values if volumes is not None else None
     n_bars, n_cols = ret_array.shape
     n_assets = min(args.n_assets, n_cols)
     ret_array = ret_array[:, :n_assets]
+    if vol_array is not None:
+        vol_array = vol_array[:, :n_assets]
 
     engine.config.n_assets = n_assets
     engine.causal_transformer.eval()
@@ -122,12 +134,14 @@ def run_finetune(engine: PrometheusEngine, args) -> None:
         # Rolling window mini-batches
         for start in range(0, n_bars - args.seq_len - args.horizon, args.seq_len):
             end = start + args.seq_len
-            x_np = ret_array[start:end]
+            ret_window = ret_array[start:end]
+            vol_window = vol_array[start:end] if vol_array is not None else None
             y_np = ret_array[end:end + args.horizon]
 
-            if x_np.shape[0] < 4 or y_np.shape[0] < 1:
+            if ret_window.shape[0] < 4 or y_np.shape[0] < 1:
                 continue
 
+            x_np = build_features(ret_window, vol_window)
             x = torch.tensor(x_np, dtype=torch.float32).unsqueeze(0).to(args.device)
             y = torch.tensor(y_np, dtype=torch.float32).unsqueeze(0).to(args.device)
 
@@ -264,6 +278,12 @@ def main():
         # loudly, so a silent drift here would go unnoticed indefinitely.
         snn_layer_sizes=[int(x) for x in args.snn_layer_sizes.split(",")],
         snn_output_size=args.n_assets,
+        # ltc/snn now take returns+volume (kronos/features.py), not
+        # returns alone - see run_finetune's build_features() call below.
+        # causal_transformer is unaffected (its real input is always
+        # ltc's n_assets-wide output, never the raw window - see
+        # PrometheusEngine.__init__'s own comment on this).
+        n_input_features=n_input_features(args.n_assets),
     )
 
     logger.info("Initializing Prometheus Engine...")

@@ -347,8 +347,12 @@ class KronosOrchestrator:
         recent = self.state.memory.returns_window(
             self.cfg.nightmare.horizon_days
         )
+        recent_volumes = self.state.memory.volumes_window(
+            self.cfg.nightmare.horizon_days
+        )
         decision = self.reflex.infer(
-            recent, vix_value, bar_prices, bar_volumes, now=now
+            recent, vix_value, bar_prices, bar_volumes, now=now,
+            recent_volumes=recent_volumes,
         )
         # Execute toward signal-derived target weights
         if bar_prices:
@@ -804,6 +808,7 @@ class KronosOrchestrator:
                 bias = compute_daily_bias(
                     self.state.memory.returns_window(self.cfg.data.lookback_days),
                     checkpoint_dir=RUNPOD_CHECKPOINT_DIR,
+                    recent_volumes=self.state.memory.volumes_window(self.cfg.data.lookback_days),
                 )
             self.reflex.set_daily_bias(bias)
             self._persist_daily_bias(bias)
@@ -815,7 +820,8 @@ class KronosOrchestrator:
             # checkpoint for the same reason the daily bias is.
             if self.state.memory is not None:
                 self.reflex.calibrate_size_scale(
-                    self.state.memory.returns_window(self.cfg.data.lookback_days)
+                    self.state.memory.returns_window(self.cfg.data.lookback_days),
+                    recent_volumes=self.state.memory.volumes_window(self.cfg.data.lookback_days),
                 )
                 self._persist_size_scale()
         else:

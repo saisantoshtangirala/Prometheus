@@ -30,6 +30,8 @@ import numpy as np
 import pandas as pd
 import torch
 
+from kronos.features import build_features, n_input_features
+
 logger = logging.getLogger(__name__)
 
 TRADING_DAYS = 252
@@ -44,12 +46,13 @@ def load_history(
     start: str,
     end: Optional[str] = None,
     csv_path: Optional[str] = None,
-) -> pd.DataFrame:
+) -> Tuple[pd.DataFrame, Optional[pd.DataFrame]]:
     """
-    Return a [date x ticker] close-price DataFrame.
+    Return (closes, volumes) - both [date x ticker], volumes possibly None.
 
     csv_path: a CSV with a Date column/index and one column per ticker
-    (what `save_history` writes). If absent, yfinance is tried.
+    (what `save_history` writes) - closes only, no volume archived offline.
+    If absent, yfinance is tried, which does carry Volume.
     """
     if csv_path and os.path.exists(csv_path):
         df = pd.read_csv(csv_path, index_col=0, parse_dates=True)
@@ -59,7 +62,7 @@ def load_history(
         out = df[cols].loc[start:end].dropna(how="all")
         logger.info("[backtest] loaded %d rows x %d tickers from %s",
                     len(out), len(cols), csv_path)
-        return out
+        return out, None
 
     import yfinance as yf
     data = yf.download(tickers, start=start, end=end,
@@ -72,7 +75,14 @@ def load_history(
     closes = data["Close"] if "Close" in data else data
     if isinstance(closes, pd.Series):
         closes = closes.to_frame(tickers[0])
-    return closes.dropna(how="all")
+    closes = closes.dropna(how="all")
+
+    volumes = None
+    if "Volume" in data:
+        volumes = data["Volume"]
+        if isinstance(volumes, pd.Series):
+            volumes = volumes.to_frame(tickers[0])
+    return closes, volumes
 
 
 def save_history(closes: pd.DataFrame, csv_path: str) -> None:
@@ -85,14 +95,20 @@ def save_history(closes: pd.DataFrame, csv_path: str) -> None:
 # ---------------------------------------------------------------------------
 
 class Strategy:
-    """fit() sees ONLY the train window; weights_for() sees data <= t-1."""
+    """fit() sees ONLY the train window; weights_for() sees data <= t-1.
+
+    train_volumes/recent_volumes are optional (None for strategies, CSV-
+    loaded histories, or data sources that don't have them) - only
+    KronosStrategy uses them; the dumb baselines below ignore them."""
 
     name = "base"
 
-    def fit(self, train_returns: np.ndarray) -> None:   # [T, A]
+    def fit(self, train_returns: np.ndarray, train_volumes: Optional[np.ndarray] = None) -> None:   # [T, A]
         pass
 
-    def weights_for(self, recent_returns: np.ndarray) -> np.ndarray:  # [W, A]
+    def weights_for(
+        self, recent_returns: np.ndarray, recent_volumes: Optional[np.ndarray] = None,
+    ) -> np.ndarray:  # [W, A]
         raise NotImplementedError
 
 
@@ -101,7 +117,9 @@ class BuyHoldStrategy(Strategy):
 
     name = "buy_hold"
 
-    def weights_for(self, recent_returns: np.ndarray) -> np.ndarray:
+    def weights_for(
+        self, recent_returns: np.ndarray, recent_volumes: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
         n = recent_returns.shape[1]
         return np.full(n, 1.0 / n)
 
@@ -115,7 +133,9 @@ class MomentumStrategy(Strategy):
         self.lookback = lookback
         self.max_weight = max_weight
 
-    def weights_for(self, recent_returns: np.ndarray) -> np.ndarray:
+    def weights_for(
+        self, recent_returns: np.ndarray, recent_volumes: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
         window = recent_returns[-self.lookback:]
         signal = np.sign(window.mean(axis=0))
         n_active = max(int(np.abs(signal).sum()), 1)
@@ -180,7 +200,9 @@ class KronosStrategy(Strategy):
 
     # -- internal: nightmare bootstrap (block resample of train returns) ----
 
-    def _bootstrap_futures(self, train: np.ndarray) -> torch.Tensor:
+    def _bootstrap_futures(
+        self, train_returns: np.ndarray, train_volumes: Optional[np.ndarray],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Contiguous block-bootstrap: each future is a real horizon-length
         run of consecutive historical days (from a random start point), not
         `horizon` independently-resampled days. The old per-bar independent
@@ -191,19 +213,30 @@ class KronosStrategy(Strategy):
         the NEAT population against futures with no genuine autocorrelation,
         momentum, or vol-clustering meant it could only ever be fit against
         noise, regardless of whether the underlying market has real
-        structure to learn."""
+        structure to learn.
+
+        Returns (ret_futures, vol_futures), both [N, horizon, A] - the
+        return-block and volume-block of each future use the SAME start
+        index, so they come from the same real historical days (their
+        actual joint relationship, not independently shuffled marginals).
+        vol_futures is all-zeros if train_volumes is unavailable."""
         rng = np.random.default_rng(self.seed)
-        T = train.shape[0]
+        T = train_returns.shape[0]
         if T <= self.horizon:
             starts = np.zeros(self.n_futures, dtype=int)
         else:
             starts = rng.integers(0, T - self.horizon, size=self.n_futures)
         idx = starts[:, None] + np.arange(self.horizon)[None, :]   # [N, horizon] contiguous
-        futures = torch.tensor(train[idx], dtype=torch.float32)
-        jitter = torch.randn_like(futures) * float(train.std()) * 0.1
-        return futures + jitter
+        ret_futures = torch.tensor(train_returns[idx], dtype=torch.float32)
+        jitter = torch.randn_like(ret_futures) * float(train_returns.std()) * 0.1
+        ret_futures = ret_futures + jitter
+        if train_volumes is not None and train_volumes.shape == train_returns.shape:
+            vol_futures = torch.tensor(train_volumes[idx], dtype=torch.float32)
+        else:
+            vol_futures = torch.zeros_like(ret_futures)
+        return ret_futures, vol_futures
 
-    def fit(self, train_returns: np.ndarray) -> None:
+    def fit(self, train_returns: np.ndarray, train_volumes: Optional[np.ndarray] = None) -> None:
         from kronos.evolver import WeightedEnsemble
         from kronos.warmer import ClippedMAML
         from prometheus.meta.neat_evolver import (
@@ -216,12 +249,17 @@ class KronosStrategy(Strategy):
         _random.seed(self.seed)
 
         self._n_assets = train_returns.shape[1]
-        input_dim = self._n_assets * self.horizon
+        n_feat = n_input_features(self._n_assets)
+        input_dim = n_feat * self.horizon
 
         # 1. Nightmare: bootstrap futures from the train window only
-        futures = self._bootstrap_futures(train_returns)     # [N, H, A]
-        X_val = futures.reshape(futures.shape[0], -1)
-        y_val = futures[:, -1, :]
+        ret_futures, vol_futures = self._bootstrap_futures(train_returns, train_volumes)  # [N,H,A] each
+        N, H, A = ret_futures.shape
+        feat_futures = build_features(
+            ret_futures.reshape(N * H, A).numpy(), vol_futures.reshape(N * H, A).numpy(),
+        ).reshape(N, H, n_feat)
+        X_val = torch.tensor(feat_futures.reshape(N, -1), dtype=torch.float32)
+        y_val = ret_futures[:, -1, :]   # target is the raw RETURN, never the volume channel
 
         # 2. Evolution: tiny NEAT against the futures
         evolver = NEATArchitectureEvolver(
@@ -242,11 +280,18 @@ class KronosStrategy(Strategy):
         master = WeightedEnsemble(models, [g.fitness for g in top])
 
         # 3. MAML warm-up on the tail of the train window (still no test data)
-        tail = train_returns[-(self.horizon + 5):]
+        tail_returns = train_returns[-(self.horizon + 5):]
+        tail_volumes = (
+            train_volumes[-(self.horizon + 5):]
+            if train_volumes is not None and train_volumes.shape == train_returns.shape
+            else None
+        )
         xs, ys = [], []
-        for s in range(len(tail) - self.horizon):
-            xs.append(tail[s:s + self.horizon].reshape(-1))
-            ys.append(tail[s + self.horizon])
+        for s in range(len(tail_returns) - self.horizon):
+            window_r = tail_returns[s:s + self.horizon]
+            window_v = tail_volumes[s:s + self.horizon] if tail_volumes is not None else None
+            xs.append(build_features(window_r, window_v).reshape(-1))
+            ys.append(tail_returns[s + self.horizon])
         if xs:
             learner = ClippedMAML(master, inner_lr=0.01, n_inner_steps=3)
             master, _ = learner.adapt(
@@ -257,9 +302,11 @@ class KronosStrategy(Strategy):
             )
         self.model = master
         self.model.eval()
-        self._size_scale = self._calibrate_size_scale(train_returns)
+        self._size_scale = self._calibrate_size_scale(train_returns, train_volumes)
 
-    def _calibrate_size_scale(self, train_returns: np.ndarray) -> float:
+    def _calibrate_size_scale(
+        self, train_returns: np.ndarray, train_volumes: Optional[np.ndarray] = None,
+    ) -> float:
         """Mirrors kronos/reflex.py's ReflexArc.calibrate_size_scale() -
         see its docstring for the full rationale (a normalize-by-its-own-
         volatility scaler was tested and rejected: it's scale-invariant
@@ -272,8 +319,10 @@ class KronosStrategy(Strategy):
         preds, actuals = [], []
         with torch.no_grad():
             for t in range(self.horizon, T - 1):
-                window = train_returns[t - self.horizon:t]
-                x = torch.tensor(window.reshape(1, -1), dtype=torch.float32)
+                window_r = train_returns[t - self.horizon:t]
+                window_v = train_volumes[t - self.horizon:t] if train_volumes is not None else None
+                feats = build_features(window_r, window_v)
+                x = torch.tensor(feats.reshape(1, -1), dtype=torch.float32)
                 pred = self.model(x).squeeze(0).numpy()
                 preds.append(pred)
                 actuals.append(train_returns[t + 1])
@@ -290,14 +339,21 @@ class KronosStrategy(Strategy):
         scale = max(0.0, min(scale, MAX_SIZE_SCALE))
         return scale if scale > 0.0 else 1.0
 
-    def weights_for(self, recent_returns: np.ndarray) -> np.ndarray:
+    def weights_for(
+        self, recent_returns: np.ndarray, recent_volumes: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
         if self.model is None:
             return np.zeros(recent_returns.shape[1])
-        window = recent_returns[-self.horizon:]
-        if window.shape[0] < self.horizon:
-            pad = np.zeros((self.horizon - window.shape[0], window.shape[1]))
-            window = np.vstack([pad, window])
-        x = torch.tensor(window.reshape(1, -1), dtype=torch.float32)
+        window_r = recent_returns[-self.horizon:]
+        window_v = recent_volumes[-self.horizon:] if recent_volumes is not None else None
+        if window_r.shape[0] < self.horizon:
+            pad_r = np.zeros((self.horizon - window_r.shape[0], window_r.shape[1]))
+            window_r = np.vstack([pad_r, window_r])
+            if window_v is not None:
+                pad_v = np.zeros((self.horizon - window_v.shape[0], window_v.shape[1]))
+                window_v = np.vstack([pad_v, window_v])
+        feats = build_features(window_r, window_v)
+        x = torch.tensor(feats.reshape(1, -1), dtype=torch.float32)
         with torch.no_grad():
             pred = self.model(x).squeeze(0).numpy()
         # size_scale: see _calibrate_size_scale() - fit once per
@@ -404,7 +460,12 @@ class WalkForwardBacktester:
     the return of day t. Turnover between consecutive days pays cost_bps.
     """
 
-    def __init__(self, closes: pd.DataFrame, config: Optional[WalkForwardConfig] = None):
+    def __init__(
+        self,
+        closes: pd.DataFrame,
+        config: Optional[WalkForwardConfig] = None,
+        volumes: Optional[pd.DataFrame] = None,
+    ):
         self.closes = closes.dropna(how="any")
         self.returns = self.closes.pct_change().dropna()
         self.cfg = config or WalkForwardConfig()
@@ -413,6 +474,15 @@ class WalkForwardBacktester:
                 f"Need >= {self.cfg.train_window + self.cfg.test_window} bars, "
                 f"got {len(self.returns)}"
             )
+        # Aligned to self.returns' exact index/column order (not volumes'
+        # own) - see kronos/features.py.build_features and DailyMemory.
+        # volumes_window's identical concern. None (KronosStrategy falls
+        # back to an all-zeros volume channel) if unavailable - offline
+        # CSV loads and the --synthetic harness mode have no volume.
+        self.volumes = (
+            volumes.reindex(index=self.returns.index, columns=self.returns.columns).fillna(0.0)
+            if volumes is not None else None
+        )
 
     def windows(self) -> List[Tuple[int, int, int]]:
         """[(train_start, train_end, test_end)] index triples, no overlap of
@@ -431,6 +501,7 @@ class WalkForwardBacktester:
 
     def run(self, strategy: Strategy) -> BacktestResult:
         rets = self.returns.values                     # [T, A]
+        vols = self.volumes.values if self.volumes is not None else None   # [T, A] or None
         dates = self.returns.index
         daily: List[float] = []
         daily_dates: List = []
@@ -440,9 +511,12 @@ class WalkForwardBacktester:
 
         spans = self.windows()
         for (s, e, te) in spans:
-            strategy.fit(rets[s:e])
+            strategy.fit(rets[s:e], vols[s:e] if vols is not None else None)
             for t in range(e, te):
-                w = np.asarray(strategy.weights_for(rets[:t]), dtype=float)
+                w = np.asarray(
+                    strategy.weights_for(rets[:t], vols[:t] if vols is not None else None),
+                    dtype=float,
+                )
                 w = np.nan_to_num(w, nan=0.0)
                 turnover = float(np.abs(w - prev_w).sum())
                 gross = float((w * rets[t]).sum())

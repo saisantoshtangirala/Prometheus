@@ -58,6 +58,7 @@ class PrometheusConfig:
         ltc_hidden: List[int] = None,
         snn_layer_sizes: List[int] = None,
         snn_output_size: Optional[int] = None,
+        n_input_features: Optional[int] = None,
         memory_dim: int = 64,
         device: str = "cpu",
         output_dir: str = "output",
@@ -79,6 +80,16 @@ class PrometheusConfig:
         # kronos/reflex.py's ReflexArc (output_size == n_assets exactly) -
         # pass this explicitly instead.
         self.snn_output_size = snn_output_size if snn_output_size is not None else n_assets // 2
+        # Width of the per-timestep INPUT to causal_transformer/ltc/snn -
+        # deliberately separate from n_assets (which stays "how many assets
+        # we predict/output", used by every other subsystem here: dag,
+        # hive_mind, diffusion, black_swan_gen, htm, kelly, neat). Defaults
+        # to n_assets (returns-only, the historical behavior) so every
+        # caller except kronos's own wiring is unaffected. kronos/features.py
+        # is the shared convention for what a wider feature vector contains
+        # (returns + volume z-score -> n_assets * 2) and callers that build
+        # that wider input pass n_input_features=n_assets*2 explicitly.
+        self.n_input_features = n_input_features if n_input_features is not None else n_assets
         self.memory_dim = memory_dim
         self.device = device
         self.output_dir = output_dir
@@ -105,6 +116,11 @@ class PrometheusEngine:
         # Causal subsystem
         self.dag = CausalDAGEngine(max_nodes=500)
         self.causal_transformer = CausalTransformer(
+            # NOT cfg.n_input_features: causal_transformer's actual input
+            # is always self.ltc's OUTPUT (ltc_out, below), never the raw
+            # x directly - and self.ltc's output_size is (and stays)
+            # cfg.n_assets regardless of how wide its own input is. Only
+            # ltc/snn (which consume raw x) use n_input_features.
             n_features=cfg.n_assets,
             n_targets=cfg.n_assets,
             horizon=cfg.horizon,
@@ -116,13 +132,13 @@ class PrometheusEngine:
 
         # Neural subsystems
         self.ltc = LiquidTimeConstantNetwork(
-            input_size=cfg.n_assets,
+            input_size=cfg.n_input_features,
             hidden_sizes=cfg.ltc_hidden,
             output_size=cfg.n_assets,
         ).to(self.device)
 
         self.snn = SpikingMarketEncoder(
-            input_size=cfg.n_assets,
+            input_size=cfg.n_input_features,
             layer_sizes=cfg.snn_layer_sizes,
             output_size=cfg.snn_output_size,
         ).to(self.device)
@@ -407,6 +423,18 @@ class PrometheusEngine:
                 if x.shape[1] < 2:
                     continue
 
+                # Synthetic black-swan scenarios carry no volume - pad with
+                # zeros to match ltc/snn's configured n_input_features
+                # (kronos/features.py's contract: no volume data means an
+                # all-zeros volume channel, never a shape mismatch). A
+                # no-op whenever n_input_features == n_assets (the default,
+                # unless a caller explicitly widened it).
+                pad = self.config.n_input_features - x.shape[-1]
+                if pad > 0:
+                    x = torch.cat(
+                        [x, torch.zeros(*x.shape[:-1], pad, device=x.device)], dim=-1,
+                    )
+
                 step_result = self.train_step(x, y)
                 epoch_losses.append(step_result["loss"])
 
@@ -576,6 +604,12 @@ class PrometheusEngine:
             "n_layers": cfg.n_layers,
             "d_ff": cfg.d_ff,
             "ltc_hidden": cfg.ltc_hidden,
+            # Width of ltc/causal_transformer/snn's per-timestep input -
+            # see PrometheusConfig.n_input_features. Older checkpoints saved
+            # before this field existed don't have it; readers must fall
+            # back to n_assets (their only historical behavior) rather than
+            # KeyError.
+            "n_input_features": cfg.n_input_features,
         }
         with open(f"{path}/arch.json", "w") as f:
             json.dump(arch, f)

@@ -23,6 +23,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from kronos import KronosOrchestrator, load_config
+from kronos.features import n_input_features
 
 
 @pytest.fixture
@@ -67,7 +68,7 @@ class TestMaybeAdoptRunpodCheckpoint:
         orch = KronosOrchestrator(config)
 
         source = type(orch.reflex.snn)(
-            input_size=len(config.data.tickers), layer_sizes=[32, 16],
+            input_size=n_input_features(len(config.data.tickers)), layer_sizes=[32, 16],
             output_size=len(config.data.tickers),
         )
         _write_snn_checkpoint(runpod_dir, source)
@@ -85,7 +86,7 @@ class TestMaybeAdoptRunpodCheckpoint:
         orch = KronosOrchestrator(config)
 
         source = type(orch.reflex.snn)(
-            input_size=len(config.data.tickers), layer_sizes=[32, 16],
+            input_size=n_input_features(len(config.data.tickers)), layer_sizes=[32, 16],
             output_size=len(config.data.tickers),
         )
         _write_snn_checkpoint(runpod_dir, source)
@@ -103,7 +104,7 @@ class TestMaybeAdoptRunpodCheckpoint:
         orch = KronosOrchestrator(config)
 
         source = type(orch.reflex.snn)(
-            input_size=len(config.data.tickers), layer_sizes=[32, 16],
+            input_size=n_input_features(len(config.data.tickers)), layer_sizes=[32, 16],
             output_size=len(config.data.tickers),
         )
         _write_snn_checkpoint(runpod_dir, source)
@@ -129,14 +130,14 @@ class TestMaybeAdoptRunpodCheckpoint:
         orch = KronosOrchestrator(config)
 
         first = type(orch.reflex.snn)(
-            input_size=len(config.data.tickers), layer_sizes=[32, 16],
+            input_size=n_input_features(len(config.data.tickers)), layer_sizes=[32, 16],
             output_size=len(config.data.tickers),
         )
         _write_snn_checkpoint(runpod_dir, first)
         orch.maybe_adopt_runpod_checkpoint()
 
         second = type(orch.reflex.snn)(
-            input_size=len(config.data.tickers), layer_sizes=[32, 16],
+            input_size=n_input_features(len(config.data.tickers)), layer_sizes=[32, 16],
             output_size=len(config.data.tickers),
         )
         time.sleep(0.01)   # ensure a distinct mtime
@@ -211,7 +212,7 @@ class TestDailyDigestRunpodStatus:
 
         orch = KronosOrchestrator(config)
         source = type(orch.reflex.snn)(
-            input_size=len(config.data.tickers), layer_sizes=[32, 16],
+            input_size=n_input_features(len(config.data.tickers)), layer_sizes=[32, 16],
             output_size=len(config.data.tickers),
         )
         _write_snn_checkpoint(runpod_dir, source)
@@ -232,7 +233,7 @@ class TestDailyDigestRunpodStatus:
         orch = KronosOrchestrator(config)
 
         source = type(orch.reflex.snn)(
-            input_size=len(config.data.tickers), layer_sizes=[32, 16],
+            input_size=n_input_features(len(config.data.tickers)), layer_sizes=[32, 16],
             output_size=len(config.data.tickers),
         )
         _write_snn_checkpoint(runpod_dir, source)
@@ -257,7 +258,7 @@ class TestDailyDigestRunpodStatus:
 
         orch = KronosOrchestrator(config)
         source = type(orch.reflex.snn)(
-            input_size=len(config.data.tickers), layer_sizes=[32, 16],
+            input_size=n_input_features(len(config.data.tickers)), layer_sizes=[32, 16],
             output_size=len(config.data.tickers),
         )
         _write_snn_checkpoint(runpod_dir, source)

@@ -105,6 +105,16 @@ class DailyMemory:
         """Last N days of returns as [days, n_tickers] float32."""
         return self.returns.iloc[-days:].fillna(0.0).values.astype(np.float32)
 
+    def volumes_window(self, days: int) -> np.ndarray:
+        """Last N days of volumes as [days, n_tickers] float32, column-
+        aligned to self.returns's ticker order (not necessarily
+        self.volumes' own) so it lines up with returns_window() for
+        kronos/features.py.build_features() without a silent ticker-order
+        mismatch. Missing/unresolvable columns become 0.0, matching
+        returns_window()'s own NaN handling."""
+        aligned = self.volumes.reindex(columns=self.returns.columns)
+        return aligned.iloc[-days:].fillna(0.0).values.astype(np.float32)
+
 
 # ---------------------------------------------------------------------------
 # Source adapters - uniform interface: fetch(tickers, lookback) -> DataFrame
