@@ -356,6 +356,22 @@ class TestFetchLiveBar:
         assert prices == {}
         assert volumes == {}
 
+    def test_download_called_with_threads_disabled(self):
+        """Regression: yf.download()'s default threaded mode leaks one
+        never-closed sqlite connection (yfinance's own tz/cookie cache)
+        per worker thread per call. Called every REFLEX minute, that
+        accumulated open fds until the process could no longer open its
+        own trades.db (~61 minutes after each restart, confirmed live on
+        the Hetzner box). threads=False must always be passed."""
+        from unittest.mock import MagicMock, patch as _patch
+
+        idx = pd.date_range("2026-01-01 09:30", periods=1, freq="1min")
+        fake_data = pd.DataFrame({"Close": [101.0], "Volume": [1000.0]}, index=idx)
+        mock_download = MagicMock(return_value=fake_data)
+        with _patch("yfinance.download", mock_download):
+            run_kronos.fetch_live_bar(["AAA"])
+        assert mock_download.call_args.kwargs.get("threads") is False
+
 
 class TestRealtimeExecutesTrades:
     def test_reflex_tick_receives_live_prices_and_can_trade(self, config):

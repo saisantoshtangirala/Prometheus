@@ -91,9 +91,20 @@ def fetch_live_bar(tickers: List[str]) -> Tuple[Dict[str, float], Dict[str, floa
         logger.warning("[reflex] yfinance not installed - cannot fetch live quotes")
         return {}, {}
     try:
+        # threads=False: yf.download()'s default threaded mode spawns a
+        # worker thread per ticker, and yfinance's own tz/cookie sqlite
+        # cache (yfinance/cache.py, peewee SqliteDatabase) hands out a
+        # new thread-local connection per thread that is never closed
+        # when the thread exits. Called once a minute during REFLEX with
+        # threads=True, that leaked a growing set of open fds to
+        # ~/.cache/py-yfinance/*.db every tick, until the process could no
+        # longer open its own trades.db - confirmed via the Hetzner box's
+        # /proc/<pid>/fd listing showing dozens of live handles to
+        # tkr-tz.db/cookies.db minutes after a fresh restart. Sequential
+        # fetching reuses one connection and never leaks.
         data = yf.download(
             tickers, period="1d", interval="1m",
-            progress=False, auto_adjust=True, group_by="column",
+            progress=False, auto_adjust=True, group_by="column", threads=False,
         )
     except Exception as e:
         logger.warning("[reflex] live quote fetch failed: %s", e)
