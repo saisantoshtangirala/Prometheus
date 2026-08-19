@@ -56,6 +56,7 @@ from kronos.notifier import TelegramNotifier
 from kronos.paper_trader import PaperTrader
 from kronos.reflex import ReflexArc
 from kronos.reporter import GodsEyeReporter
+from kronos.risk_guard import RiskGuard
 from kronos.bias_estimator import compute_daily_bias
 from kronos.runpod_trigger import CHECKPOINT_DIR as RUNPOD_CHECKPOINT_DIR, load_runpod_checkpoint
 from kronos.warmer import KronosWarmer, WarmupResult
@@ -115,6 +116,7 @@ class KronosOrchestrator:
         self.trader = PaperTrader(self.cfg)
         self.reporter = GodsEyeReporter(self.cfg)
         self.notifier = TelegramNotifier(self.cfg)
+        self.risk_guard = RiskGuard(self.cfg)
 
         self.state = DayState()
         self.master_model: Optional[torch.nn.Module] = None
@@ -214,6 +216,10 @@ class KronosOrchestrator:
                     )
                     self.state.phase_failures[name] = str(e)
                     self.state.degraded = True
+                    self._alert(
+                        f"Kronos phase FATAL: {name} (day {self.state.day})\n"
+                        f"{e}\nMoving on in degraded mode - see audit log."
+                    )
                     return None
                 logger.warning(
                     "[orchestrator] %s failed (attempt %d/%d) - retrying: %s",
@@ -344,12 +350,19 @@ class KronosOrchestrator:
             return None
         if self.skip_trading:
             return None   # stale/unavailable data day - observe, never trade
+        if bar_prices:
+            # Mark-to-market BEFORE the risk check below - RiskGuard reads
+            # trader.equity(), which marks off last_prices. Checking risk
+            # against last tick's stale prices would let this tick's real
+            # move go unnoticed until the tick after.
+            self.trader.last_prices.update(bar_prices)
         recent = self.state.memory.returns_window(
             self.cfg.nightmare.horizon_days
         )
         decision = self.reflex.infer(
             recent, vix_value, bar_prices, bar_volumes, now=now
         )
+        halted = self._enforce_risk()
         # Execute toward signal-derived target weights
         if bar_prices:
             tickers = self.state.memory.tickers
@@ -357,19 +370,65 @@ class KronosOrchestrator:
             for i, ticker in enumerate(tickers):
                 if ticker not in bar_prices or i >= len(decision.signals):
                     continue
-                target = float(decision.signals[i]) * kelly_fraction \
-                    * float(self.cfg.trading.max_position_pct)
+                price = bar_prices[ticker]
+                target = 0.0 if halted else float(decision.signals[i]) \
+                    * kelly_fraction * float(self.cfg.trading.max_position_pct)
+                if not halted:
+                    rejection = self.risk_guard.sanity_check_order(
+                        ticker, price, self.trader.last_prices.get(ticker), target,
+                    )
+                    if rejection:
+                        self.trader.audit(self.state.day, "risk",
+                                          f"order rejected: {rejection}")
+                        self._alert(f"Kronos order rejected (risk guard)\n{rejection}")
+                        continue
                 asset_cap = min(
                     decision.position_cap,
                     decision.asset_caps.get(ticker, 1.0),
                 )
                 self.trader.execute(
-                    self.state.day, ticker, target,
-                    bar_prices[ticker],
+                    self.state.day, ticker, target, price,
                     (bar_volumes or {}).get(ticker, 0.0),
                     position_cap=asset_cap,
                 )
         return decision
+
+    def _enforce_risk(self) -> bool:
+        """Check the independent risk layer. On any breach - or if already
+        halted from a previous check - flattens every position immediately
+        (no 24h veto delay, no ML in the loop) and trips the halt file.
+        Returns True if trading is halted, so callers skip placing new
+        orders this tick."""
+        if self.risk_guard.halted:
+            return True
+        reason = self.risk_guard.check(self.trader)
+        if reason is None:
+            return False
+        self._auto_flatten(reason)
+        self.risk_guard.trip(reason)
+        self._alert(
+            f"KRONOS RISK HALT\n{reason}\nAll positions flattened. "
+            f"Trading halted until an operator removes {self.risk_guard.halt_file}."
+        )
+        return True
+
+    def _auto_flatten(self, reason: str) -> None:
+        for ticker, price in list(self.trader.last_prices.items()):
+            if self.trader.positions.get(ticker, 0.0) != 0.0:
+                self.trader.execute(
+                    self.state.day, ticker, 0.0, price, bar_volume=1e9,
+                )
+        self.trader.audit(self.state.day, "risk", f"auto-flatten: {reason}")
+
+    def _alert(self, text: str) -> None:
+        """Best-effort out-of-band alert for events that can't wait for the
+        daily digest - risk halts, rejected orders, phase FATAL failures.
+        Never raises; a notification problem must never affect trading."""
+        try:
+            if self.notifier.enabled:
+                self.notifier.send(text)
+        except Exception as e:
+            logger.warning("[orchestrator] alert failed: %s", e)
 
     def run_logging(self, closing_prices: Optional[Dict[str, float]] = None) -> Dict:
         prices = closing_prices or dict(self.trader.last_prices)

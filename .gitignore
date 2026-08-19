@@ -21,3 +21,4 @@ build/
 *.html
 notebooks/.ipynb_checkpoints/
 /logs/
+/KILL_SWITCH

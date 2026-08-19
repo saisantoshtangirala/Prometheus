@@ -62,6 +62,8 @@ def config(tmp_path):
     cfg.override("orchestrator.checkpoint_dir", str(tmp_path / "models"))
     cfg.override("orchestrator.report_dir", str(tmp_path / "reports"))
     cfg.override("orchestrator.veto_file", str(tmp_path / "veto.txt"))
+    cfg.override("risk.halt_file", str(tmp_path / "risk_halt.flag"))
+    cfg.override("risk.kill_switch_file", str(tmp_path / "KILL_SWITCH"))
     return cfg
 
 

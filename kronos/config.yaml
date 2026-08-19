@@ -86,6 +86,20 @@ orchestrator:
   checkpoint_dir: "logs/models"
   report_dir: "logs/reports"
 
+# Independent risk layer - enforced in code the ML pipeline cannot reach,
+# so a bad signal or a bug in reflex/evolution can never itself defeat
+# these limits. Distinct from orchestrator.veto_file: that's a 24h-delayed
+# human override for deliberate strategic intervention; this is immediate,
+# automatic, and exists precisely to act faster than a human could.
+risk:
+  enabled: true
+  max_daily_loss_pct: 0.05       # loss from the day's opening equity -> auto-flatten + halt
+  max_drawdown_pct: 0.20         # loss from the campaign's peak-ever equity -> auto-flatten + halt
+  max_single_order_pct: 0.30     # reject any single order notional above this fraction of equity
+  max_price_deviation_pct: 0.20  # reject a fill priced this far from the last known price (fat-finger/bad-data guard)
+  halt_file: "logs/risk_halt.flag"    # created automatically on an automatic trip; its presence blocks new positions until an operator removes it
+  kill_switch_file: "KILL_SWITCH"     # operator-created file (repo root) -> immediate flatten + halt, no delay, no ML involved
+
 reporting:
   top_movers: 3
   volatility_windows: [5, 20]

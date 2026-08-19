@@ -102,6 +102,11 @@ def _builtin_defaults() -> Dict[str, Any]:
                          "veto_delay_hours": 24, "heartbeat_minutes": 60,
                          "checkpoint_dir": "logs/models",
                          "report_dir": "logs/reports"},
+        "risk": {"enabled": True, "max_daily_loss_pct": 0.05,
+                 "max_drawdown_pct": 0.20, "max_single_order_pct": 0.30,
+                 "max_price_deviation_pct": 0.20,
+                 "halt_file": "logs/risk_halt.flag",
+                 "kill_switch_file": "KILL_SWITCH"},
         "reporting": {"top_movers": 3, "volatility_windows": [5, 20]},
         "notifications": {"enabled": False, "send_daily_digest": True},
     }
