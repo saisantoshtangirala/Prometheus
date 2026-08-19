@@ -58,12 +58,11 @@ def main():
     p.add_argument("--out-dir", default="logs/backtests")
     args = p.parse_args()
 
-    volumes = None
     if args.synthetic:
         closes = synthetic_history(args.tickers)
         data_label = "SYNTHETIC (regime-switching GBM) - says NOTHING about real markets"
     else:
-        closes, volumes = load_history(args.tickers, args.start, args.end, args.csv)
+        closes = load_history(args.tickers, args.start, args.end, args.csv)
         data_label = (
             f"{'CSV ' + args.csv if args.csv else 'yfinance'} "
             f"{closes.index[0].date()} .. {closes.index[-1].date()}"
@@ -80,7 +79,6 @@ def main():
             cost_bps=args.cost_bps,
             n_trials=len(args.strategies),
         ),
-        volumes=volumes,
     )
     logger.info("data: %s | %d bars | %d walk-forward windows",
                 data_label, len(bt.returns), len(bt.windows()))

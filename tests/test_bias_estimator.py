@@ -23,31 +23,11 @@ from prometheus.engine import PrometheusEngine, PrometheusConfig
 @pytest.fixture
 def saved_engine_dir(tmp_path):
     """A real PrometheusEngine.save() output - arch.json + weight files,
-    the actual contract compute_daily_bias reads. Returns-only
-    (n_input_features defaults to n_assets) - the historical contract,
-    still what most checkpoints look like."""
+    the actual contract compute_daily_bias reads."""
     cfg = PrometheusConfig(
         n_assets=10, seq_len=64, horizon=5, d_model=32, n_heads=2, n_layers=2,
         device="cpu", output_dir=str(tmp_path / "out"),
         snn_layer_sizes=[32, 16], snn_output_size=10,
-    )
-    engine = PrometheusEngine(cfg)
-    meta_dir = tmp_path / "meta"
-    engine.save(str(meta_dir))
-    return tmp_path
-
-
-@pytest.fixture
-def saved_engine_dir_with_volume_features(tmp_path):
-    """Same as saved_engine_dir but built with n_input_features=n_assets*2
-    (kronos/features.py's returns+volume contract) - what a checkpoint
-    trained after the feature-richness change looks like."""
-    from kronos.features import n_input_features as _n_feat
-    cfg = PrometheusConfig(
-        n_assets=10, seq_len=64, horizon=5, d_model=32, n_heads=2, n_layers=2,
-        device="cpu", output_dir=str(tmp_path / "out"),
-        snn_layer_sizes=[32, 16], snn_output_size=10,
-        n_input_features=_n_feat(10),
     )
     engine = PrometheusEngine(cfg)
     meta_dir = tmp_path / "meta"
@@ -79,26 +59,6 @@ class TestComputeDailyBias:
         (saved_engine_dir / "meta" / "ltc.pt").write_bytes(b"not a torch checkpoint")
         recent_returns = np.random.randn(80, 10).astype(np.float32) * 0.01
         assert compute_daily_bias(recent_returns, checkpoint_dir=saved_engine_dir) is None
-
-    def test_volume_feature_checkpoint_with_volumes_provided(self, saved_engine_dir_with_volume_features):
-        recent_returns = np.random.randn(80, 10).astype(np.float32) * 0.01
-        recent_volumes = np.random.randint(1_000_000, 50_000_000, (80, 10)).astype(np.float32)
-        bias = compute_daily_bias(
-            recent_returns, checkpoint_dir=saved_engine_dir_with_volume_features,
-            recent_volumes=recent_volumes,
-        )
-        assert bias is not None
-        assert bias.shape == (10,)
-
-    def test_volume_feature_checkpoint_without_volumes_still_works(self, saved_engine_dir_with_volume_features):
-        """Omitting recent_volumes must degrade gracefully (zeros channel
-        via build_features), not raise or silently mismatch shapes."""
-        recent_returns = np.random.randn(80, 10).astype(np.float32) * 0.01
-        bias = compute_daily_bias(
-            recent_returns, checkpoint_dir=saved_engine_dir_with_volume_features,
-        )
-        assert bias is not None
-        assert bias.shape == (10,)
 
 
 class TestReflexArcConfidenceBlend:

@@ -34,7 +34,6 @@ from typing import Optional
 import numpy as np
 import torch
 
-from kronos.features import build_features
 from prometheus.causal.causal_transformer import CausalTransformer
 from prometheus.neuro.ltc_network import LiquidTimeConstantNetwork
 
@@ -44,7 +43,6 @@ logger = logging.getLogger("kronos.bias_estimator")
 def compute_daily_bias(
     recent_returns: np.ndarray,   # [T, n_assets], T >= arch's seq_len
     checkpoint_dir: Path,
-    recent_volumes: Optional[np.ndarray] = None,   # [T, n_assets], see kronos/features.py
 ) -> Optional[np.ndarray]:
     """
     Returns a [n_assets] array - the checkpoint's causal_transformer's
@@ -67,11 +65,6 @@ def compute_daily_bias(
 
         n_assets = arch["n_assets"]
         seq_len = arch["seq_len"]
-        # Older checkpoints saved before kronos/features.py existed have no
-        # n_input_features key - their only historical behavior was
-        # returns-only (n_input_features == n_assets), so that's the
-        # correct fallback, not a hard failure.
-        n_feat = arch.get("n_input_features", n_assets)
         if recent_returns.ndim != 2 or recent_returns.shape[-1] != n_assets:
             logger.warning(
                 "Daily bias skipped: recent_returns shape %s doesn't match "
@@ -86,7 +79,7 @@ def compute_daily_bias(
             return None
 
         ltc = LiquidTimeConstantNetwork(
-            input_size=n_feat,
+            input_size=n_assets,
             hidden_sizes=arch["ltc_hidden"],
             output_size=n_assets,
         )
@@ -94,12 +87,6 @@ def compute_daily_bias(
         ltc.eval()
 
         causal_transformer = CausalTransformer(
-            # NOT n_feat: causal_transformer's actual input is always
-            # ltc's OUTPUT (ltc_out, below), which is n_assets-wide
-            # regardless of how wide ltc's own input is. Only ltc itself
-            # (which consumes raw x) uses n_feat. Mirrors
-            # PrometheusEngine.__init__'s construction exactly - see its
-            # comment for why.
             n_features=n_assets,
             n_targets=n_assets,
             horizon=arch["horizon"],
@@ -114,9 +101,7 @@ def compute_daily_bias(
         causal_transformer.eval()
 
         window = recent_returns[-seq_len:]
-        vol_window = recent_volumes[-seq_len:] if recent_volumes is not None else None
-        feats = build_features(window, vol_window) if n_feat != n_assets else window
-        x = torch.tensor(feats, dtype=torch.float32).unsqueeze(0)
+        x = torch.tensor(window, dtype=torch.float32).unsqueeze(0)
         with torch.no_grad():
             ltc_out, _, _ = ltc(x)
             causal_out = causal_transformer(ltc_out, return_attributions=False)

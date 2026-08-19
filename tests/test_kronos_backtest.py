@@ -66,9 +66,9 @@ class TestNoLookAhead:
         seen_lengths = []
 
         class Spy(BuyHoldStrategy):
-            def weights_for(self, recent_returns, recent_volumes=None):
+            def weights_for(self, recent_returns):
                 seen_lengths.append(len(recent_returns))
-                return super().weights_for(recent_returns, recent_volumes)
+                return super().weights_for(recent_returns)
 
         bt = WalkForwardBacktester(
             closes, WalkForwardConfig(train_window=252, test_window=21)
@@ -90,7 +90,7 @@ class TestNoLookAhead:
             def __init__(self):
                 self.rets = closes.pct_change().dropna().values
 
-            def weights_for(self, recent_returns, recent_volumes=None):
+            def weights_for(self, recent_returns):
                 t = len(recent_returns)          # the day about to be traded
                 if t < len(self.rets):
                     return np.sign(self.rets[t]) * 0.25   # uses only leak-free index
@@ -216,8 +216,7 @@ class TestStrategies:
         true_autocorr = np.corrcoef(ar[:-1, 0], ar[1:, 0])[0, 1]
 
         strat = KronosStrategy(horizon=5, seed=42)
-        ret_futures, _vol_futures = strat._bootstrap_futures(ar, train_volumes=None)
-        futures = ret_futures.numpy()   # [N, horizon, A]
+        futures = strat._bootstrap_futures(ar).numpy()   # [N, horizon, A]
         x = futures[:, :-1, 0].reshape(-1)
         y = futures[:, 1:, 0].reshape(-1)
         resampled_autocorr = np.corrcoef(x, y)[0, 1]
@@ -256,28 +255,6 @@ class TestStrategies:
                 WalkForwardConfig(train_window=252, test_window=21),
             )
 
-    def test_kronos_runs_end_to_end_with_real_volume_data(self, closes):
-        """The feature-richness change: KronosStrategy now builds its
-        model input from returns+volume (kronos/features.py), not returns
-        alone. Confirms the whole WalkForwardBacktester -> KronosStrategy
-        pipeline runs cleanly end-to-end with volume data threaded through
-        fit()/weights_for()/_bootstrap_futures()/_calibrate_size_scale(),
-        not just the returns-only path other tests exercise."""
-        rng = np.random.default_rng(3)
-        volumes = pd.DataFrame(
-            rng.integers(1_000_000, 50_000_000, closes.shape).astype(float),
-            index=closes.index, columns=closes.columns,
-        )
-        bt = WalkForwardBacktester(
-            closes,
-            WalkForwardConfig(train_window=252, test_window=21),
-            volumes=volumes,
-        )
-        strat = KronosStrategy(population=4, generations=1, top_k=2, n_futures=16)
-        res = bt.run(strat)
-        assert len(res.daily_returns) > 0
-        assert np.isfinite(res.sharpe)
-
 
 # ---------------------------------------------------------------------------
 # Data + reporting
@@ -287,12 +264,11 @@ class TestDataAndReport:
     def test_csv_roundtrip(self, closes, tmp_path):
         path = str(tmp_path / "closes.csv")
         save_history(closes, path)
-        loaded, volumes = load_history(
+        loaded = load_history(
             ["AAA", "BBB"], start="2020-01-01", csv_path=path
         )
         assert list(loaded.columns) == ["AAA", "BBB"]
         assert len(loaded) > 0
-        assert volumes is None   # CSV path never archives volume
 
     def test_csv_missing_tickers_raises(self, closes, tmp_path):
         path = str(tmp_path / "closes.csv")
