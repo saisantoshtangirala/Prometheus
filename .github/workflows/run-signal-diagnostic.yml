@@ -1,0 +1,68 @@
+name: Run Signal-Direction Diagnostic (read-only)
+
+# Runs kronos/backtest.py's diagnose_signal_direction() on Hetzner (which
+# has proven yfinance/internet access - this sandbox's own network doesn't
+# reach Yahoo Finance through its proxy) against real NSE history. Isolates
+# whether kronos's raw predicted DIRECTION correlates with the REALIZED
+# direction of the asset it's predicting - stripped of position sizing,
+# transaction costs, and cross-asset netting, which is what the backtest's
+# own Hit Rate column conflates. Does not touch the live kronos.service
+# process or its checkpoints/state at all - runs in a scratch directory and
+# only reads the repo checkout.
+#
+# Manual trigger only. CPU-only (no GPU needed for this).
+
+on:
+  workflow_dispatch:
+    inputs:
+      tickers:
+        description: "space-separated tickers (defaults to Kronos's live NSE universe)"
+        required: false
+        default: "RELIANCE.NS TCS.NS HDFCBANK.NS INFY.NS ICICIBANK.NS HINDUNILVR.NS ITC.NS SBIN.NS BHARTIARTL.NS KOTAKBANK.NS"
+        type: string
+      start:
+        description: "history start date (YYYY-MM-DD)"
+        required: false
+        default: "2015-01-01"
+        type: string
+      strategies:
+        description: "space-separated: kronos momentum buy_hold"
+        required: false
+        default: "kronos momentum"
+        type: string
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Load Hetzner deploy key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.HETZNER_SSH_KEY }}
+
+      - name: Trust Hetzner host key
+        run: ssh-keyscan -H "${{ secrets.HETZNER_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Run the diagnostic in a scratch checkout
+        run: |
+          ssh "${{ secrets.HETZNER_USER }}@${{ secrets.HETZNER_HOST }}" '
+            set -euo pipefail
+            SCRATCH=/tmp/kronos-signal-diag-${{ github.run_id }}
+            rm -rf "$SCRATCH"
+            git clone --branch claude/prometheus-causal-market-ol2pau --depth 1 \
+              /opt/prometheus "$SCRATCH"
+            cd "$SCRATCH"
+            source /opt/prometheus/.venv/bin/activate
+            python scripts/diagnose_signal_direction.py \
+              --tickers '"${{ github.event.inputs.tickers || 'RELIANCE.NS TCS.NS HDFCBANK.NS INFY.NS ICICIBANK.NS HINDUNILVR.NS ITC.NS SBIN.NS BHARTIARTL.NS KOTAKBANK.NS' }}"' \
+              --start '"${{ github.event.inputs.start || '2015-01-01' }}"' \
+              --strategies '"${{ github.event.inputs.strategies || 'kronos momentum' }}"'
+          '
+
+      - name: Clean up scratch checkout
+        if: always()
+        run: |
+          ssh "${{ secrets.HETZNER_USER }}@${{ secrets.HETZNER_HOST }}" '
+            rm -rf /tmp/kronos-signal-diag-${{ github.run_id }}
+          '
