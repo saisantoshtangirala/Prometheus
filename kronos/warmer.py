@@ -95,11 +95,14 @@ class KronosWarmer:
         Build the support set from the last `support_days` trading days.
 
         The master model maps flattened nightmare-shaped windows
-        [horizon * n_assets] -> next-bar returns [n_assets], so the support
-        set uses the same shape from REAL data: sliding windows of length
-        `horizon` predicting the following bar.
+        [(horizon - 1) * n_assets] -> next-bar returns [n_assets], so the
+        support set uses the same shape from REAL data: sliding windows of
+        length `horizon - 1` predicting the following bar. (AUDIT-1A: the
+        master model's input width is horizon-1, not horizon - see
+        kronos/evolver.py's KronosEvolver.__init__ for why - so this must
+        match or every nightly warm-up would fail with a shape mismatch.)
         """
-        horizon = self.cfg.nightmare.horizon_days
+        horizon = self.cfg.nightmare.horizon_days - 1
         support_days = self.cfg.adaptation.support_days
         window = memory.returns_window(horizon + support_days)
 

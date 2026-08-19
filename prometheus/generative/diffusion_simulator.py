@@ -304,7 +304,19 @@ class MarketDiffusionSimulator:
             "worst_drawdown": worst_drawdown,
             "sigma_threshold": sigma_threshold,
             "n_scenarios": n_scenarios,
-            "passes_fat_tail_check": kurtosis > -1.0 or coverage_pct >= min_tail_pct,
+            # AUDIT-2C: this used to be `kurtosis > -1.0 OR coverage_pct >=
+            # min_tail_pct`. kurtosis > -1.0 is true for almost any
+            # distribution, including a perfectly Gaussian one (kurtosis
+            # 0) - combined with OR, the check could never actually fail
+            # even for a generator producing too-narrow, non-fat-tailed
+            # output (it would report passes=True with coverage_pct=0, as
+            # long as kurtosis alone cleared the near-universal floor).
+            # This was the guardrail that should have caught the
+            # untrained-ScoreNetwork bug (see train_step()'s call sites -
+            # or previous lack thereof) and didn't. Fixed to AND with a
+            # real fat-tail threshold (kurtosis > 0 = genuinely fatter
+            # than Gaussian, not just "not extremely platykurtic").
+            "passes_fat_tail_check": kurtosis > 0.0 and coverage_pct >= min_tail_pct,
         }
 
     def save(self, path: str) -> None:

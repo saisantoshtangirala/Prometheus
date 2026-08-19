@@ -123,6 +123,12 @@ class KronosOrchestrator:
         self._last_heartbeat: Optional[datetime] = None
         self._pending_veto: Optional[Dict] = None
         self._phase_runs: Set[Tuple[str, str]] = set()
+        # AUDIT-2B: today's first-seen price per ticker, used by
+        # run_reflex_tick() to compute a live intraday return-so-far each
+        # tick without mutating self.state.memory (a frozen DailyMemory -
+        # see run_reflex_tick()'s docstring note for why). Reset once per
+        # day in run_digestion().
+        self._day_open_prices: Dict[str, float] = {}
         self._evolution_progress: Dict = {}   # generation-level resume state
         self._completed_today: Set[str] = set()
         self.skip_trading: bool = False       # set on stale/unavailable data
@@ -232,6 +238,7 @@ class KronosOrchestrator:
 
     def run_digestion(self, filings: Optional[Dict[str, str]] = None) -> Optional[DailyMemory]:
         self.skip_trading = False
+        self._day_open_prices = {}   # AUDIT-2B: fresh intraday reference each day
         memory = self._run_phase("digestion", self.pipeline.run_sync, filings)
         self.state.memory = memory
         if memory is None:
@@ -345,7 +352,20 @@ class KronosOrchestrator:
         bar_volumes: Optional[Dict[str, float]] = None,
         now: Optional[datetime] = None,
     ):
-        """One market-hours tick: infer, gate, trade."""
+        """One market-hours tick: infer, gate, trade.
+
+        AUDIT-2B: recent_returns fed to reflex.infer() used to come purely
+        from self.state.memory - a frozen DailyMemory snapshotted once
+        before market open by run_digestion() and never reassigned for
+        the rest of the trading session. Every ~60s tick of the ~375-tick
+        NSE session was therefore feeding the SNN an identical, stale
+        window all day - it could never see or react to intraday price
+        movement, despite running a fresh inference every tick. Fixed via
+        _recent_returns_with_intraday(): holds out memory's most recent
+        historical bar and replaces it with a live return-so-far row
+        (today's bar_prices vs. the first bar_prices seen today), without
+        mutating the frozen DailyMemory itself.
+        """
         if self.state.memory is None:
             return None
         if self.skip_trading:
@@ -356,9 +376,7 @@ class KronosOrchestrator:
             # against last tick's stale prices would let this tick's real
             # move go unnoticed until the tick after.
             self.trader.last_prices.update(bar_prices)
-        recent = self.state.memory.returns_window(
-            self.cfg.nightmare.horizon_days
-        )
+        recent = self._recent_returns_with_intraday(bar_prices)
         decision = self.reflex.infer(
             recent, vix_value, bar_prices, bar_volumes, now=now
         )
@@ -392,6 +410,44 @@ class KronosOrchestrator:
                     position_cap=asset_cap,
                 )
         return decision
+
+    def _recent_returns_with_intraday(
+        self, bar_prices: Optional[Dict[str, float]]
+    ) -> np.ndarray:
+        """Build the horizon-bar window fed to reflex.infer(): the last
+        (horizon - 1) historical daily bars from self.state.memory, plus a
+        final row of today's live return-so-far per ticker - so the
+        window actually changes tick to tick instead of being identical
+        all day (AUDIT-2B). `self._day_open_prices` (reset once per day in
+        run_digestion()) is this session's own reference price per ticker,
+        first captured on that ticker's first tick of the day - that
+        tick's own live row is 0.0 (no intraday move yet), exactly as a
+        return-since-open should read.
+
+        Falls back to the pure-historical window (previous behavior) when
+        bar_prices isn't available - e.g. tests or simulations that call
+        run_reflex_tick() without live ticks - or when horizon_days is too
+        small to hold out a bar at all.
+        """
+        horizon = self.cfg.nightmare.horizon_days
+        if not bar_prices or horizon < 2:
+            return self.state.memory.returns_window(horizon)
+
+        tickers = self.state.memory.tickers
+        live_row = np.zeros(len(tickers), dtype=np.float32)
+        for i, ticker in enumerate(tickers):
+            price = bar_prices.get(ticker)
+            if price is None:
+                continue
+            open_price = self._day_open_prices.get(ticker)
+            if open_price is None:
+                self._day_open_prices[ticker] = price
+                continue   # first tick of the day: no return-so-far yet
+            if open_price:
+                live_row[i] = (price / open_price) - 1.0
+
+        hist = self.state.memory.returns_window(horizon - 1)
+        return np.vstack([hist, live_row[np.newaxis, :]]).astype(np.float32)
 
     def _enforce_risk(self) -> bool:
         """Check the independent risk layer. On any breach - or if already
@@ -956,7 +1012,9 @@ class KronosOrchestrator:
         if self.master_model is None or self.state.memory is None:
             return None
         try:
-            horizon = self.cfg.nightmare.horizon_days
+            # AUDIT-1A: master_model's input width is (horizon - 1) bars,
+            # not horizon - see kronos/evolver.py's KronosEvolver.__init__.
+            horizon = self.cfg.nightmare.horizon_days - 1
             window = self.state.memory.returns_window(horizon)
             x = torch.tensor(window.reshape(1, -1), dtype=torch.float32)
             with torch.no_grad():

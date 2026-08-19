@@ -21,6 +21,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.func import functional_call
 from torch.optim import Adam
 
 logger = logging.getLogger(__name__)
@@ -162,11 +163,20 @@ class MAMLMetaLearner:
         params: Dict[str, torch.Tensor],
         loss_fn: Callable,
     ) -> torch.Tensor:
-        """Run model forward pass with custom parameter dict."""
-        # Use functional API to apply custom params
-        # This requires the model to support functional forward
-        # Fallback: use standard forward and treat params as a detached copy
-        pred = self.model(X)
+        """Run the model's forward pass with the given (adapted) parameter
+        dict substituted for its live registered weights, via
+        torch.func.functional_call - so the returned loss's autograd graph
+        actually traces back to `params`, not to self.model's own
+        nn.Parameters. This is load-bearing for MAML: adapt()/
+        meta_train_step() build `params` as clones and then take
+        torch.autograd.grad(loss, params.values(), ...) - if the forward
+        pass here used self.model(X) directly (as it did previously),
+        those clones would never enter the graph that produced `loss`,
+        every one of those grads would come back None (allow_unused=True),
+        get zero-filled, and the entire K-step inner-loop adaptation would
+        be a mathematical no-op (adapted params == pre-adaptation clones,
+        every step)."""
+        pred = functional_call(self.model, params, (X,))
         if isinstance(pred, dict):
             pred = pred.get("predictions", pred.get("output", list(pred.values())[0]))
         if pred.shape != y.shape and pred.numel() == y.numel():

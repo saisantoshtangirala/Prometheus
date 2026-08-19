@@ -365,21 +365,126 @@ class PrometheusEngine:
             "n_wrong_direction": loss_detail["n_wrong_direction"],
         }
 
+    def _pretrain_score_net(
+        self, real_returns: Optional[np.ndarray], n_steps: int,
+    ) -> None:
+        """
+        AUDIT-2C: self.diffusion's ScoreNetwork is randomly initialized,
+        and was never fit to anything before this fix -
+        MarketDiffusionSimulator.train_step() (a fully functional DDPM
+        training step) existed but was never called anywhere in the
+        codebase. generate_doomsday_library() (called right after this)
+        produces the entire black-swan pretraining corpus by running
+        reverse diffusion through that untrained network - conditioned on
+        real microstructure stats, but with no learned relationship to
+        real return distributions, despite the module's docstring
+        claiming realistic volatility clustering, jumps, and correlation.
+        Fits the score network on real historical windows first, so what
+        pretrain actually trains self.snn/self.causal_transformer on has
+        a genuine (if imperfect) relationship to real market statistics,
+        rather than being structured noise the model must later unlearn
+        during finetune.
+
+        Best-effort: if no real_returns are given and none can be
+        fetched, proceeds with an untrained score network exactly as
+        before - but now logs CRITICAL rather than staying silent,
+        matching this codebase's existing fail-loud convention elsewhere
+        (kronos/nightmare_generator.py's NIG-03, kronos/bias_estimator.py's
+        fail-closed contract).
+        """
+        if real_returns is None:
+            try:
+                fetcher = MarketDataFetcher()
+                raw = fetcher.fetch_all()
+                if raw.empty:
+                    raise ValueError("no data returned")
+                real_returns = fetcher.get_returns(raw).fillna(0.0).values
+            except Exception as e:
+                logger.critical(
+                    "[black_swan_pretrain] could not obtain real returns "
+                    "to fit the diffusion ScoreNetwork (%s) - proceeding "
+                    "with an UNTRAINED score network. The black-swan "
+                    "scenario library about to be generated will be "
+                    "structured noise, not realistic market data - "
+                    "pretraining on it may be actively counterproductive "
+                    "rather than merely unhelpful.", e,
+                )
+                return
+
+        seq_len = self.diffusion.seq_len
+        n_assets = self.diffusion.n_assets
+        T = real_returns.shape[0]
+        if T < seq_len:
+            logger.critical(
+                "[black_swan_pretrain] only %d bars of real data "
+                "available, need >= %d (config.seq_len) to fit the "
+                "diffusion ScoreNetwork - proceeding with an UNTRAINED "
+                "score network.", T, seq_len,
+            )
+            return
+
+        if real_returns.shape[1] < n_assets:
+            pad = np.zeros((T, n_assets - real_returns.shape[1]))
+            real_returns = np.concatenate([real_returns, pad], axis=1)
+        else:
+            real_returns = real_returns[:, :n_assets]
+
+        rng = np.random.default_rng(42)
+        batch_size = min(16, max(1, T - seq_len + 1))
+        losses = []
+        for _ in range(n_steps):
+            starts = rng.integers(0, T - seq_len + 1, size=batch_size)
+            batch = np.stack([real_returns[s:s + seq_len] for s in starts])
+            x_0 = torch.tensor(batch, dtype=torch.float32, device=self.device)
+            condition = torch.cat([
+                self.diffusion.compute_condition(batch[i])
+                for i in range(batch_size)
+            ], dim=0)
+            losses.append(self.diffusion.train_step(x_0, condition))
+
+        logger.info(
+            "[black_swan_pretrain] fit diffusion ScoreNetwork on real "
+            "data: %d steps, loss %.4f -> %.4f",
+            n_steps, losses[0], losses[-1],
+        )
+        tail_check = self.diffusion.validate_tail_coverage()
+        if not tail_check["passes_fat_tail_check"]:
+            logger.warning(
+                "[black_swan_pretrain] fitted ScoreNetwork still fails "
+                "the fat-tail check (kurtosis=%.2f, coverage_pct=%.2f%%) "
+                "- generated scenarios may be too narrow to be useful "
+                "for black-swan pretraining.",
+                tail_check["kurtosis"], tail_check["coverage_pct"],
+            )
+
     def train_on_black_swans(
         self,
         n_scenarios: int = 2000,
         n_epochs: int = 10,
         batch_size: int = 32,
         on_epoch_end: Optional[callable] = None,
+        real_returns: Optional[np.ndarray] = None,
+        score_net_train_steps: int = 200,
     ) -> List[Dict]:
         """
         Train the model on synthetic black-swan scenarios.
         This is the core of the 'synthetic chaos pre-training' approach.
+
+        real_returns: optional [T, n_assets] array of real historical
+        returns (T >= self.config.seq_len) used to fit self.diffusion's
+        ScoreNetwork (AUDIT-2C) before it generates the scenario library.
+        If omitted, a best-effort fetch via MarketDataFetcher is
+        attempted; if that also fails (e.g. no network), scenario
+        generation proceeds with an untrained score network exactly as
+        before, but now loudly logged rather than silent - see
+        _pretrain_score_net()'s docstring for why an untrained network
+        was a real, previously-undiagnosed bug.
         """
         logger.info("Pre-training on %d black-swan scenarios...", n_scenarios)
 
         # Generate or load scenarios
         if not self.scenario_library.scenarios:
+            self._pretrain_score_net(real_returns, score_net_train_steps)
             logger.info("Generating black-swan library (this may take a while)...")
             scenarios = self.black_swan_gen.generate_doomsday_library(
                 n_per_template=200,

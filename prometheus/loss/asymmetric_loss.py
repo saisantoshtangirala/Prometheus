@@ -34,6 +34,10 @@ class AsymmetricUtilityLoss(nn.Module):
         confidence:  model's self-assessed confidence [0,1] — scales penalty
     """
 
+    # AUDIT-3B: overestimate calibration floor as a fraction of alpha - see
+    # forward()'s calibration comment.
+    OVERESTIMATE_PENALTY_FRAC = 0.01
+
     def __init__(
         self,
         alpha: float = 0.5,     # penalty for conservative errors
@@ -77,11 +81,28 @@ class AsymmetricUtilityLoss(nn.Module):
         # Case 1 & 2: correct direction
         # If pred is more conservative (abs(pred) < abs(target)): mild loss
         underestimated = (torch.abs(pred) < torch.abs(target)).float() * same_sign
-        # Tiny calibration floor for correct-direction overestimates prevents the
-        # model from collapsing to always-zero predictions (which would be "safe"
-        # under pure zero-loss design).  1e-4 is ~200x below alpha so it never
-        # dominates; it only ensures a nonzero gradient survives to the optimiser.
-        calibration = 1e-4 * same_sign * mag_error
+        # Calibration floor for correct-direction overestimates prevents the
+        # model from collapsing to always-zero predictions (which would be
+        # "safe" under pure zero-loss design), while staying well below the
+        # underestimate penalty so the intentional asymmetry (underestimating
+        # a real edge costs more than overestimating) is preserved.
+        #
+        # AUDIT-3B: this used to be a bare constant (1e-4), disconnected
+        # from alpha - as alpha grows or is learned upward (log_alpha is a
+        # trainable nn.Parameter), the ratio to the real underestimate
+        # penalty (alpha * mag_error) shrinks further, making an
+        # overestimate ~5000x cheaper than an equal-magnitude underestimate
+        # at alpha's default of 0.5. That gradient asymmetry gives training
+        # a systematic incentive toward large, aggressive-magnitude
+        # predictions whenever it believes it has any directional edge,
+        # independent of real calibration quality. Scaling the floor by
+        # alpha itself keeps the ratio fixed (here 1%) regardless of how
+        # alpha moves, instead of decaying toward pure recklessness as
+        # alpha grows - tests/unit/test_loss_kelly.py's existing
+        # test_calibration_gradient_much_smaller_than_underestimate_gradient
+        # asserts this ratio stays under 1%; OVERESTIMATE_PENALTY_FRAC sits
+        # right at that tested boundary rather than ~200x below it.
+        calibration = self.OVERESTIMATE_PENALTY_FRAC * alpha * same_sign * mag_error
         correct_dir_loss = alpha * underestimated * mag_error + calibration
 
         # Case 3: wrong direction — exponentially penalized

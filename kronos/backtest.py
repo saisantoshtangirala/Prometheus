@@ -180,10 +180,10 @@ class KronosStrategy(Strategy):
 
     # -- internal: nightmare bootstrap (block resample of train returns) ----
 
-    def _bootstrap_futures(self, train: np.ndarray) -> torch.Tensor:
-        """Contiguous block-bootstrap: each future is a real horizon-length
+    def _bootstrap_futures(self, train: np.ndarray, length: Optional[int] = None) -> torch.Tensor:
+        """Contiguous block-bootstrap: each future is a real `length`-bar
         run of consecutive historical days (from a random start point), not
-        `horizon` independently-resampled days. The old per-bar independent
+        `length` independently-resampled days. The old per-bar independent
         resampling destroyed all real temporal structure - verified
         directly on a synthetic AR(1) series with a real lag-1 autocorr of
         0.293: the old approach's resampled futures had pooled lag-1
@@ -191,14 +191,21 @@ class KronosStrategy(Strategy):
         the NEAT population against futures with no genuine autocorrelation,
         momentum, or vol-clustering meant it could only ever be fit against
         noise, regardless of whether the underlying market has real
-        structure to learn."""
+        structure to learn.
+
+        `length` defaults to self.horizon (the model's own input window
+        size). fit() calls this with length=horizon+1 specifically for the
+        NEAT fitness evaluation, so it can carve off one genuinely-future
+        bar as the target without that bar ever appearing inside the
+        model's input window - see the AUDIT-1A note in fit() for why."""
         rng = np.random.default_rng(self.seed)
+        length = length if length is not None else self.horizon
         T = train.shape[0]
-        if T <= self.horizon:
+        if T <= length:
             starts = np.zeros(self.n_futures, dtype=int)
         else:
-            starts = rng.integers(0, T - self.horizon, size=self.n_futures)
-        idx = starts[:, None] + np.arange(self.horizon)[None, :]   # [N, horizon] contiguous
+            starts = rng.integers(0, T - length, size=self.n_futures)
+        idx = starts[:, None] + np.arange(length)[None, :]   # [N, length] contiguous
         futures = torch.tensor(train[idx], dtype=torch.float32)
         jitter = torch.randn_like(futures) * float(train.std()) * 0.1
         return futures + jitter
@@ -218,10 +225,24 @@ class KronosStrategy(Strategy):
         self._n_assets = train_returns.shape[1]
         input_dim = self._n_assets * self.horizon
 
-        # 1. Nightmare: bootstrap futures from the train window only
-        futures = self._bootstrap_futures(train_returns)     # [N, H, A]
-        X_val = futures.reshape(futures.shape[0], -1)
-        y_val = futures[:, -1, :]
+        # 1. Nightmare: bootstrap futures from the train window only.
+        #
+        # AUDIT-1A (fitness-leakage fix): a future needs to be `horizon`
+        # bars long to match the model's own input window (weights_for(),
+        # _calibrate_size_scale() and the MAML warm-up below all feed it
+        # exactly self.horizon bars), but the fitness target must be a bar
+        # the model never sees. The old code took a `horizon`-bar future,
+        # used ALL of it (flattened) as X, and reused ITS OWN LAST BAR as
+        # y - so y was already sitting inside X, and a genome could score
+        # well by learning to copy input[-n_assets:] to output, with zero
+        # relationship to whether it predicts anything about market
+        # dynamics. Fixed by bootstrapping one bar longer than the model's
+        # window (horizon+1) and using the extra bar - which never enters
+        # X - as the target. input_dim (and every other consumer of this
+        # class's `self.model`) is unchanged.
+        futures = self._bootstrap_futures(train_returns, length=self.horizon + 1)  # [N, H+1, A]
+        X_val = futures[:, :self.horizon, :].reshape(futures.shape[0], -1)
+        y_val = futures[:, self.horizon, :]
 
         # 2. Evolution: tiny NEAT against the futures
         evolver = NEATArchitectureEvolver(

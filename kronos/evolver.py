@@ -96,7 +96,15 @@ class KronosEvolver:
         self.cfg = config
         n_assets = len(config.data.tickers)
         horizon = config.nightmare.horizon_days
-        self.input_dim = n_assets * horizon
+        # AUDIT-1A: input_dim is (horizon - 1) bars, not horizon, so that
+        # _nightmare_val_data() below can hold out the buffer's own last
+        # bar as a genuinely-unseen fitness target instead of leaking it
+        # into the model's own input (see that method's docstring). Every
+        # other consumer of a decoded master_model - kronos/warmer.py's
+        # KronosWarmer.support_set() and this orchestrator's
+        # _master_signals() - feeds (horizon - 1)-bar windows to match.
+        self.horizon = horizon
+        self.input_dim = n_assets * (horizon - 1)
         self.output_dim = n_assets
 
     def _make_evolver(self, degraded: bool) -> NEATArchitectureEvolver:
@@ -121,15 +129,30 @@ class KronosEvolver:
         """
         Convert the NightmareBuffer into (X, y) validation tensors.
 
-        X: flattened future path per scenario  [N, horizon * n_assets]
-        y: next-step returns (last bar)        [N, n_assets]
+        X: flattened future path, bars [0, T-2)   [N, (horizon-1) * n_assets]
+        y: next-step returns, the LAST bar        [N, n_assets]
+
+        AUDIT-1A (fitness-leakage fix): the buffer's futures are exactly
+        `horizon` bars long (kronos/nightmare_generator.py, keyed to
+        config.nightmare.horizon_days) - there is no bar beyond the buffer
+        to use as a genuinely-held-out target. The old code used ALL
+        `horizon` bars (flattened) as X and then reused X's own last bar
+        as y, so a genome could score well purely by learning to copy
+        input[-n_assets:] to output - zero relationship to whether it
+        predicts anything about the adversarial scenario's dynamics. Fixed
+        by holding out the last bar from X entirely: X only ever sees bars
+        [0, T-2), y is bar T-1. self.input_dim is sized to match
+        ((horizon-1)*n_assets, see __init__) and every consumer of the
+        resulting master_model (KronosWarmer.support_set(),
+        orchestrator._master_signals()) feeds it (horizon-1)-bar windows
+        for the same reason.
 
         A variant scores well only if its directional calls survive the
         adversarial futures - exactly the gauntlet Kronos wants.
         """
-        futures = buffer.futures                         # [N, T, A]
-        X = futures.reshape(futures.shape[0], -1)
-        y = futures[:, -1, :]                            # final-bar returns
+        futures = buffer.futures                         # [N, T, A]  T == horizon
+        X = futures[:, :-1, :].reshape(futures.shape[0], -1)
+        y = futures[:, -1, :]                             # final-bar returns, never in X
         return X.float(), y.float()
 
     # -- main entry ---------------------------------------------------------
