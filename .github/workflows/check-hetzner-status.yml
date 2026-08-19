@@ -64,4 +64,15 @@ jobs:
             echo
             echo "=== largest contributors under /opt/prometheus and /var/log ==="
             du -sh /opt/prometheus/logs/* /var/log/kronos-service.log 2>&1 | sort -rh
+
+            echo
+            echo "=== periodic jobs that could interfere with logs/trades.db (diagnosing the ~61-min-interval sqlite crash - disk is NOT full, 7% used) ==="
+            echo "--- systemd timers ---"
+            systemctl list-timers --all --no-pager 2>&1
+            echo "--- root crontab ---"
+            crontab -l 2>&1
+            echo "--- /etc/cron.* ---"
+            ls -la /etc/cron.d /etc/cron.hourly 2>&1
+            echo "--- logrotate rules mentioning prometheus/kronos/trades ---"
+            grep -rl "prometheus\|kronos\|trades" /etc/logrotate.d/ 2>&1 || echo "(none found)"
           '
