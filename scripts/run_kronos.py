@@ -192,10 +192,35 @@ def catch_up(orchestrator, executed_today: set, day: int, now=None) -> None:
             orchestrator.run_report()
 
 
+def _resume_day(orchestrator) -> int:
+    """The campaign's real day count, not always 1 - a service restart
+    (every deploy-hetzner.yml redeploy restarts kronos.service) must not
+    silently reset a multi-month paper-trading campaign back to day 1.
+
+    daily_performance rows are only ever written by close_day(), which
+    only runs once a day reaches the LOGGING phase - so MAX(day) is
+    exactly "the last fully-closed day," and the next day (closed or
+    still in progress) is always exactly one past it. No date comparison
+    needed: if today's day hasn't closed yet, MAX(day) is one less than
+    today's in-progress day either way."""
+    try:
+        row = orchestrator.trader._conn.execute(
+            "SELECT MAX(day) FROM daily_performance"
+        ).fetchone()
+    except Exception as e:
+        logger.warning("[main] could not read prior day count (%s) - starting at day 1", e)
+        return 1
+    max_day = row[0] if row else None
+    return int(max_day) + 1 if max_day is not None else 1
+
+
 def run_realtime(orchestrator, n_days: int):
     """Wall-clock loop: execute each phase when its window opens."""
     executed_today = set()
-    day = 1
+    day = _resume_day(orchestrator)
+    if day > 1:
+        logger.info("[main] resuming campaign at day %d (prior days found in %s)",
+                    day, orchestrator.trader.db_path)
     current_date = _exchange_now(orchestrator).date()
     orchestrator.state.day = day
     reflex_ticks = 0

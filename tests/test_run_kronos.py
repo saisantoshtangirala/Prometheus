@@ -449,6 +449,77 @@ class TestReflexTickLogging:
         )
 
 
+class TestResumeDayCount:
+    """Regression: run_realtime() used to hardcode day = 1 on every
+    process start, with no attempt to recover how far a prior run had
+    gotten. Since deploy-hetzner.yml restarts kronos.service on every
+    push, this silently reset the entire paper-trading campaign back to
+    day 1 with a fresh account on every single deploy - the campaign
+    could never accumulate more than the time between two deploys.
+    trades.db itself survives restarts on disk (only git-tracked files
+    are touched by `git reset --hard`); this is about actually reading
+    it back at startup instead of ignoring it."""
+
+    def test_resume_day_starts_at_1_with_no_prior_history(self, config):
+        orch = KronosOrchestrator(config)
+        assert run_kronos._resume_day(orch) == 1
+
+    def test_resume_day_continues_after_a_closed_day(self, config):
+        orch = KronosOrchestrator(config)
+        orch.trader.close_day(1, {t: 100.0 for t in config.data.tickers})
+        assert run_kronos._resume_day(orch) == 2
+
+    def test_resume_day_continues_after_several_closed_days(self, config):
+        orch = KronosOrchestrator(config)
+        for day in (1, 2, 3):
+            orch.trader.close_day(day, {t: 100.0 for t in config.data.tickers})
+        assert run_kronos._resume_day(orch) == 4
+
+    def test_resume_day_survives_a_simulated_process_restart(self, config):
+        """The actual regression scenario: one orchestrator/trader closes
+        a day and shuts down (simulating a deploy killing the process);
+        a SECOND, freshly-constructed orchestrator pointed at the same
+        db_path (simulating the next process start) must pick up where
+        it left off, not reset to day 1."""
+        first = KronosOrchestrator(config)
+        first.trader.close_day(1, {t: 100.0 for t in config.data.tickers})
+        first.trader.close()
+
+        second = KronosOrchestrator(config)
+        assert run_kronos._resume_day(second) == 2
+
+    def test_run_realtime_starts_at_the_resumed_day_not_hardcoded_1(self, config):
+        """End-to-end: run_realtime() itself (not just _resume_day() in
+        isolation) must actually use the resumed day count."""
+        from datetime import datetime
+        from unittest.mock import patch as _patch
+        from zoneinfo import ZoneInfo
+
+        orch = KronosOrchestrator(config)
+        orch.trader.close_day(1, {t: 100.0 for t in config.data.tickers})
+        memory = make_memory(config)
+        et_tz = ZoneInfo("America/New_York")
+        during_market_hours = datetime(2026, 3, 2, 10, 0, tzinfo=et_tz)
+
+        def fake_sleep(seconds):
+            run_kronos._shutdown = True
+
+        with _patch("run_kronos._exchange_now", return_value=during_market_hours), \
+             _patch.object(orch, "phase_for", return_value=Phase.REFLEX), \
+             _patch.object(orch.pipeline, "run_sync", return_value=memory), \
+             _patch("run_kronos.fetch_live_bar", return_value=({}, {})), \
+             _patch("run_kronos.time.sleep", side_effect=fake_sleep):
+            try:
+                run_kronos.run_realtime(orch, n_days=365)
+            finally:
+                run_kronos._shutdown = False
+
+        assert orch.state.day == 2, (
+            "a restart after day 1 already closed must resume at day 2, "
+            "not silently restart the whole campaign at day 1"
+        )
+
+
 class TestLoggingSetup:
     def test_log_directory_created_before_file_handler(self, tmp_path, monkeypatch):
         """Regression: logging.FileHandler("logs/kronos.log") used to run

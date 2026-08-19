@@ -359,6 +359,102 @@ class TestPaperTraderSlippage:
         trader.close()
 
 
+class TestPaperTraderResume:
+    """A fresh PaperTrader(config) pointed at the same db_path as a prior
+    one must pick up where that prior one left off - not silently start a
+    new initial_capital account. This is what makes a multi-month paper
+    campaign survive a service restart (every deploy restarts the
+    process) instead of resetting to day 1 every time."""
+
+    def test_fresh_db_starts_clean(self, config):
+        """No prior history - a fresh account is the CORRECT behavior,
+        not a bug. Confirms resume_from_db() doesn't invent state."""
+        trader = PaperTrader(config)
+        assert trader.cash == config.trading.initial_capital
+        assert trader.positions == {}
+        assert trader._equity_history == [config.trading.initial_capital]
+        trader.close()
+
+    def test_cash_and_positions_survive_a_restart(self, config):
+        first = PaperTrader(config)
+        first.execute(day=1, ticker="AAA", target_weight=0.20,
+                     price=100.0, bar_volume=50_000_000)
+        first.execute(day=1, ticker="BBB", target_weight=0.10,
+                     price=50.0, bar_volume=50_000_000)
+        cash_before = first.cash
+        positions_before = dict(first.positions)
+        first.close()
+
+        second = PaperTrader(config)   # simulates a process restart
+        assert second.cash == pytest.approx(cash_before)
+        assert second.positions == pytest.approx(positions_before)
+        second.close()
+
+    def test_equity_history_survives_a_restart(self, config):
+        first = PaperTrader(config)
+        first.execute(day=1, ticker="AAA", target_weight=0.10,
+                     price=100.0, bar_volume=50_000_000)
+        first.close_day(1, {"AAA": 105.0})
+        first.close_day(2, {"AAA": 103.0})
+        first.close()
+
+        second = PaperTrader(config)
+        # one entry per closed day persisted to daily_performance - no
+        # synthetic leading initial_capital marker, since the persisted
+        # rows already fully capture the real equity progression.
+        assert len(second._equity_history) == 2
+        second.close()
+
+    def test_written_off_position_not_revived_on_resume(self, config):
+        first = PaperTrader(config)
+        first.execute(day=1, ticker="AAA", target_weight=0.20,
+                     price=100.0, bar_volume=50_000_000)
+        first.write_off(day=1, ticker="AAA", price=0.0005)
+        first.close()
+
+        second = PaperTrader(config)
+        assert "AAA" not in second.positions
+        second.close()
+
+    def test_second_position_untouched_by_first_ticker_trading_after(self, config):
+        """positions must be reconstructed PER TICKER from that ticker's
+        own most recent trade, not just the single globally-latest trade
+        row - otherwise a ticker traded earlier (but not most recently)
+        would incorrectly disappear on resume."""
+        first = PaperTrader(config)
+        first.execute(day=1, ticker="AAA", target_weight=0.20,
+                     price=100.0, bar_volume=50_000_000)
+        first.execute(day=1, ticker="BBB", target_weight=0.10,
+                     price=50.0, bar_volume=50_000_000)
+        # AAA trades again - the most recent row overall is now AAA's
+        first.execute(day=1, ticker="AAA", target_weight=0.15,
+                     price=101.0, bar_volume=50_000_000)
+        aaa_before = first.positions["AAA"]
+        bbb_before = first.positions["BBB"]
+        first.close()
+
+        second = PaperTrader(config)
+        assert second.positions["AAA"] == pytest.approx(aaa_before)
+        assert second.positions["BBB"] == pytest.approx(bbb_before)
+        second.close()
+
+    def test_old_schema_db_without_cash_after_falls_back_to_fresh(self, config):
+        """A trades.db that predates this fix has trades but no cash_after
+        values (NULL after migration) - must fall back to a fresh account
+        rather than crash or guess a wrong cash figure."""
+        first = PaperTrader(config)
+        first.execute(day=1, ticker="AAA", target_weight=0.20,
+                     price=100.0, bar_volume=50_000_000)
+        with first._db_lock:
+            first._conn.execute("UPDATE trades SET cash_after = NULL")
+            first._conn.commit()
+        first.close()
+
+        second = PaperTrader(config)
+        assert second.cash == config.trading.initial_capital
+        second.close()
+
+
 # ---------------------------------------------------------------------------
 # 7. End-to-end 24h simulation
 # ---------------------------------------------------------------------------

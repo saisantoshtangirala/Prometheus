@@ -36,7 +36,8 @@ CREATE TABLE IF NOT EXISTS trades (
     fill_price REAL NOT NULL,
     slippage_pct REAL NOT NULL,
     notional REAL NOT NULL,
-    position_after REAL NOT NULL
+    position_after REAL NOT NULL,
+    cash_after REAL
 );
 CREATE TABLE IF NOT EXISTS daily_performance (
     day INTEGER PRIMARY KEY,
@@ -96,7 +97,80 @@ class PaperTrader:
         self._db_lock = threading.Lock()
         with self._db_lock:
             self._conn.executescript(SCHEMA)
+            self._migrate_add_cash_after()
             self._conn.commit()
+
+        # Restore cash/positions/equity history from any prior campaign
+        # already in this DB, instead of always starting a fresh
+        # initial_capital account - see resume_from_db()'s docstring for
+        # why this matters (every service restart, including every
+        # deploy, used to silently reset the whole paper-trading campaign
+        # to day 1 with a brand-new account, discarding all prior history
+        # even though trades.db itself survives restarts on disk).
+        self.resume_from_db()
+
+    def _migrate_add_cash_after(self) -> None:
+        """trades.db files created before cash_after existed need the
+        column added in place - CREATE TABLE IF NOT EXISTS is a no-op
+        against an existing table with an older schema, it does not add
+        missing columns. Safe to call every startup: checks first."""
+        cols = [row[1] for row in self._conn.execute("PRAGMA table_info(trades)")]
+        if "cash_after" not in cols:
+            self._conn.execute("ALTER TABLE trades ADD COLUMN cash_after REAL")
+
+    def resume_from_db(self) -> None:
+        """
+        Reconstruct cash/positions/equity history from this DB's existing
+        trades/daily_performance rows, if any - otherwise leaves the
+        fresh-account defaults __init__ already set untouched.
+
+        cash: the cash_after of the single most recently recorded trade
+        (by id) across all tickers - the ground truth for "how much cash
+        do I actually have right now." Rows written before cash_after
+        existed have it as NULL; if the most recent trade predates the
+        migration, cash cannot be reconstructed and this falls back to a
+        fresh account rather than guessing.
+
+        positions: per ticker, the position_after of THAT ticker's own
+        most recent trade (not the single most recent trade overall -
+        a ticker untouched by the latest trade can still hold a real
+        position from an earlier one). write_off() also writes a
+        position_after=0 trade-like row precisely so a written-off
+        position is never incorrectly revived here.
+
+        equity history: daily_performance.equity in day order - keeps
+        close_day()'s rolling Sharpe reflecting the whole campaign, not
+        just whatever ran since the last restart.
+        """
+        last_cash_row = self._conn.execute(
+            "SELECT cash_after FROM trades ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if last_cash_row is None or last_cash_row[0] is None:
+            return   # no trades yet, or they predate cash_after - stay fresh
+
+        self.cash = float(last_cash_row[0])
+        rows = self._conn.execute(
+            """
+            SELECT ticker, position_after FROM trades t1
+            WHERE id = (
+                SELECT MAX(id) FROM trades t2 WHERE t2.ticker = t1.ticker
+            )
+            """
+        ).fetchall()
+        self.positions = {
+            ticker: float(shares) for ticker, shares in rows if shares != 0.0
+        }
+
+        equity_rows = self._conn.execute(
+            "SELECT equity FROM daily_performance ORDER BY day ASC"
+        ).fetchall()
+        if equity_rows:
+            self._equity_history = [float(r[0]) for r in equity_rows]
+
+        logger.info(
+            "[trader] resumed from %s: cash=%.2f positions=%d equity_history=%d days",
+            self.db_path, self.cash, len(self.positions), len(self._equity_history),
+        )
 
     # -- slippage -----------------------------------------------------------
 
@@ -225,6 +299,16 @@ class PaperTrader:
         self.audit(day, "write-off",
                    f"{ticker}: {shares:.4f} shares written off at "
                    f"price={price:.6f}, est. loss ${loss:.2f}")
+        # Record a position_after=0 trade-like row - resume_from_db() reads
+        # each ticker's own most recent trade row to reconstruct positions
+        # on restart; without this, a written-off position (cash unaffected,
+        # since the loss is a mark-to-market wipeout, not a sale) would
+        # look untouched since its last real trade and get incorrectly
+        # revived as if it still existed.
+        self._record_trade(day, Fill(
+            ticker=ticker, side="writeoff", quantity=shares,
+            signal_price=price, fill_price=0.0, slippage_pct=0.0, notional=0.0,
+        ))
 
     # -- daily bookkeeping --------------------------------------------------
 
@@ -295,11 +379,11 @@ class PaperTrader:
         with self._db_lock:
             self._conn.execute(
                 "INSERT INTO trades (ts, day, ticker, side, quantity, signal_price,"
-                " fill_price, slippage_pct, notional, position_after)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                " fill_price, slippage_pct, notional, position_after, cash_after)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (datetime.now(timezone.utc).isoformat(), day, fill.ticker, fill.side,
                  fill.quantity, fill.signal_price, fill.fill_price, fill.slippage_pct,
-                 fill.notional, self.positions.get(fill.ticker, 0.0)),
+                 fill.notional, self.positions.get(fill.ticker, 0.0), self.cash),
             )
             self._conn.commit()
 
