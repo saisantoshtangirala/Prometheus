@@ -49,24 +49,31 @@ jobs:
         run: |
           ssh "${{ secrets.HETZNER_USER }}@${{ secrets.HETZNER_HOST }}" '
             set -euo pipefail
-            rm -rf /tmp/kronos-backtest
+            # Unique per-run scratch dir (github.run_id), not a fixed path -
+            # a fixed /tmp/kronos-backtest let two concurrently-triggered
+            # runs race on the same rm -rf/clone/cwd, and one run deleted
+            # the directory the OTHER run'"'"'s python process still had as
+            # its cwd mid-run (os.getcwd() FileNotFoundError, nothing to do
+            # with the backtest itself). Each run now gets its own path.
+            SCRATCH=/tmp/kronos-backtest-${{ github.run_id }}
+            rm -rf "$SCRATCH"
             git clone --branch claude/prometheus-causal-market-ol2pau --depth 1 \
-              /opt/prometheus /tmp/kronos-backtest
-            cd /tmp/kronos-backtest
+              /opt/prometheus "$SCRATCH"
+            cd "$SCRATCH"
             source /opt/prometheus/.venv/bin/activate
             python scripts/run_backtest.py \
               --tickers '"${{ github.event.inputs.tickers || 'RELIANCE.NS TCS.NS HDFCBANK.NS INFY.NS ICICIBANK.NS HINDUNILVR.NS ITC.NS SBIN.NS BHARTIARTL.NS KOTAKBANK.NS' }}"' \
               --start '"${{ github.event.inputs.start || '2015-01-01' }}"' \
               --strategies '"${{ github.event.inputs.strategies || 'kronos momentum buy_hold' }}"' \
-              --out-dir /tmp/kronos-backtest-report
+              --out-dir "$SCRATCH-report"
             echo
             echo "=== full markdown report ==="
-            cat /tmp/kronos-backtest-report/*.md
+            cat "$SCRATCH-report"/*.md
           '
 
       - name: Clean up scratch checkout
         if: always()
         run: |
           ssh "${{ secrets.HETZNER_USER }}@${{ secrets.HETZNER_HOST }}" '
-            rm -rf /tmp/kronos-backtest /tmp/kronos-backtest-report
+            rm -rf /tmp/kronos-backtest-${{ github.run_id }} /tmp/kronos-backtest-${{ github.run_id }}-report
           '
