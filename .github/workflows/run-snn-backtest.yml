@@ -1,0 +1,73 @@
+name: Run SNN (Production Model) Walk-Forward Backtest (read-only)
+
+# Runs kronos/backtest_snn.py's walk-forward harness against the ACTUAL
+# production model - ReflexArc's SNN, trained via
+# prometheus.engine.PrometheusEngine's real pretrain->finetune->meta
+# procedure - not kronos/backtest.py's separate KronosStrategy stand-in
+# that every prior backtest number in this project has actually measured.
+# See kronos/backtest_snn.py's module docstring for the full rationale and
+# real (measured, not guessed) cost breakdown. Runs on Hetzner (real
+# yfinance access) in a scratch checkout; does not touch kronos.service or
+# its checkpoints/state.
+#
+# Manual trigger only. CPU-only (no GPU needed - measured feasible in
+# hours, not the days/weeks a naive per-window pretrain would cost).
+
+on:
+  workflow_dispatch:
+    inputs:
+      tickers:
+        description: "space-separated tickers (defaults to Kronos's live NSE universe)"
+        required: false
+        default: "RELIANCE.NS TCS.NS HDFCBANK.NS INFY.NS ICICIBANK.NS HINDUNILVR.NS ITC.NS SBIN.NS BHARTIARTL.NS KOTAKBANK.NS"
+        type: string
+      start:
+        description: "history start date (YYYY-MM-DD)"
+        required: false
+        default: "2015-01-01"
+        type: string
+      max_windows:
+        description: "limit to N walk-forward windows (blank = all ~125, ~2-2.5h); use a small number for a sanity check first"
+        required: false
+        default: "5"
+        type: string
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Load Hetzner deploy key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.HETZNER_SSH_KEY }}
+
+      - name: Trust Hetzner host key
+        run: ssh-keyscan -H "${{ secrets.HETZNER_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Run the SNN backtest in a scratch checkout
+        run: |
+          ssh "${{ secrets.HETZNER_USER }}@${{ secrets.HETZNER_HOST }}" '
+            set -euo pipefail
+            SCRATCH=/tmp/kronos-snn-backtest-${{ github.run_id }}
+            rm -rf "$SCRATCH"
+            git clone --branch claude/prometheus-causal-market-ol2pau --depth 1 \
+              /opt/prometheus "$SCRATCH"
+            cd "$SCRATCH"
+            source /opt/prometheus/.venv/bin/activate
+            MAX_WINDOWS_ARG=""
+            if [ -n "${{ github.event.inputs.max_windows }}" ]; then
+              MAX_WINDOWS_ARG="--max-windows ${{ github.event.inputs.max_windows }}"
+            fi
+            python scripts/run_snn_backtest.py \
+              --tickers '"${{ github.event.inputs.tickers || 'RELIANCE.NS TCS.NS HDFCBANK.NS INFY.NS ICICIBANK.NS HINDUNILVR.NS ITC.NS SBIN.NS BHARTIARTL.NS KOTAKBANK.NS' }}"' \
+              --start '"${{ github.event.inputs.start || '2015-01-01' }}"' \
+              $MAX_WINDOWS_ARG
+          '
+
+      - name: Clean up scratch checkout
+        if: always()
+        run: |
+          ssh "${{ secrets.HETZNER_USER }}@${{ secrets.HETZNER_HOST }}" '
+            rm -rf /tmp/kronos-snn-backtest-${{ github.run_id }}
+          '
