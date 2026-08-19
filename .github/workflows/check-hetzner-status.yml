@@ -75,4 +75,16 @@ jobs:
             ls -la /etc/cron.d /etc/cron.hourly 2>&1
             echo "--- logrotate rules mentioning prometheus/kronos/trades ---"
             grep -rl "prometheus\|kronos\|trades" /etc/logrotate.d/ 2>&1 || echo "(none found)"
+
+            echo
+            echo "=== open file descriptor count for the running kronos process (crash interval tracks time-SINCE-RESTART, not wall clock - points at an in-process leak, e.g. yfinance not closing something per reflex tick, not a scheduled job) ==="
+            KPID=$(systemctl show kronos.service -p MainPID --value)
+            echo "MainPID=$KPID"
+            if [ -n "$KPID" ] && [ "$KPID" != "0" ]; then
+              echo "open fd count: $(ls /proc/$KPID/fd 2>/dev/null | wc -l)"
+              echo "--- soft/hard open-file limit for this process ---"
+              grep -i "open files" /proc/$KPID/limits 2>&1
+              echo "--- fd targets sample (first 30) ---"
+              ls -la /proc/$KPID/fd 2>&1 | head -30
+            fi
           '
