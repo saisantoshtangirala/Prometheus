@@ -52,4 +52,8 @@ jobs:
             echo
             echo "=== last 15 lines of /var/log/kronos-service.log, unfiltered ==="
             tail -n 15 /var/log/kronos-service.log 2>&1
+
+            echo
+            echo "=== most recent Traceback/ERROR/CRITICAL in /var/log/kronos-service.log (with context) ==="
+            grep -n -B2 -A30 "Traceback\|\[ERROR\]\|\[CRITICAL\]" /var/log/kronos-service.log 2>&1 | tail -n 200 || echo "(none found)"
           '
