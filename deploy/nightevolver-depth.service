@@ -1,0 +1,60 @@
+# Kite depth recorder, run under systemd on the Hetzner box.
+#
+#   sudo cp deploy/nightevolver-depth.service /etc/systemd/system/
+#   sudo cp deploy/nightevolver-depth.timer   /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now nightevolver-depth.timer
+#
+# CREDENTIALS live in /etc/nightevolver/kite.env, NOT in this unit and
+# not in the repo:
+#
+#   sudo mkdir -p /etc/nightevolver
+#   sudo install -m 600 /dev/null /etc/nightevolver/kite.env
+#   # then write:  KITE_API_KEY=...
+#   #              KITE_ACCESS_TOKEN=...
+#
+# The access token EXPIRES DAILY. Refresh it each morning by running
+# scripts/kite_login.py on your laptop (that is the only step needing
+# api_secret, which should never reach this machine) and rewriting
+# kite.env. Until that is done, the service will exit 2 with a clear
+# auth error rather than spinning - a recorder that looks alive while
+# recording nothing is the failure mode this design avoids.
+
+[Unit]
+Description=NightEvolver Kite market-depth recorder
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=prometheus
+Group=prometheus
+WorkingDirectory=/opt/prometheus
+EnvironmentFile=/etc/nightevolver/kite.env
+
+# --duration 24000 is ~6h40m: started at 09:10 IST by the timer, the
+# process exits cleanly after the 15:30 close instead of holding a
+# connection open overnight.
+ExecStart=/usr/bin/python3 scripts/record_depth.py --duration 24000
+
+# Restart on transport failures, but NOT on a clean exit and not on the
+# exit code used for auth failure - retrying a stale daily token cannot
+# help and would just burn the day.
+Restart=on-failure
+RestartPreventExitStatus=2
+RestartSec=30
+
+# The recorded data is irreplaceable; give it room and keep the rest
+# locked down.
+StateDirectory=nightevolver
+ReadWritePaths=/opt/prometheus/data
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

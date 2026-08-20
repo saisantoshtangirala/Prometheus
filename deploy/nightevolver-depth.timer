@@ -1,0 +1,23 @@
+# Start the depth recorder shortly before the NSE open.
+#
+# 09:10 IST = 03:40 UTC. The timer is written in UTC so it does not
+# depend on the box's timezone being set to Asia/Kolkata - one less
+# thing that can silently drift and cost a session.
+#
+# Weekdays only. Exchange holidays are NOT filtered here on purpose: on
+# a holiday the stream simply carries no data, and the recorder exits
+# after its --duration having written nothing. A timer that tried to
+# track the NSE holiday calendar would be one more thing to maintain,
+# and getting it wrong would skip a real trading day - which is the
+# expensive direction of that error, since depth cannot be backfilled.
+
+[Unit]
+Description=Start the NightEvolver depth recorder before the NSE open
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 03:40:00 UTC
+Persistent=false
+Unit=nightevolver-depth.service
+
+[Install]
+WantedBy=timers.target

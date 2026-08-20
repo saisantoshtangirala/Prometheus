@@ -526,6 +526,40 @@ class TestRecorderEndToEnd:
         assert stats.written >= 1
 
 
+class TestLoginChecksum:
+    """The checksum is SHA-256 of api_key + request_token + api_secret,
+    in that order. A wrong order fails opaquely - Kite returns a generic
+    auth error, not 'your checksum is backwards' - so pin it."""
+
+    def _fn(self):
+        import importlib.util
+        from pathlib import Path
+        spec = importlib.util.spec_from_file_location(
+            "kite_login",
+            Path(__file__).parent.parent / "scripts" / "kite_login.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod.login_checksum
+
+    def test_matches_known_vector(self):
+        import hashlib
+        fn = self._fn()
+        expected = hashlib.sha256(b"KEYREQSECRET").hexdigest()
+        assert fn("KEY", "REQ", "SECRET") == expected
+
+    def test_field_order_is_not_commutative(self):
+        fn = self._fn()
+        assert fn("KEY", "REQ", "SECRET") != fn("SECRET", "REQ", "KEY")
+        assert fn("KEY", "REQ", "SECRET") != fn("KEY", "SECRET", "REQ")
+
+    def test_changing_any_field_changes_the_digest(self):
+        fn = self._fn()
+        base = fn("KEY", "REQ", "SECRET")
+        assert fn("KEY2", "REQ", "SECRET") != base
+        assert fn("KEY", "REQ2", "SECRET") != base
+        assert fn("KEY", "REQ", "SECRET2") != base
+
+
 class TestOrderFlowFeatures:
     def test_daily_orderflow_from_records(self):
         t = parse_packet(_build_full(token=555))

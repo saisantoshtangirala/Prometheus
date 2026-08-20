@@ -36,6 +36,35 @@ the ₹1,500–2,500 quoted for True Data / GDFL.
 
 ---
 
+## Day one, in order
+
+```bash
+# 1. Get the daily token. RUN THIS ON YOUR LAPTOP - it is the only step
+#    that needs api_secret, which should never reach the server.
+export KITE_API_KEY=...
+export KITE_API_SECRET=...
+python scripts/kite_login.py
+
+# 2. On the box, with KITE_API_KEY + KITE_ACCESS_TOKEN exported:
+#    check every link in the chain before relying on it.
+python scripts/kite_preflight.py
+
+# 3. Record.
+python scripts/record_depth.py
+```
+
+`kite_preflight.py` checks credentials, auth, CNC availability,
+instrument resolution, historical access, a live stream probe and disk
+space, and reports each with a specific remedy. It exists because the
+alternative is discovering a missing subscription at 09:15 IST and
+losing a session that cannot be re-recorded.
+
+The check most likely to fail on a **new account** is HISTORICAL: the
+candle API is billed with the Connect subscription and can lag app
+creation. That failure does **not** block the recorder, which needs
+streaming only — the script says so instead of leaving you to assume
+everything is broken.
+
 ## Running the recorder
 
 ```bash
@@ -46,6 +75,30 @@ python scripts/record_depth.py
 # smoke test, no waiting for market hours
 python scripts/record_depth.py --duration 60 --any-hours
 ```
+
+### Under systemd
+
+`deploy/nightevolver-depth.service` and `.timer` are ready to install:
+
+```bash
+sudo cp deploy/nightevolver-depth.{service,timer} /etc/systemd/system/
+sudo mkdir -p /etc/nightevolver
+sudo install -m 600 /dev/null /etc/nightevolver/kite.env   # then write the two vars
+sudo systemctl daemon-reload
+sudo systemctl enable --now nightevolver-depth.timer
+```
+
+The timer fires weekdays at 03:40 UTC (09:10 IST) and the unit runs with
+`--duration 24000`, so the process exits cleanly after the 15:30 close.
+`RestartPreventExitStatus=2` matches the exit code the recorder uses for
+auth failure: transport drops are retried, a stale daily token is not,
+because retrying it cannot help and would burn the day.
+
+The timer deliberately does not filter exchange holidays. On a holiday
+the stream carries no data and the recorder writes nothing; a timer that
+tried to track the NSE calendar would be one more thing to maintain, and
+getting it wrong would skip a real trading day — the expensive direction
+of that error, since depth cannot be backfilled.
 
 Output is one gzipped JSONL file per IST trading date in `data/depth/`,
 roughly 10–20 MB/day for ten symbols — about 1 GB per quarter.
