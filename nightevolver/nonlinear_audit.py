@@ -65,6 +65,27 @@ DEFAULT_QUANTILE_BINS = 5
 MAX_N_FOR_DCOR = 1200             # memory guard: n^2 float64
 
 
+_NOISE_FLOOR_CACHE: Dict[int, float] = {}
+
+
+def _noise_floor(n: int, rng: np.random.Generator, draws: int = 12) -> float:
+    """Mean dCor between two INDEPENDENT series of length n.
+
+    dCor is biased upward at finite n - independent data at n~588
+    scores ~0.07, not 0. A "significant" 0.09 is therefore much closer
+    to nothing than it looks, and the sign-channel comparison needs a
+    reference point rather than an implicit zero.
+    """
+    if n < 8:
+        return float("nan")
+    if n in _NOISE_FLOOR_CACHE:
+        return _NOISE_FLOOR_CACHE[n]
+    vals = [distance_correlation(rng.normal(size=n), rng.normal(size=n))
+            for _ in range(draws)]
+    _NOISE_FLOOR_CACHE[n] = float(np.mean(vals))
+    return _NOISE_FLOOR_CACHE[n]
+
+
 def _double_center(d: np.ndarray) -> np.ndarray:
     """A_ij = d_ij - row_mean_i - col_mean_j + grand_mean."""
     row = d.mean(axis=1, keepdims=True)
@@ -145,6 +166,9 @@ class NonlinearPair:
     n_per_asset: int
     q_value: float = float("nan")
     significant: bool = False
+    dcor_sign: float = float("nan")     # dependence on sign(y) only
+    dcor_abs: float = float("nan")      # dependence on |y| only
+    noise_floor: float = float("nan")   # dCor of independent data at this n
 
     @property
     def hidden_by_monotonic(self) -> bool:
@@ -152,13 +176,42 @@ class NonlinearPair:
         module was built to find."""
         return self.significant and abs(self.spearman_ref) < 0.05
 
+    @property
+    def magnitude_only(self) -> bool:
+        """Dependence lives in |y|, not sign(y) - so it is NOT tradeable
+        direction.
+
+        THE TRAP THIS EXISTS TO CATCH. Distance correlation detects any
+        dependence, including dependence on a target's SCALE. A return
+        series has volatility structure, so a volatility feature scores
+        against `r` simply because it predicts |r|. Knowing tomorrow's
+        move will be large tells you nothing about which way to take it.
+
+        Measured on the five pairs that first "survived" on directional
+        targets - every one of them a volatility measure:
+
+            atr_pct   dCor(x,r)=0.1121  dCor(x,|r|)=0.1595
+                      dCor(x,sign r)=0.0550   noise floor 0.0704
+
+        The sign channel sits BELOW the independent-noise floor. Those
+        five were the known volatility result arriving through a
+        different door, and reporting them as hidden directional signal
+        would have been a false discovery of exactly the kind this
+        project exists to avoid.
+        """
+        if not np.isfinite(self.dcor_sign) or not np.isfinite(self.noise_floor):
+            return False
+        return self.dcor_sign <= self.noise_floor
+
     def __str__(self) -> str:
         flag = "  <-- SURVIVES FDR" if self.significant else ""
         hid = "  [MISSED BY SPEARMAN]" if self.hidden_by_monotonic else ""
+        mag = "  [MAGNITUDE ONLY - NOT DIRECTION]" if self.magnitude_only else ""
         return (f"{self.feature:22s} -> {self.target:16s} "
                 f"dCor={self.dcor:.4f} p={self.dcor_p:.4f}  "
-                f"KW={self.kruskal:6.2f} p={self.kruskal_p:.4f}  "
-                f"(rho={self.spearman_ref:+.3f})  q={self.q_value:.4f}{flag}{hid}")
+                f"sign={self.dcor_sign:.4f} |y|={self.dcor_abs:.4f} "
+                f"floor={self.noise_floor:.4f}  "
+                f"q={self.q_value:.4f}{flag}{hid}{mag}")
 
 
 @dataclass
@@ -204,6 +257,20 @@ class NonlinearResult:
 
         lines.append("=" * 78)
         surv, hid = self.survivors, self.hidden
+        mag = [p for p in surv if p.magnitude_only]
+        real = [p for p in surv if not p.magnitude_only]
+        if mag:
+            lines.append(f"  {len(mag)} of {len(surv)} survivor(s) are MAGNITUDE ONLY:")
+            for p in mag:
+                lines.append(f"    {p.feature} -> {p.target}  "
+                             f"sign={p.dcor_sign:.4f} <= floor={p.noise_floor:.4f}")
+            lines.append("")
+            lines.append("  dCor detects ANY dependence, including on a target's SCALE.")
+            lines.append("  A volatility feature scores against `r` because it predicts")
+            lines.append("  |r|. Knowing tomorrow's move will be large says nothing about")
+            lines.append("  which way to take it - so these are NOT tradeable direction.")
+            lines.append("")
+            surv, hid = real, [p for p in hid if not p.magnitude_only]
         if not surv:
             lines.append("  NOTHING survives FDR correction.")
             lines.append("")
@@ -353,6 +420,14 @@ def audit_nonlinear(features: np.ndarray,
             if spearman_ref is not None:
                 ref = float(spearman_ref.get((fname, tname), 0.0))
 
+            # Decompose: is the dependence in sign(y) or |y|? Only the
+            # sign channel is tradeable direction. See magnitude_only.
+            sgn, ab = [], []
+            for Ac, Bc, denom, x, y in mats:
+                sgn.append(distance_correlation(x, np.sign(y)))
+                ab.append(distance_correlation(x, np.abs(y)))
+            floor = _noise_floor(len(mats[0][3]) if mats else 0, rng)
+
             result.pairs.append(NonlinearPair(
                 feature=fname, target=tname,
                 dcor=dcor_obs,
@@ -360,6 +435,9 @@ def audit_nonlinear(features: np.ndarray,
                 kruskal=kw_obs,
                 kruskal_p=(cnt_k + 1.0) / (n_permutations + 1.0),
                 spearman_ref=ref, n_per_asset=n,
+                dcor_sign=float(np.mean(sgn)) if sgn else float("nan"),
+                dcor_abs=float(np.mean(ab)) if ab else float("nan"),
+                noise_floor=floor,
             ))
 
     q, rejected = benjamini_hochberg([p.dcor_p for p in result.pairs],

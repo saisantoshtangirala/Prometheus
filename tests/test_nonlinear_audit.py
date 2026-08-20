@@ -211,3 +211,63 @@ class TestPermutationFloor:
         for n_pairs, alpha in [(52, 0.05), (104, 0.05), (20, 0.10)]:
             need = int(np.ceil(n_pairs / alpha)) - 1
             assert n_pairs / (need + 1.0) <= alpha + 1e-12
+
+
+class TestMagnitudeConfound:
+    """dCor detects ANY dependence, including on a target's SCALE. A
+    volatility feature scores against `r` because it predicts |r| - and
+    knowing tomorrow's move will be large says nothing about which way
+    to take it.
+
+    This confound produced five apparent 'hidden directional signals' on
+    the real panel, every one of them a volatility measure. Reporting
+    them without decomposing sign from magnitude would have been a false
+    discovery of exactly the kind this project exists to avoid."""
+
+    def test_pure_magnitude_dependence_is_flagged(self):
+        """y's SCALE depends on x, its SIGN does not. dCor must fire and
+        magnitude_only must catch it."""
+        from nightevolver.nonlinear_audit import NonlinearPair, _noise_floor
+        rng = np.random.default_rng(30)
+        n = 500
+        x = np.abs(rng.normal(size=n))
+        y = x * rng.normal(size=n)          # scale from x, sign independent
+
+        d_raw = distance_correlation(x, y)
+        d_abs = distance_correlation(x, np.abs(y))
+        d_sgn = distance_correlation(x, np.sign(y))
+        floor = _noise_floor(n, np.random.default_rng(0))
+
+        assert d_abs > d_raw, "magnitude channel should dominate"
+        assert d_sgn <= floor * 1.2, \
+            f"sign channel {d_sgn:.4f} should sit at the noise floor {floor:.4f}"
+
+        p = NonlinearPair("v", "direction_1d", d_raw, 0.001, 0.0, 0.5, 0.0, n,
+                          q_value=0.01, significant=True,
+                          dcor_sign=d_sgn, dcor_abs=d_abs, noise_floor=floor)
+        assert p.magnitude_only, "magnitude-only dependence was not flagged"
+
+    def test_genuine_sign_dependence_is_not_flagged(self):
+        """The complement: if the SIGN really is predictable, the pair
+        must survive as a real directional finding."""
+        from nightevolver.nonlinear_audit import NonlinearPair, _noise_floor
+        rng = np.random.default_rng(31)
+        n = 500
+        x = rng.normal(size=n)
+        y = np.sign(x) * np.abs(rng.normal(size=n))     # sign from x
+
+        d_sgn = distance_correlation(x, np.sign(y))
+        floor = _noise_floor(n, np.random.default_rng(0))
+        assert d_sgn > floor * 2, "planted sign dependence not detected"
+
+        p = NonlinearPair("s", "direction_1d", 0.3, 0.001, 0.0, 0.5, 0.0, n,
+                          q_value=0.01, significant=True,
+                          dcor_sign=d_sgn, dcor_abs=0.1, noise_floor=floor)
+        assert not p.magnitude_only
+
+    def test_noise_floor_is_meaningfully_above_zero(self):
+        """dCor is biased upward at finite n. Treating 0 as the reference
+        makes a 0.09 look like signal when independent data scores 0.07."""
+        from nightevolver.nonlinear_audit import _noise_floor
+        floor = _noise_floor(588, np.random.default_rng(0))
+        assert 0.04 < floor < 0.12, f"unexpected floor {floor:.4f}"
