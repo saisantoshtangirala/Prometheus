@@ -32,6 +32,7 @@ import json
 import logging
 import sys
 from pathlib import Path
+from typing import List
 
 import numpy as np
 
@@ -57,7 +58,13 @@ DEFAULT_TICKERS = [
 def parse_args():
     p = argparse.ArgumentParser(description="NightEvolver GA / RL training")
     p.add_argument("--mode", choices=["ga", "rl"], default="ga")
-    p.add_argument("--tickers", nargs="+", default=DEFAULT_TICKERS)
+    p.add_argument("--tickers", nargs="+", default=DEFAULT_TICKERS,
+                   help="space- OR comma-separated. Comma form is accepted "
+                        "because train-runpod.yml builds its ticker list from "
+                        "kronos/config.yaml as a single comma-joined string "
+                        "(that is what scripts/train.py takes), and a silent "
+                        "mismatch here would train on a ticker literally named "
+                        "'A.NS,B.NS,...' rather than failing loudly.")
     p.add_argument("--start", default="2022-01-01",
                    help="history start; ~2 years is the spec's window")
     p.add_argument("--end", default=None)
@@ -80,7 +87,15 @@ def parse_args():
                    help="accepted for CLI parity with train.py; unused - "
                         "this workload is CPU-bound (see module docstring)")
     p.add_argument("--seed", type=int, default=42)
-    return p.parse_args()
+    args = p.parse_args()
+    # Normalise both accepted forms to a flat list.
+    flat: List[str] = []
+    for chunk in args.tickers:
+        flat.extend(t.strip() for t in str(chunk).split(",") if t.strip())
+    if not flat:
+        p.error("--tickers resolved to an empty list")
+    args.tickers = flat
+    return args
 
 
 def _synthetic(tickers, n_days: int = 700):

@@ -70,11 +70,21 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "train.py --mode"
+        description: "training mode - 'nightevolver-*' run the GA/RL trainer, the rest run scripts/train.py's SNN pipeline"
         required: false
         default: "full"
         type: choice
-        options: [pretrain, finetune, meta, evolve, full]
+        options: [pretrain, finetune, meta, evolve, full, nightevolver-ga, nightevolver-rl]
+      generations:
+        description: "nightevolver-ga only: GA generations (population is 50)"
+        required: false
+        default: "20"
+        type: string
+      history_start:
+        description: "nightevolver only: history start date (YYYY-MM-DD)"
+        required: false
+        default: "2022-01-01"
+        type: string
       gpu_type:
         description: "\"auto\" = pick the cheapest in-stock GPU that fits (recommended), or an exact RunPod GPU type ID to force one"
         required: false
@@ -104,6 +114,8 @@ jobs:
           set -euo pipefail
           pip install -q pyyaml
           echo "mode=${{ github.event.inputs.mode || 'full' }}" >> "$GITHUB_OUTPUT"
+          echo "generations=${{ github.event.inputs.generations || '20' }}" >> "$GITHUB_OUTPUT"
+          echo "history_start=${{ github.event.inputs.history_start || '2022-01-01' }}" >> "$GITHUB_OUTPUT"
           echo "gpu_type=${{ github.event.inputs.gpu_type || 'auto' }}" >> "$GITHUB_OUTPUT"
           echo "cloud_type=${{ github.event.inputs.cloud_type || 'COMMUNITY' }}" >> "$GITHUB_OUTPUT"
           N_ASSETS=$(python3 -c "
@@ -328,7 +340,29 @@ jobs:
             cd /opt/prometheus
             pip install -q -e .
             pip install -q pyyaml yfinance
-            python scripts/train.py --mode "'"${{ steps.params.outputs.mode }}"'" --device cuda --n-assets "'"${{ steps.params.outputs.n_assets }}"'" --tickers "'"${{ steps.params.outputs.tickers }}"'"
+            MODE="'"${{ steps.params.outputs.mode }}"'"
+            case "$MODE" in
+              nightevolver-ga)
+                # CPU-bound by design (see scripts/train_nightevolver.py) -
+                # --device is accepted for CLI parity and ignored.
+                python scripts/train_nightevolver.py --mode ga \
+                  --tickers "'"${{ steps.params.outputs.tickers }}"'" \
+                  --start "'"${{ steps.params.outputs.history_start }}"'" \
+                  --generations "'"${{ steps.params.outputs.generations }}"'" \
+                  --population 50
+                ;;
+              nightevolver-rl)
+                python scripts/train_nightevolver.py --mode rl \
+                  --tickers "'"${{ steps.params.outputs.tickers }}"'" \
+                  --start "'"${{ steps.params.outputs.history_start }}"'" \
+                  --episodes 1000
+                ;;
+              *)
+                python scripts/train.py --mode "$MODE" --device cuda \
+                  --n-assets "'"${{ steps.params.outputs.n_assets }}"'" \
+                  --tickers "'"${{ steps.params.outputs.tickers }}"'"
+                ;;
+            esac
             tar czf /tmp/checkpoints.tar.gz checkpoints
           '
           scp -P "${{ steps.connect.outputs.port }}" \
