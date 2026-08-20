@@ -169,24 +169,57 @@ WITH flow channels
 
 A naive report writes "adding FII flow data lifted out-of-sample Sharpe
 from −1.46 to +1.18 and win rate to 66.7%". That is **two winning trades
-out of three.** The multi-seed spread is in §5 and settles it.
+out of three.** The multi-seed spread in §5 settles it: across 8 seeds
+the +1.18 never reappears, every run is ≤ 0.00, and the two arms are
+statistically indistinguishable (p=0.27).
 
 ---
 
-## 5. Multi-seed stability
+## 5. Multi-seed stability — the single-seed result was noise
 
-**Run in progress at the time of this commit** — 8 seeds × 2 arms,
-reporting out-of-sample Sharpe and trade count for each. This section
-will be filled in with the verbatim numbers when it completes; it is
-left explicitly empty rather than filled with the single-seed result
-above, because the single-seed result is exactly the thing that needs
-checking.
+8 seeds × 2 arms, same data, same budget:
 
-What the numbers are being asked to settle: whether the flows-on arm's
-+1.18 out-of-sample Sharpe is anything other than the 3-trade artefact
-it appears to be, and whether the two arms are distinguishable at all.
-A trade count in the single digits cannot support a Sharpe estimate, so
-the trade column matters as much as the Sharpe column.
+```
+seed | no-flow OOS  trd |  flow OOS  trd
+   0 |       -2.32    3 |     -0.67    2
+   1 |       -1.04    1 |      0.00    0
+   2 |       -1.45    2 |     -2.53    3
+   3 |       -2.13    5 |     -1.03    2
+   4 |       -2.48    3 |      0.00    0
+   5 |       -2.33    3 |     -0.82    2
+   6 |       -1.04    1 |     -2.18    3
+   7 |       -3.26    3 |      0.00    0
+
+no flows    OOS Sharpe mean=-2.01 sd=0.72 range=[-3.26,-1.04] | median trades=3
+with flows  OOS Sharpe mean=-0.90 sd=0.92 range=[-2.53,+0.00] | median trades=2
+```
+
+**The +1.18 does not reappear. Every one of the 16 runs is ≤ 0.00.** The
+seed-42 result reported in §4 was a lucky draw on three trades, exactly
+as suspected.
+
+**And the apparent improvement is not real.** `with flows` looks better
+(−0.90 vs −2.01) for one reason: **3 of its 8 seeds placed ZERO trades**
+and were recorded as Sharpe 0.00. A strategy that never trades is not a
+strategy scoring zero — it is an abstention, and averaging it in as a
+zero drags the mean up. Excluding the non-trading seeds:
+
+```
+flows, seeds that actually traded:  mean -1.45  (n=5)
+no flows, all seeds traded:         mean -2.01  (n=8)
+Welch t-test:  t=-1.20  p=0.265     -> not distinguishable
+```
+
+**This is the same failure mode as the CHIMERA deadband collapse found
+earlier in this project**: never-trading scores exactly 0.0, which beats
+any negative score, so a search that is failing will select for
+abstention and then report the abstention as a good number. Adding six
+uninformative channels widened the search space 30% and made the GA
+trade *less* (median 3 → 2), which is what "no information, more
+parameters" looks like from the inside.
+
+So: **adding the flow data did not help.** The audit said so in three
+seconds; the GA took sixteen runs to agree.
 
 ---
 
@@ -201,9 +234,16 @@ the trade column matters as much as the Sharpe column.
   building on — but through sizing or an instrument that pays for vol,
   not by relabelling it as a directional edge.
 - **The new flow data carries nothing measurable** at its honest sample
-  size. That is a real answer, obtained in seconds, and it is worth more
-  than a week of backtests that would have concluded the same thing less
-  clearly.
+  size, and the GA confirmed it independently: 8 seeds, every run ≤ 0.00
+  out-of-sample, two arms indistinguishable at p=0.27. That is a real
+  answer, and the audit reached it in three seconds against sixteen GA
+  runs.
+- **Watch for abstention being scored as success.** Three of eight
+  flow-arm seeds placed zero trades and were recorded as Sharpe 0.00,
+  which pulled the arm's mean *above* the arm that actually traded. This
+  is the second time this exact pattern has appeared in this project
+  (the first was CHIMERA's deadband collapse). A zero-trade run should
+  be reported as an abstention, never averaged in as a zero.
 - **The genuinely untested lever is still intraday microstructure** —
   the one source that could not be obtained free. Everything daily and
   free has now been measured.
