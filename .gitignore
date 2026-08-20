@@ -26,3 +26,7 @@ notebooks/.ipynb_checkpoints/
 # Cached NSE source data (bhavcopy zips, participant CSVs, corp actions).
 # Re-fetchable and large; the loaders rebuild it on demand.
 /data/cache/
+
+# Recorded market depth. Large, append-only, and irreplaceable - back it
+# up off the box, but do not commit it.
+/data/depth/
