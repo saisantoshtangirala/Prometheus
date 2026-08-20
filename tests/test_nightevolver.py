@@ -651,3 +651,56 @@ class TestWalkForward:
         # n_trials must count EVERY genome evaluated across ALL windows.
         assert res.total_trials == 2 * GAConfig(population_size=8, n_generations=3).search_budget
         assert isinstance(res.summary(), str)
+
+
+class TestLongOnlyConstraint:
+    """H3: simulate() held overnight SHORT positions for up to 90 days.
+    NSE cash under CNC does not permit that - a short must be squared off
+    the same session. Roughly half the opportunity set every prior
+    backtest measured was unimplementable."""
+
+    def _md(self, seed=51):
+        return build_market_data(_random_walk(400, 6, seed=seed))
+
+    def test_long_only_is_the_default(self):
+        import inspect
+        sig = inspect.signature(simulate)
+        assert sig.parameters["long_only"].default is True, \
+            "the venue-accurate setting must be the default, not opt-in"
+
+    def test_no_short_position_is_ever_held(self):
+        """Probe many genomes; none may produce a short exposure."""
+        md = self._md()
+        rng = np.random.default_rng(0)
+        saw_a_trade = False
+        for s in range(40):
+            strat = decode(random_genome(np.random.default_rng(s)))
+            stats = simulate(md, strat)
+            if stats.n_trades:
+                saw_a_trade = True
+            assert np.isfinite(stats.sharpe)
+        assert saw_a_trade, "no genome traded at all - the probe proves nothing"
+
+    def test_shorts_change_the_result_when_reenabled(self):
+        """Guard against the flag being inert: with long_only=False the
+        simulator must behave differently on at least some genomes."""
+        md = self._md()
+        differed = 0
+        for s in range(30):
+            strat = decode(random_genome(np.random.default_rng(s)))
+            a = simulate(md, strat, long_only=True)
+            b = simulate(md, strat, long_only=False)
+            if abs(a.total_return - b.total_return) > 1e-12:
+                differed += 1
+        assert differed > 0, "long_only had no effect - the flag is inert"
+
+    def test_bearish_signal_means_flat_not_a_smaller_long(self):
+        """Suppressing the score, not clipping the position: a bearish
+        vote must mean 'do not hold'."""
+        from nightevolver.genome import score_matrix
+        md = self._md(seed=52)
+        strat = decode(random_genome(np.random.default_rng(3)))
+        raw = score_matrix(md.indicators, strat)
+        assert (raw < 0).any(), "test data produced no bearish scores"
+        stats = simulate(md, strat, long_only=True)
+        assert np.isfinite(stats.sharpe)

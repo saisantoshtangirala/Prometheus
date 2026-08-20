@@ -276,16 +276,30 @@ jobs:
               POD_ID="$ID"
               CHOSEN_GPU="$GPU_ID"
               CHOSEN_CLOUD="$CLOUD"
+              # PUBLISH THE ID IMMEDIATELY - billing has already started.
+              # This used to be written only after the loop, so a
+              # cancellation in between left the terminate step's guard
+              # (pod_id != '') false and the pod ran on unattended.
+              echo "pod_id=$POD_ID" >> "$GITHUB_OUTPUT"
               break
             fi
-            echo "::warning::$GPU_ID on $CLOUD had no capacity - trying the next candidate."
+            # A 2xx whose body we cannot parse may still have CREATED a
+            # pod. Treating that as "no capacity" and moving on would
+            # start a second pod while the first bills untracked, so stop.
+            if echo "$RESPONSE" | jq -e . >/dev/null 2>&1; then
+              echo "::warning::$GPU_ID on $CLOUD had no capacity - trying the next candidate."
+            else
+              echo "::error::Unparseable response from POST /pods. A pod may "
+              echo "::error::have been created. Refusing to create another - "
+              echo "::error::check the RunPod console for kronos-ci-${{ github.run_id }}."
+              exit 1
+            fi
           done < <(echo '${{ steps.pick.outputs.candidates }}' | jq -r '.[] | @tsv')
 
           if [ -z "$POD_ID" ]; then
             echo "::error::Pod creation failed on every GPU/cloud candidate tried."
             exit 1
           fi
-          echo "pod_id=$POD_ID" >> "$GITHUB_OUTPUT"
           echo "Created pod: $POD_ID ($CHOSEN_GPU on $CHOSEN_CLOUD)"
 
       - name: Poll until the pod is running and reachable
@@ -331,7 +345,13 @@ jobs:
         if: steps.gate.outputs.should_run == 'true'
         run: |
           set -euo pipefail
-          ssh -p "${{ steps.connect.outputs.port }}" \
+          # ConnectTimeout/keepalive: without these a pod that accepts the
+          # TCP connection and then freezes blocks until the 240-minute job
+          # timeout, billing a dead GPU the whole time. scripts/ssh_train.sh
+          # already set ServerAliveInterval; this path did not.
+          ssh -o ConnectTimeout=15 -o ServerAliveInterval=30 \
+              -o ServerAliveCountMax=6 \
+              -p "${{ steps.connect.outputs.port }}" \
               "root@${{ steps.connect.outputs.host }}" '
             set -euo pipefail
             git clone --branch claude/prometheus-causal-market-ol2pau \
@@ -365,7 +385,9 @@ jobs:
             esac
             tar czf /tmp/checkpoints.tar.gz checkpoints
           '
-          scp -P "${{ steps.connect.outputs.port }}" \
+          scp -o ConnectTimeout=15 -o ServerAliveInterval=30 \
+              -o ServerAliveCountMax=6 \
+              -P "${{ steps.connect.outputs.port }}" \
               "root@${{ steps.connect.outputs.host }}:/tmp/checkpoints.tar.gz" \
               ./checkpoints.tar.gz
 

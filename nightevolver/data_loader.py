@@ -36,9 +36,7 @@ from typing import List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
-from nightevolver.genome import (
-    FLOW_CHANNEL_NAMES, INDICATOR_NAMES, N_FLOW, N_INDICATORS, N_TECHNICAL,
-)
+from nightevolver.genome import N_FLOW, N_TECHNICAL
 
 logger = logging.getLogger("nightevolver.data")
 

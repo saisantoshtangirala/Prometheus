@@ -37,14 +37,26 @@ nothing else in Kronos depends on this working.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
+import time
 from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
 TELEGRAM_API_BASE = "https://api.telegram.org"
 MAX_MESSAGE_CHARS = 4000   # Telegram's real limit is 4096; leave margin
+
+# Identical alerts inside this window are suppressed and counted. 15
+# minutes is long enough to collapse a failure storm into one message,
+# short enough that a genuinely recurring condition is re-reported.
+DEDUPE_WINDOW_SECONDS = 900
+# One bounded retry on 429/5xx. The alert channel for an unattended
+# trading system must not drop a critical message because the first
+# attempt was throttled.
+SEND_ATTEMPTS = 3
+RETRY_BACKOFF_SECONDS = 1.5
 
 
 class TelegramNotifier:
@@ -56,6 +68,9 @@ class TelegramNotifier:
         self.cfg = config
         self.bot_token = os.environ.get("KRONOS_TELEGRAM_BOT_TOKEN", "").strip()
         self.chat_id = os.environ.get("KRONOS_TELEGRAM_CHAT_ID", "").strip()
+        # message-hash -> monotonic time of last successful send / count
+        self._last_sent: Dict[str, float] = {}
+        self._suppressed: Dict[str, int] = {}
 
     @property
     def enabled(self) -> bool:
@@ -63,32 +78,84 @@ class TelegramNotifier:
         cfg_on = bool(notif_cfg.get("enabled", False)) if notif_cfg else False
         return cfg_on and bool(self.bot_token) and bool(self.chat_id)
 
-    def send(self, text: str) -> bool:
-        """Best-effort send. Returns True on success, never raises."""
+    def send(self, text: str, dedupe: bool = True) -> bool:
+        """Best-effort send. Returns True on success, never raises.
+
+        DEDUPLICATION AND RETRY, both added by audit.
+
+        Before: `send()` posted once and returned False on any failure.
+        Two consequences, and the second is worse than the first.
+
+        1. SPAM. A data-fetch failure inside a loop produced one Telegram
+           message per occurrence. Telegram then rate-limits, and the
+           alerts most worth reading are the ones dropped - because a
+           storm is exactly when something is wrong.
+        2. SILENT LOSS. An HTTP 429 or a 5xx was logged at WARNING and
+           discarded. The primary human interface for a system that
+           trades unattended must not drop a critical alert because the
+           first attempt was throttled.
+
+        Identical messages inside DEDUPE_WINDOW_SECONDS are suppressed
+        (counted, and the count is reported when the window closes), and
+        429/5xx get one bounded retry. Pass `dedupe=False` for a message
+        that must always go out, such as a daily report.
+        """
         if not self.enabled:
             logger.debug("[notifier] disabled or unconfigured - skipping send")
             return False
         text = text[:MAX_MESSAGE_CHARS]
-        try:
-            import requests
-            url = f"{TELEGRAM_API_BASE}/bot{self.bot_token}/sendMessage"
-            resp = requests.post(
-                url,
-                json={"chat_id": self.chat_id, "text": text},
-                timeout=15,
-            )
-            ok = resp.status_code == 200
-            if ok:
-                logger.info("[notifier] Telegram report sent")
-            else:
-                logger.warning(
-                    "[notifier] Telegram send returned status %d: %s",
-                    resp.status_code, resp.text[:200],
+
+        if dedupe:
+            now = time.monotonic()
+            key = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            last = self._last_sent.get(key)
+            if last is not None and (now - last) < DEDUPE_WINDOW_SECONDS:
+                self._suppressed[key] = self._suppressed.get(key, 0) + 1
+                logger.debug("[notifier] suppressed duplicate (%d in window)",
+                             self._suppressed[key])
+                return False
+            repeats = self._suppressed.pop(key, 0)
+            if repeats:
+                text = (f"{text}\n\n(+{repeats} identical alert(s) suppressed "
+                        f"in the last {DEDUPE_WINDOW_SECONDS // 60}m)")[:MAX_MESSAGE_CHARS]
+            self._last_sent[key] = now
+            self._prune_dedupe_state(now)
+
+        url = f"{TELEGRAM_API_BASE}/bot{self.bot_token}/sendMessage"
+        for attempt in range(SEND_ATTEMPTS):
+            try:
+                import requests
+                resp = requests.post(
+                    url,
+                    json={"chat_id": self.chat_id, "text": text},
+                    timeout=15,
                 )
-            return ok
-        except Exception as e:
-            logger.warning("[notifier] Telegram send failed: %s", e)
-            return False
+                if resp.status_code == 200:
+                    logger.info("[notifier] Telegram report sent")
+                    return True
+                retryable = resp.status_code == 429 or resp.status_code >= 500
+                logger.warning(
+                    "[notifier] Telegram send returned status %d: %s%s",
+                    resp.status_code, resp.text[:200],
+                    " (retrying)" if retryable and attempt < SEND_ATTEMPTS - 1 else "",
+                )
+                if not retryable:
+                    return False
+            except Exception as e:
+                logger.warning("[notifier] Telegram send failed: %s", e,
+                               exc_info=True)
+            if attempt < SEND_ATTEMPTS - 1:
+                time.sleep(RETRY_BACKOFF_SECONDS * (2 ** attempt))
+        return False
+
+    def _prune_dedupe_state(self, now: float) -> None:
+        """Keep the dedupe map from growing without bound in a process
+        that runs for 365 days."""
+        stale = [k for k, t in self._last_sent.items()
+                 if now - t > DEDUPE_WINDOW_SECONDS * 4]
+        for k in stale:
+            self._last_sent.pop(k, None)
+            self._suppressed.pop(k, None)
 
     # -- report formatting ---------------------------------------------
 

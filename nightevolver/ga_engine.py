@@ -50,13 +50,13 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
 from nightevolver.data_loader import MarketData
 from nightevolver.genome import (
-    DecodedStrategy, GENOME_LENGTH, crossover, decode, mutate, random_genome,
+    DecodedStrategy, crossover, decode, mutate, random_genome,
     score_matrix,
 )
 
@@ -199,7 +199,7 @@ class BacktestStats:
 
 
 def simulate(md: MarketData, strat: DecodedStrategy, cost_bps: float = 22.0,
-             max_position: float = 0.10) -> BacktestStats:
+             max_position: float = 0.10, long_only: bool = True) -> BacktestStats:
     """Run one decoded strategy over a MarketData window.
 
     Vectorised across ASSETS, looped over TIME. The time loop is not
@@ -214,6 +214,23 @@ def simulate(md: MarketData, strat: DecodedStrategy, cost_bps: float = 22.0,
     information enters the decision.
     """
     scores = score_matrix(md.indicators, strat)       # [T, A]
+
+    # LONG-ONLY BY DEFAULT, because that is what the venue permits.
+    #
+    # This simulator previously opened negative positions and held them
+    # for up to hold_days (now 90). In the NSE **cash** segment under CNC
+    # (delivery) a short cannot be carried overnight - it must be squared
+    # off the same session or it goes to auction. Roughly half the
+    # opportunity set every prior backtest measured was therefore
+    # unimplementable, and every Sharpe and profit factor produced from
+    # it was optimistic by an unquantified amount.
+    #
+    # Suppressing the score rather than clipping the position is
+    # deliberate: a bearish signal should mean "do not hold", not "hold
+    # a smaller long".
+    if long_only:
+        scores = np.maximum(scores, 0.0)
+
     fwd = md.forward_returns                          # [T, A]
     close = md.close
     T, A = scores.shape

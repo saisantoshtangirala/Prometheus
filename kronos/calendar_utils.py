@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import logging
 from datetime import date as ddate, timedelta
-from typing import Dict, Set
+from typing import Dict, Optional, Set
 
 logger = logging.getLogger("kronos.calendar_utils")
 
@@ -132,7 +132,36 @@ NSE_HOLIDAYS_BY_YEAR: Dict[int, Set[ddate]] = {
         ddate(2026, 11, 24),   # Guru Nanak Jayanti
         ddate(2026, 12, 25),   # Christmas
     },
+    # 2027. Dates that follow the Gregorian calendar (Republic Day,
+    # Ambedkar Jayanti, Maharashtra Day, Gandhi Jayanti, Christmas) are
+    # exact. The lunar/luni-solar festivals are the published-in-advance
+    # estimates and NSE confirms them by circular each December, so treat
+    # them as a best-effort cache and re-check against NSE's official
+    # 2027 list when it publishes. Weekend dates are omitted - they are
+    # already non-trading days.
+    2027: {
+        ddate(2027, 1, 26),    # Republic Day (Tue)
+        ddate(2027, 3, 22),    # Holi (Mon)
+        ddate(2027, 3, 26),    # Good Friday (Fri)
+        ddate(2027, 4, 14),    # Dr. Baba Saheb Ambedkar Jayanti (Wed)
+        ddate(2027, 4, 15),    # Ram Navami (Thu)
+        ddate(2027, 4, 19),    # Mahavir Jayanti (Mon)
+        ddate(2027, 5, 17),    # Bakri Id (Mon)
+        ddate(2027, 6, 15),    # Muharram (Tue)
+        ddate(2027, 9, 3),     # Ganesh Chaturthi (Fri)
+        ddate(2027, 10, 8),    # Dussehra (Fri)
+        ddate(2027, 10, 29),   # Diwali - Balipratipada (Fri)
+        ddate(2027, 11, 12),   # Guru Nanak Jayanti (Fri)
+    },
 }
+
+# How far ahead the table must remain populated. The failure this guards
+# against: the table held 2026 ONLY, so from 2027-01-01 every festival
+# holiday would have been treated as a trading day - the scheduler would
+# have provisioned RunPod pods on closed days and the orchestrator would
+# have expected market data that did not exist. It warned, but only into
+# a log nobody reads daily.
+NSE_CALENDAR_WARN_DAYS = 90
 
 _warned_missing_nse_years: Set[int] = set()
 
@@ -150,6 +179,29 @@ def nse_holidays(year: int) -> Set[ddate]:
             _warned_missing_nse_years.add(year)
         return set()
     return holidays
+
+
+def nse_calendar_coverage_gap(today: Optional[ddate] = None,
+                              horizon_days: int = NSE_CALENDAR_WARN_DAYS
+                              ) -> Optional[str]:
+    """Returns a message if the holiday table runs out within
+    `horizon_days`, else None.
+
+    Exists so calendar expiry is an ACTIONABLE signal - surfaced in the
+    daily report and assertable in CI - rather than a warning logged once
+    per process into a file nobody tails. Call it from the daily report
+    path and from a test.
+    """
+    today = today or ddate.today()
+    horizon = today + timedelta(days=horizon_days)
+    missing = sorted({y for y in (today.year, horizon.year)
+                      if y not in NSE_HOLIDAYS_BY_YEAR})
+    if not missing:
+        return None
+    return (f"NSE holiday table has no entry for {', '.join(map(str, missing))} "
+            f"(checked {today} .. {horizon}). Without it every festival "
+            f"holiday in those years is treated as a trading day. Update "
+            f"NSE_HOLIDAYS_BY_YEAR in kronos/calendar_utils.py.")
 
 
 def is_nse_trading_day(d: ddate) -> bool:

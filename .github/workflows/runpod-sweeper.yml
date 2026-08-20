@@ -1,0 +1,125 @@
+name: Sweep orphaned RunPod pods
+
+# THE BACKSTOP THAT SURVIVES A LOST RUNNER.
+#
+# train-runpod.yml terminates its own pod with `if: always()`, which
+# covers ordinary failure and cancellation. It does NOT cover:
+#
+#   - the GitHub runner itself dying (no step runs, including always())
+#   - a pod created between the POST and the moment its id is published
+#     (narrowed by writing pod_id inside the create loop, not eliminated)
+#   - a DELETE that returns non-2xx and is only echoed as an error
+#
+# In every one of those cases a GPU bills until a human notices. This
+# workflow is the thing that notices. It runs hourly, lists pods, and
+# deletes any `kronos-ci-*` older than the training job's own
+# timeout-minutes (240) - old enough that no legitimate run could still
+# be using it.
+#
+# Pods are named `kronos-ci-${{ github.run_id }}` by the training
+# workflow, which is what makes them identifiable here.
+
+permissions:
+  contents: read
+
+on:
+  schedule:
+    - cron: "17 * * * *"      # hourly, off the hour to avoid API rush
+  workflow_dispatch:
+    inputs:
+      max_age_minutes:
+        description: "delete kronos-ci pods older than this many minutes"
+        required: false
+        default: "240"
+        type: string
+      dry_run:
+        description: "list what would be deleted without deleting"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+
+env:
+  RUNPOD_API: https://rest.runpod.io/v1
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Find and terminate orphaned pods
+        env:
+          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+          MAX_AGE_MINUTES: ${{ github.event.inputs.max_age_minutes || '240' }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+        run: |
+          set -euo pipefail
+
+          RESPONSE=$(curl -sS --max-time 60 "$RUNPOD_API/pods" \
+            -H "Authorization: Bearer $RUNPOD_API_KEY")
+
+          if ! echo "$RESPONSE" | jq -e . >/dev/null 2>&1; then
+            echo "::error::GET /pods returned unparseable JSON - cannot sweep."
+            echo "$RESPONSE" | head -c 400
+            exit 1
+          fi
+
+          # The list endpoint has returned either a bare array or an
+          # object with a data/pods key across API revisions; accept any.
+          PODS=$(echo "$RESPONSE" | jq -c '
+            (if type == "array" then . else (.data // .pods // []) end)
+            | map(select(.name != null and (.name | startswith("kronos-ci-"))))')
+
+          TOTAL=$(echo "$PODS" | jq 'length')
+          echo "Found $TOTAL kronos-ci pod(s)."
+          if [ "$TOTAL" = "0" ]; then
+            echo "Nothing to sweep."
+            exit 0
+          fi
+
+          NOW=$(date -u +%s)
+          CUTOFF=$(( MAX_AGE_MINUTES * 60 ))
+          KILLED=0
+          FAILED=0
+
+          # createdAt is ISO-8601; a pod with no parseable timestamp is
+          # treated as OLD rather than skipped. An unsweepable orphan is
+          # the failure mode this workflow exists to prevent, so the
+          # ambiguous case errs toward deleting.
+          while IFS=$'\t' read -r ID NAME CREATED; do
+            [ -z "$ID" ] && continue
+            AGE="unknown"
+            if [ -n "$CREATED" ] && [ "$CREATED" != "null" ]; then
+              if CREATED_S=$(date -u -d "$CREATED" +%s 2>/dev/null); then
+                AGE=$(( (NOW - CREATED_S) / 60 ))
+                if [ "$AGE" -lt "$MAX_AGE_MINUTES" ]; then
+                  echo "  keep   $NAME ($ID) - ${AGE}m old, under ${MAX_AGE_MINUTES}m"
+                  continue
+                fi
+              fi
+            fi
+
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "  DRY    $NAME ($ID) - ${AGE}m old, would delete"
+              continue
+            fi
+
+            echo "::warning::Sweeping orphaned pod $NAME ($ID), ${AGE}m old."
+            CODE=$(curl -sS --max-time 60 -X DELETE "$RUNPOD_API/pods/$ID" \
+              -H "Authorization: Bearer $RUNPOD_API_KEY" \
+              -o /dev/null -w "%{http_code}" || echo "000")
+            if [ "$CODE" -ge 200 ] && [ "$CODE" -lt 300 ]; then
+              KILLED=$(( KILLED + 1 ))
+              echo "    terminated (HTTP $CODE)"
+            else
+              FAILED=$(( FAILED + 1 ))
+              echo "::error::DELETE $ID returned HTTP $CODE - pod may STILL BE BILLING."
+            fi
+          done < <(echo "$PODS" | jq -r '.[] | [.id, .name, (.createdAt // "")] | @tsv')
+
+          echo "Swept: $KILLED terminated, $FAILED failed."
+          # A failed DELETE means a GPU is still running. Fail the job so
+          # it surfaces as a red run rather than a line in a green log.
+          if [ "$FAILED" -gt 0 ]; then
+            exit 1
+          fi
