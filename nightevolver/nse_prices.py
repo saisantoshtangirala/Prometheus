@@ -184,6 +184,7 @@ def build_adjusted_frames(days: Dict[pd.Timestamp, pd.DataFrame],
                           tickers: Sequence[str],
                           corporate_actions=None,
                           require_actions: bool = True,
+                          min_coverage: float = 0.90,
                           ) -> Tuple[pd.DataFrame, pd.DataFrame,
                                      pd.DataFrame, pd.DataFrame]:
     """Return (close, high, low, volume) with a corporate-action-adjusted
@@ -240,7 +241,28 @@ def build_adjusted_frames(days: Dict[pd.Timestamp, pd.DataFrame],
     adj_high = raw_high * scale
     adj_low = raw_low * scale
 
+    # Drop THIN SYMBOLS BEFORE dropping dates. The row filter below
+    # requires every column to be present, so with a large universe a
+    # single late-listed or long-suspended name would delete that date
+    # for all the others - at 50 names one bad symbol can cost most of
+    # the panel. Dropping the symbol costs one column; dropping the
+    # dates costs the whole study.
+    coverage = raw_close.notna().mean()
+    thin = coverage[coverage < min_coverage].index.tolist()
+    if thin:
+        logger.warning("[prices] dropping %d symbol(s) below %.0f%% coverage: %s",
+                       len(thin), min_coverage * 100,
+                       ", ".join(f"{s}({coverage[s]:.0%})" for s in thin[:10]))
+        adj_close = adj_close.drop(columns=thin)
+        adj_high = adj_high.drop(columns=thin)
+        adj_low = adj_low.drop(columns=thin)
+        raw_vol = raw_vol.drop(columns=thin)
+    if adj_close.shape[1] == 0:
+        raise RuntimeError("every symbol fell below the coverage threshold")
+
     keep = adj_close.notna().all(axis=1)
+    logger.info("[prices] %d/%d symbols kept, %d/%d dates complete",
+                adj_close.shape[1], len(cols), int(keep.sum()), len(keep))
     return (adj_close[keep], adj_high[keep], adj_low[keep],
             raw_vol[keep].fillna(0.0))
 
@@ -297,7 +319,8 @@ def top_liquid_symbols(as_of: str, n: int = 50, use_cache: bool = True,
 
 def fetch_nse_prices(tickers: Sequence[str], start: str, end: Optional[str] = None,
                      max_workers: int = 6, use_cache: bool = True,
-                     require_actions: bool = True, with_flows: bool = False):
+                     require_actions: bool = True, with_flows: bool = False,
+                     min_coverage: float = 0.90):
     """Convenience: bhavcopy -> MarketData, bypassing yfinance entirely.
 
     `tickers` are NSE symbols WITHOUT the .NS suffix (RELIANCE, not
@@ -312,7 +335,7 @@ def fetch_nse_prices(tickers: Sequence[str], start: str, end: Optional[str] = No
     if not days:
         raise RuntimeError("no bhavcopy sessions retrieved")
     close, high, low, vol = build_adjusted_frames(
-        days, syms, require_actions=require_actions)
+        days, syms, require_actions=require_actions, min_coverage=min_coverage)
     logger.info("[prices] %d bars x %d tickers (%s .. %s)", len(close),
                 close.shape[1], close.index[0].date(), close.index[-1].date())
 
