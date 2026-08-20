@@ -1,0 +1,203 @@
+name: Install Kite credentials on Hetzner
+
+# Writes the Kite auth file and the daily-refresh cron onto the execution
+# box, using GitHub repo secrets as the source. Manual dispatch only -
+# this handles full account credentials and must never fire on a push or
+# a schedule.
+#
+# WHY THIS WORKFLOW EXISTS
+# Setting up unattended login needs the Zerodha password, the TOTP seed
+# and api_secret. Sending those through a chat window or a terminal
+# transcript puts complete account control - orders, funds, everything -
+# into a log that outlives the session. GitHub secrets are encrypted at
+# rest, masked in job output, and never reach the repository, so this is
+# the one place they can pass through without leaving a copy behind.
+#
+# REQUIRED REPO SECRETS
+#   Settings -> Secrets and variables -> Actions -> New repository secret
+#
+#     KITE_API_KEY       the Connect app's API key
+#     KITE_API_SECRET    the Connect app's secret
+#     KITE_USER_ID       Zerodha client id, e.g. AB1234
+#     KITE_PASSWORD      Zerodha login password
+#     KITE_TOTP_SECRET   the BASE32 SEED from the authenticator setup
+#                        screen - NOT a 6-digit code
+#
+#   (HETZNER_HOST / HETZNER_USER / HETZNER_SSH_KEY already exist.)
+#
+# WHAT IT LEAVES ON THE BOX
+#   /etc/nightevolver/kite_auth.env   mode 600, the five values above
+#   /etc/nightevolver/kite.env        mode 600, refreshed key + token
+#   a weekday cron at 03:05 UTC (08:35 IST) running --check
+#
+# SECURITY NOTE, once. Storing the TOTP seed beside the password means
+# the second factor no longer protects against anyone who can read those
+# files. Treat host compromise as account compromise, and keep the
+# RiskGuard limits conservative - the file-backed halt and
+# max_daily_loss_pct are the controls that still bite in that case.
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "install = write credentials + cron; verify = test the existing setup without touching it"
+        required: true
+        default: "verify"
+        type: choice
+        options: [verify, install]
+      install_cron:
+        description: "install the daily refresh cron (install action only)"
+        required: false
+        default: "true"
+        type: choice
+        options: ["true", "false"]
+
+permissions:
+  contents: read
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check the required secrets are present
+        env:
+          K: ${{ secrets.KITE_API_KEY }}
+          S: ${{ secrets.KITE_API_SECRET }}
+          U: ${{ secrets.KITE_USER_ID }}
+          P: ${{ secrets.KITE_PASSWORD }}
+          T: ${{ secrets.KITE_TOTP_SECRET }}
+        run: |
+          set -euo pipefail
+          MISSING=""
+          [ -z "$K" ] && MISSING="$MISSING KITE_API_KEY"
+          [ -z "$S" ] && MISSING="$MISSING KITE_API_SECRET"
+          [ -z "$U" ] && MISSING="$MISSING KITE_USER_ID"
+          [ -z "$P" ] && MISSING="$MISSING KITE_PASSWORD"
+          [ -z "$T" ] && MISSING="$MISSING KITE_TOTP_SECRET"
+          if [ -n "$MISSING" ]; then
+            echo "::error::Missing repo secret(s):$MISSING"
+            echo "::error::Add them under Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+          # Catch the likeliest paste error before it reaches the box: the
+          # 6-digit CODE from the phone instead of the base32 SEED from the
+          # setup screen. Length alone separates them cleanly.
+          if [ "${#T}" -lt 16 ]; then
+            echo "::error::KITE_TOTP_SECRET looks like a 6-digit code (length ${#T})."
+            echo "::error::It must be the BASE32 SEED shown when you enabled the"
+            echo "::error::authenticator - the long string, not the rotating code."
+            exit 1
+          fi
+          echo "All five secrets present. TOTP seed length ${#T} - plausible."
+
+      - name: Load Hetzner deploy key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.HETZNER_SSH_KEY }}
+
+      - name: Trust Hetzner host key
+        run: ssh-keyscan -H "${{ secrets.HETZNER_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Pull the code the refresh script lives in
+        run: |
+          set -euo pipefail
+          ssh "${{ secrets.HETZNER_USER }}@${{ secrets.HETZNER_HOST }}" '
+            set -euo pipefail
+            cd /opt/prometheus
+            git fetch origin claude/prometheus-causal-market-ol2pau
+            git reset --hard origin/claude/prometheus-causal-market-ol2pau
+            test -f scripts/kite_auto_login.py \
+              || { echo "kite_auto_login.py missing after pull"; exit 1; }
+            echo "code up to date"
+          '
+
+      - name: Write the credentials file
+        if: github.event.inputs.action == 'install'
+        env:
+          K: ${{ secrets.KITE_API_KEY }}
+          S: ${{ secrets.KITE_API_SECRET }}
+          U: ${{ secrets.KITE_USER_ID }}
+          P: ${{ secrets.KITE_PASSWORD }}
+          T: ${{ secrets.KITE_TOTP_SECRET }}
+        run: |
+          set -euo pipefail
+          # Piped over STDIN, never as ssh arguments - an argument would
+          # appear in the remote process list while the command runs.
+          # `umask 077` before the write means the file is never briefly
+          # world-readable between creation and chmod.
+          printf 'KITE_API_KEY=%s\nKITE_API_SECRET=%s\nKITE_USER_ID=%s\nKITE_PASSWORD=%s\nKITE_TOTP_SECRET=%s\n' \
+            "$K" "$S" "$U" "$P" "$T" \
+          | ssh "${{ secrets.HETZNER_USER }}@${{ secrets.HETZNER_HOST }}" '
+              set -euo pipefail
+              sudo install -d -m 755 /etc/nightevolver
+              umask 077
+              sudo tee /etc/nightevolver/kite_auth.env >/dev/null
+              sudo chmod 600 /etc/nightevolver/kite_auth.env
+              sudo chown root:root /etc/nightevolver/kite_auth.env
+            '
+          echo "credentials written"
+
+      - name: Verify file permissions
+        run: |
+          set -euo pipefail
+          # Reports the MODE only. Never the contents.
+          ssh "${{ secrets.HETZNER_USER }}@${{ secrets.HETZNER_HOST }}" '
+            set -euo pipefail
+            for f in /etc/nightevolver/kite_auth.env; do
+              if [ ! -f "$f" ]; then
+                echo "::error::$f does not exist - run this workflow with action=install"
+                exit 1
+              fi
+              MODE=$(stat -c "%a %U:%G" "$f")
+              echo "$f -> $MODE"
+              [ "$(stat -c %a "$f")" = "600" ] \
+                || { echo "::error::$f is not mode 600"; exit 1; }
+            done
+          '
+
+      - name: Refresh the token and prove it works
+        id: refresh
+        run: |
+          set -euo pipefail
+          # --check validates any existing token first and only logs in
+          # when it is genuinely stale, so re-running this workflow does
+          # not burn logins against Zerodha rate limits.
+          ssh "${{ secrets.HETZNER_USER }}@${{ secrets.HETZNER_HOST }}" '
+            set -euo pipefail
+            cd /opt/prometheus
+            source .venv/bin/activate 2>/dev/null || true
+            python scripts/kite_auto_login.py --check 2>&1 | grep -v -i "token\|secret\|password" || true
+            test -f /etc/nightevolver/kite.env \
+              || { echo "no token file produced"; exit 1; }
+            [ "$(stat -c %a /etc/nightevolver/kite.env)" = "600" ] \
+              || { echo "token file is not mode 600"; exit 1; }
+            echo "token file present, mode 600"
+          '
+
+      - name: Install the daily refresh cron
+        if: github.event.inputs.action == 'install' && github.event.inputs.install_cron == 'true'
+        run: |
+          set -euo pipefail
+          # 03:05 UTC = 08:35 IST, ~40 minutes before the NSE open, and
+          # after Zerodha's overnight token expiry has taken effect.
+          ssh "${{ secrets.HETZNER_USER }}@${{ secrets.HETZNER_HOST }}" '
+            set -euo pipefail
+            LINE="5 3 * * 1-5 cd /opt/prometheus && ./.venv/bin/python scripts/kite_auto_login.py --check >> /var/log/kite-refresh.log 2>&1"
+            ( sudo crontab -l 2>/dev/null | grep -v "kite_auto_login.py" ; echo "$LINE" ) \
+              | sudo crontab -
+            echo "cron installed:"
+            sudo crontab -l | grep kite_auto_login.py
+          '
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "### Kite auth setup" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- action: \`${{ github.event.inputs.action }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- credentials file: \`/etc/nightevolver/kite_auth.env\` (mode 600)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- token file: \`/etc/nightevolver/kite.env\` (mode 600)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- refresh: weekdays 03:05 UTC / 08:35 IST" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "No secret value is printed by any step in this workflow." >> "$GITHUB_STEP_SUMMARY"
