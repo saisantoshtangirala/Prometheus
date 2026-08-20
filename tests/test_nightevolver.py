@@ -58,13 +58,24 @@ class TestGenome:
         a, b = decode(g), decode(g)
         assert np.array_equal(a.indicator_weights, b.indicator_weights)
         assert a.indicator_weights.sum() == pytest.approx(1.0)
-        assert 2 <= a.hold_days <= 60
+        assert 5 <= a.hold_days <= 90
         assert 0.02 <= a.trailing_stop <= 0.20
         assert 0.0 <= a.kelly_fraction <= 1.0
+        assert 0.0 <= a.vol_target <= 0.30
+
+    def test_hold_floor_excludes_the_horizons_costs_close_off(self):
+        """A 1-day hold needs rho=0.342 against forward returns just to
+        clear 22bp; the best measured directional feature was rho=0.035.
+        Those horizons are arithmetically closed and must not be in the
+        search space, where the GA would only find noise in them."""
+        rng = np.random.default_rng(3)
+        for _ in range(200):
+            assert decode(random_genome(rng)).hold_days >= 5
 
     def test_genome_length_matches_indicator_count(self):
-        """Guards the layout: 3 per-indicator blocks + 5 scalars."""
-        assert GENOME_LENGTH == 3 * N_INDICATORS + 5
+        """Guards the layout: 3 per-indicator blocks + 6 scalars
+        (hold, trailing stop, kelly, regime, conviction, vol_target)."""
+        assert GENOME_LENGTH == 3 * N_INDICATORS + 6
         assert len(INDICATOR_NAMES) == N_INDICATORS
 
     def test_wrong_length_genome_is_rejected(self):
@@ -242,11 +253,112 @@ class TestGAEngine:
                                 win_rate=0.60, n_trades=50, avg_turnover=0.1)
         assert fitness(deep_dd) < fitness(good) * 0.5
 
-    def test_no_trades_scores_zero_not_negative(self):
-        """With no edge, not trading IS optimal after 22bp. The fitness
-        function must be allowed to say so rather than forced to bet."""
+    def test_abstention_beats_losing_but_does_not_beat_winning(self):
+        """With no edge, not trading IS better than trading badly, so
+        abstention must outrank a loser. But it must NOT be exactly 0.0:
+        that used to beat every negative score, making never-trading the
+        global optimum the moment a search started failing. Measured: 3
+        of 8 seeds abstained and their 0.00s pulled an arm's mean from
+        -1.45 up to -0.90, making the worse arm look better."""
+        from nightevolver.ga_engine import ABSTENTION_FITNESS, BacktestStats
+        none = BacktestStats(0.0, 0.0, 0.0, 0.0, 0, 0.0)
+        loser = BacktestStats(-1.5, -0.1, 0.08, 0.30, 60, 0.1)
+        winner = BacktestStats(1.5, 0.2, 0.05, 0.55, 60, 0.1)
+        assert fitness(none) == ABSTENTION_FITNESS
+        assert ABSTENTION_FITNESS < 0.0, "0.0 would dominate every negative"
+        assert fitness(loser) < fitness(none) < fitness(winner)
+        assert none.abstained and not loser.abstained
+
+    def test_vol_targeting_matches_an_explicit_rolling_std(self):
+        """The forecast is a vectorised rolling std. The readable version
+        is a Python loop over T, but vol_hat depends only on prices, not
+        the strategy, so that loop would re-run identically for all ~1050
+        evaluations in one GA run. Pin the two against each other."""
+        import pandas as pd
+
+        from nightevolver.ga_engine import TRADING_DAYS, VOL_LOOKBACK
+        close = _random_walk(300, 5, seed=21)
+        md = build_market_data(close)
+        c = md.close
+        rets = np.zeros_like(c)
+        rets[1:] = c[1:] / c[:-1] - 1.0
+
+        loop = np.full(c.shape, np.nan)
+        for t in range(VOL_LOOKBACK - 1, len(c)):
+            loop[t] = rets[t - VOL_LOOKBACK + 1:t + 1].std(axis=0, ddof=1) \
+                * np.sqrt(TRADING_DAYS)
+        vec = (pd.DataFrame(rets).rolling(VOL_LOOKBACK, min_periods=VOL_LOOKBACK)
+               .std(ddof=1).to_numpy() * np.sqrt(TRADING_DAYS))
+        m = np.isfinite(loop) & np.isfinite(vec)
+        assert m.sum() > 1000
+        np.testing.assert_allclose(loop[m], vec[m], atol=1e-12)
+
+    def test_vol_targeting_does_not_look_ahead(self):
+        """Sizing at t may use returns up to t and no further."""
+        close = _random_walk(300, 4, seed=22)
+        g = random_genome(np.random.default_rng(5))
+        from nightevolver.genome import IDX_VOL_TARGET
+        g[IDX_VOL_TARGET] = 0.8                       # force vol targeting on
+        strat = decode(g)
+        assert strat.vol_target > 0.0
+
+        cut_raw = 220
+        a = simulate(build_market_data(close), strat)
+        c2 = close.copy()
+        c2.iloc[cut_raw:] *= 2.0
+        b = simulate(build_market_data(c2), strat)
+
+        # Index mapping matters here and is easy to get wrong.
+        # build_market_data drops WARMUP_BARS rows, so raw bar `cut_raw`
+        # is md row cut_raw - WARMUP_BARS. And the row BEFORE that also
+        # changes legitimately: its forward_return spans into the mutated
+        # bar. That is the target moving, not a feature looking ahead.
+        safe = cut_raw - WARMUP_BARS - 1
+        assert safe > 50
+        np.testing.assert_allclose(a.daily_returns[:safe], b.daily_returns[:safe],
+                                   atol=1e-10)
+        assert not np.allclose(a.daily_returns[safe:], b.daily_returns[safe:]), \
+            "mutating the future changed nothing - the sizing is inert"
+
+    def test_vol_scale_is_capped(self):
+        """An unclamped target/estimate ratio diverges as the estimate
+        goes to zero - which is what a halted or stale name produces."""
+        from nightevolver.ga_engine import VOL_SCALE_CAP
+        assert VOL_SCALE_CAP < np.inf and VOL_SCALE_CAP > 1.0
+        flat = _random_walk(300, 3, seed=23)
+        flat.iloc[:] = 100.0                          # zero volatility
+        g = random_genome(np.random.default_rng(6))
+        from nightevolver.genome import IDX_VOL_TARGET
+        g[IDX_VOL_TARGET] = 1.0
+        stats = simulate(build_market_data(flat), decode(g), max_position=0.10)
+        assert np.isfinite(stats.sharpe)
+        assert np.all(np.abs(stats.daily_returns) < 1.0)
+
+    def test_profit_factor_reflects_asymmetric_payoffs(self):
+        """The number win rate cannot show: few big wins beating many
+        small losses."""
         from nightevolver.ga_engine import BacktestStats
-        assert fitness(BacktestStats(0.0, 0.0, 0.0, 0.0, 0, 0.0)) == 0.0
+        s = BacktestStats(0.0, 0.0, 0.0, 0.0, 0, 0.0)
+        assert s.profit_factor == 0.0                 # default, no trades
+
+    def test_fitness_ignores_win_rate(self):
+        """Win rate is not the objective. Break-even at a 1-day hold is
+        61.1% after 22bp, so the old WinRate/0.5 multiplier optimised
+        hard for a number that loses money at the value being targeted -
+        and it scored a 45%/2:1 strategy at 0.90x against a 60%/1:1
+        loser at 1.20x. Sharpe already prices asymmetry."""
+        from nightevolver.ga_engine import BacktestStats
+        low_wr = BacktestStats(1.2, 0.15, 0.06, 0.45, 60, 0.1)
+        high_wr = BacktestStats(1.2, 0.15, 0.06, 0.65, 60, 0.1)
+        assert fitness(low_wr) == pytest.approx(fitness(high_wr))
+
+    def test_few_trades_are_shrunk_toward_zero(self):
+        """The measured artefact was an out-of-sample Sharpe of +1.18 on
+        THREE trades. It must not outrank a real track record."""
+        from nightevolver.ga_engine import BacktestStats
+        lucky = BacktestStats(1.18, 0.02, 0.02, 0.667, 3, 0.02)
+        real = BacktestStats(0.60, 0.10, 0.05, 0.52, 120, 0.1)
+        assert fitness(lucky) < fitness(real)
 
     def test_ga_improves_fitness_over_generations(self):
         """Sanity: selection pressure must actually select."""

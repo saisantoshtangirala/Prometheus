@@ -65,9 +65,35 @@ logger = logging.getLogger("nightevolver.ga")
 TRADING_DAYS = 252
 
 # Fitness penalty gates, from the spec.
-MIN_WIN_RATE = 0.40
+# MIN_WIN_RATE is deliberately gone - see fitness(). Win rate is not the
+# objective and gating on it penalised asymmetric-payoff strategies,
+# which are the ones that actually clear costs.
 MAX_DRAWDOWN = 0.20
 PENALTY_MULTIPLIER = 0.1
+
+# Evidence shrinkage: a strategy keeps n/(n+K) of its score. K=20 means
+# 3 trades keep 13%, 20 keep 50%, 100 keep 83%. Chosen so the measured
+# artefact (Sharpe +1.18 on three trades) cannot win a tournament
+# against a strategy with a real track record.
+TRADE_SHRINKAGE_K = 20.0
+
+# Vol targeting: trailing window for the forecast, and a cap on the
+# resulting size multiplier. The cap matters - an unclamped
+# target/estimate ratio goes to infinity as the estimate goes to zero,
+# which is exactly what a halted or stale name produces.
+VOL_LOOKBACK = 20
+VOL_SCALE_CAP = 3.0
+
+# Below this many out-of-sample trades, a Sharpe is not a measurement
+# and the summary says so out loud.
+MIN_TRADES_FOR_A_CLAIM = 20
+
+# Not exactly 0.0. Zero used to beat every negative score, which made
+# never-trading the global optimum as soon as a search started failing -
+# measured: 3 of 8 seeds abstained and their 0.00s pulled an arm's mean
+# ABOVE the arm that actually traded. Small and negative keeps
+# abstention better than losing without letting it dominate.
+ABSTENTION_FITNESS = -0.05
 
 
 @dataclass
@@ -105,6 +131,18 @@ class BacktestStats:
     n_trades: int
     avg_turnover: float
     daily_returns: np.ndarray = field(repr=False, default_factory=lambda: np.zeros(0))
+    profit_factor: float = 0.0
+
+    @property
+    def abstained(self) -> bool:
+        """No trades placed. Distinct from 'traded and made nothing'.
+
+        These were conflated: a zero-trade run reported Sharpe 0.00 and
+        got averaged in with real results, which pulled one arm's mean
+        from -1.45 to -0.90 and made it look like the better arm. Any
+        reporting path must branch on this rather than on sharpe == 0.
+        """
+        return self.n_trades == 0
 
 
 def simulate(md: MarketData, strat: DecodedStrategy, cost_bps: float = 22.0,
@@ -126,6 +164,25 @@ def simulate(md: MarketData, strat: DecodedStrategy, cost_bps: float = 22.0,
     fwd = md.forward_returns                          # [T, A]
     close = md.close
     T, A = scores.shape
+
+    # Trailing realised volatility, annualised, for vol targeting.
+    # CAUSAL: vol_hat[t] uses returns up to and including t, and is used
+    # to size the position held over t -> t+1. Row 0 has no history, so
+    # it falls back to the target itself (a neutral 1.0x multiplier).
+    vol_hat = None
+    if strat.vol_target > 0.0:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            rets = np.zeros_like(close)
+            rets[1:] = close[1:] / np.maximum(close[:-1], 1e-12) - 1.0
+        # Vectorised rolling std. The obvious version is a Python loop
+        # over T, but vol_hat depends only on PRICES, not on the strategy
+        # - so that loop would re-run identically for all ~1050
+        # evaluations in a single GA run. pandas' rolling is C-level and
+        # numerically careful, and this is called once per simulate().
+        import pandas as pd
+        sd = (pd.DataFrame(rets).rolling(VOL_LOOKBACK, min_periods=VOL_LOOKBACK)
+              .std(ddof=1).to_numpy() * np.sqrt(TRADING_DAYS))
+        vol_hat = np.where(np.isfinite(sd) & (sd > 1e-6), sd, strat.vol_target)
 
     pos = np.zeros(A)               # signed position weight per asset
     entry_px = np.zeros(A)
@@ -168,8 +225,17 @@ def simulate(md: MarketData, strat: DecodedStrategy, cost_bps: float = 22.0,
         flat = pos == 0.0
         want = flat & (np.abs(scores[t]) > strat.conviction_floor)
         if want.any():
-            size = np.clip(np.abs(scores[t][want]) * strat.kelly_fraction,
-                           0.0, max_position)
+            size = np.abs(scores[t][want]) * strat.kelly_fraction
+            if vol_hat is not None:
+                # Scale toward a constant risk contribution: a quiet name
+                # gets more capital than a wild one for equal conviction.
+                # Capped at VOL_SCALE_CAP so a near-zero vol estimate
+                # cannot demand an enormous position - the classic way a
+                # vol-targeting rule blows up on a stale or halted name.
+                scale = np.clip(strat.vol_target / vol_hat[t][want],
+                                0.0, VOL_SCALE_CAP)
+                size = size * scale
+            size = np.clip(size, 0.0, max_position)
             pos[want] = np.sign(scores[t][want]) * size
             entry_px[want] = px[want]
             peak_px[want] = px[want]
@@ -192,30 +258,68 @@ def simulate(md: MarketData, strat: DecodedStrategy, cost_bps: float = 22.0,
     traded = net[turnover > 0]
     win_rate = float((traded > 0).mean()) if traded.size else 0.0
 
+    # Profit factor: gross gains / gross losses. Reported, not optimised.
+    # It is the number that shows an asymmetric payoff, which win rate
+    # cannot: a 45%-hit-rate strategy at 2:1 has PF 1.6 and makes money,
+    # while a 60%-hit-rate strategy at 0.5:1 has PF 0.75 and does not.
+    gains = float(net[net > 0].sum())
+    losses = float(-net[net < 0].sum())
+    profit_factor = (gains / losses) if losses > 1e-12 else (
+        float("inf") if gains > 0 else 0.0)
+
     return BacktestStats(
         sharpe=sharpe, total_return=float(equity[-1] - 1.0) if T else 0.0,
         max_drawdown=mdd, win_rate=win_rate, n_trades=trades,
         avg_turnover=float(turnover.mean()) if T else 0.0, daily_returns=net,
+        profit_factor=profit_factor,
     )
 
 
 def fitness(stats: BacktestStats) -> float:
-    """Sharpe x (1 - MaxDD) x (WinRate / 0.5), with the spec's penalty gates.
+    """Net-of-cost Sharpe x (1 - MaxDD) x evidence shrinkage.
 
-    Directly optimises the live-trading objective rather than an MSE
-    against synthetic futures - which is the single most defensible
-    change in this whole redesign, and the one most likely to matter.
+    REDEFINED. The previous objective was
+    `Sharpe x (1 - MaxDD) x (WinRate / 0.5)` with a MIN_WIN_RATE gate,
+    and both win-rate terms are now gone. Three measured reasons:
 
-    A strategy that never trades gets fitness 0, not a free pass: with
-    no edge, not trading genuinely IS optimal after 22bp costs, and the
-    archive must be allowed to say so rather than being forced to bet.
+    1. WIN RATE IS THE WRONG OBJECTIVE, and provably so on this data.
+       Break-even win rate after 22bp round-trip costs at a 1-day hold
+       is 61.1%; the spec's 55% target would lose 12.1bp per round trip.
+       Multiplying fitness by WinRate/0.5 optimised hard for a number
+       that, at the value being aimed at, loses money.
+
+    2. IT PENALISED THE PAYOFF PROFILE THAT ACTUALLY WORKS. A 45% hit
+       rate at 2:1 beats 60% at 1:1, but the old term scored the first
+       at 0.90x and the second at 1.20x. Sharpe already prices
+       asymmetry correctly - it depends on mean and dispersion, not on
+       hit count - so removing the multiplier does not lose the
+       information, it stops double-counting the wrong half of it.
+
+    3. EVIDENCE SHRINKAGE replaces it. The measured pathology was an
+       out-of-sample Sharpe of +1.18 on THREE trades - two winners and
+       a loser - which a naive report would have called a 66.7% win
+       rate. Sharpe over a window where most days are flat has a tiny
+       denominator, so a handful of lucky trades produces a large
+       number. `n / (n + K)` shrinks that toward zero: 3 trades keep
+       13% of their score, 100 trades keep 83%.
+
+    Abstention (`n_trades == 0`) scores ABSTENTION_FITNESS, a small
+    negative. It stays BETTER than actively losing money, because with
+    no edge not trading genuinely is optimal - but it is no longer
+    exactly 0.0, which used to beat every negative and made
+    never-trading the global optimum the moment a search started
+    failing. `stats.abstained` carries the distinction to the reporting
+    layer so an abstention is never averaged in as a zero-Sharpe
+    result, which is exactly what inflated the flow-arm mean from
+    -1.45 to -0.90 in the last A/B.
     """
     if stats.n_trades == 0:
-        return 0.0
-    base = stats.sharpe * (1.0 - stats.max_drawdown) * (stats.win_rate / 0.5)
-    if stats.win_rate < MIN_WIN_RATE or stats.max_drawdown > MAX_DRAWDOWN:
+        return ABSTENTION_FITNESS
+    base = stats.sharpe * (1.0 - stats.max_drawdown)
+    base *= stats.n_trades / (stats.n_trades + TRADE_SHRINKAGE_K)
+    if stats.max_drawdown > MAX_DRAWDOWN:
         base *= PENALTY_MULTIPLIER
-    return float(base) if np.isfinite(base) else 0.0
+    return float(base) if np.isfinite(base) else ABSTENTION_FITNESS
 
 
 def expected_max_sharpe_from_noise(n_trials: int, n_obs: int) -> float:
@@ -263,21 +367,37 @@ class EvolutionResult:
         """Did the winner beat what pure noise would have produced?"""
         return self.in_sample.sharpe > self.noise_benchmark_sharpe
 
+    @staticmethod
+    def _stat_line(label: str, s: BacktestStats) -> str:
+        # An abstention is NOT a Sharpe of 0.00. Printing it as one is
+        # how three zero-trade seeds ended up averaged into an arm's
+        # mean and made it look like the better arm.
+        if s.abstained:
+            return (f"  {label:11s} ABSTAINED - placed no trades "
+                    f"(not a zero-Sharpe result; nothing was risked)")
+        pf = "inf" if not np.isfinite(s.profit_factor) else f"{s.profit_factor:.2f}"
+        return (f"  {label:11s} Sharpe {s.sharpe:+.2f}  PF {pf}  "
+                f"win {s.win_rate:.1%}  maxDD {s.max_drawdown:.1%}  "
+                f"trades {s.n_trades}")
+
     def summary(self) -> str:
         oos = self.out_of_sample
         lines = [
             f"GA: {self.generations_run} generations, budget {self.search_budget} "
             f"evaluations, {self.elapsed_seconds:.1f}s",
-            f"  IN-SAMPLE   Sharpe {self.in_sample.sharpe:+.2f}  "
-            f"win {self.in_sample.win_rate:.1%}  maxDD {self.in_sample.max_drawdown:.1%}  "
-            f"trades {self.in_sample.n_trades}",
+            self._stat_line("IN-SAMPLE", self.in_sample),
         ]
         if oos is not None:
-            lines.append(
-                f"  OUT-SAMPLE  Sharpe {oos.sharpe:+.2f}  win {oos.win_rate:.1%}  "
-                f"maxDD {oos.max_drawdown:.1%}  trades {oos.n_trades}")
-            lines.append(f"  OVERFITTING GAP  {self.overfitting_gap:+.2f} Sharpe "
-                         f"(in-sample minus out-of-sample)")
+            lines.append(self._stat_line("OUT-SAMPLE", oos))
+            if not (oos.abstained or self.in_sample.abstained):
+                lines.append(f"  OVERFITTING GAP  {self.overfitting_gap:+.2f} Sharpe "
+                             f"(in-sample minus out-of-sample)")
+            if not oos.abstained and oos.n_trades < MIN_TRADES_FOR_A_CLAIM:
+                lines.append(
+                    f"  !! only {oos.n_trades} out-of-sample trades. A Sharpe on "
+                    f"fewer than {MIN_TRADES_FOR_A_CLAIM} trades is not a "
+                    f"measurement - a +1.18 on 3 trades has already appeared "
+                    f"in this project and did not survive 8 seeds.")
         lines.append(
             f"  NOISE BENCHMARK  best-of-{self.search_budget} worthless strategies "
             f"would score Sharpe ~{self.noise_benchmark_sharpe:+.2f}  "

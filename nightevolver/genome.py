@@ -95,10 +95,13 @@ N_FLOW = len(FLOW_CHANNEL_NAMES)
 INDICATOR_NAMES: Tuple[str, ...] = TECHNICAL_INDICATOR_NAMES + FLOW_CHANNEL_NAMES
 N_INDICATORS = len(INDICATOR_NAMES)
 
-# 2: flow channels appended. Version 1 genomes decode incorrectly against
-# this layout and load_checkpoint must reject them - which is the point
-# of the field.
-GENOME_VERSION = 2
+# 2: flow channels appended.
+# 3: vol-target gene appended, HOLD_DAYS_RANGE floor raised 2 -> 5.
+#    Both change what an existing gene VALUE means - a hold gene of 0.0
+#    decoded to 2 days under v2 and 5 days under v3 - so older genomes
+#    decode incorrectly here and load_checkpoint must reject them. That
+#    rejection is the entire reason this field exists.
+GENOME_VERSION = 3
 
 # Gene layout in the flat [0,1] vector.
 _W0, _W1 = 0, N_INDICATORS                              # indicator weights
@@ -109,10 +112,31 @@ IDX_TRAILING_STOP = _X1 + 1
 IDX_KELLY = _X1 + 2
 IDX_REGIME = _X1 + 3
 IDX_CONVICTION = _X1 + 4
-GENOME_LENGTH = _X1 + 5                                  # 65
+IDX_VOL_TARGET = _X1 + 5
+GENOME_LENGTH = _X1 + 6
 
 # Decoded parameter ranges.
-HOLD_DAYS_RANGE = (2, 60)
+#
+# HOLD_DAYS floor raised 2 -> 5, which is a measured decision rather
+# than a taste. Break-even win rate after 22bp round-trip costs, on the
+# actual 2024-2026 return distribution for these ten names:
+#
+#     hold   E|ret|   break-even WR   rho needed
+#       1d    0.99%          61.1%        0.342
+#       5d    2.32%          54.7%        0.148
+#      20d    4.57%          52.4%        0.076
+#      60d    8.24%          51.3%        0.042
+#
+# A 1-day hold needs rho=0.342 against forward returns to break even.
+# The best directional feature in the information audit measured
+# rho=0.035 and did not survive FDR correction. One-day trading on this
+# data is not a hard problem, it is an arithmetically closed one, and
+# leaving it in the search space only lets the GA find noise there.
+#
+# The upper bound rises 60 -> 90 for the same reason: annual cost drag
+# at 10% sizing falls from 5.54% (1d) to 0.09% (60d), so the long end is
+# where any real edge would actually survive.
+HOLD_DAYS_RANGE = (5, 90)
 TRAILING_STOP_RANGE = (0.02, 0.20)      # floor at 2%: a 0% trailing stop
                                         # would exit on any tick against
                                         # the position, which is not a
@@ -121,6 +145,25 @@ KELLY_RANGE = (0.0, 1.0)
 REGIME_RANGE = (0.0, 1.0)
 CONVICTION_RANGE = (0.05, 0.60)         # floor at 0.05 so a genome cannot
                                         # trade on numerical dust
+
+# Volatility targeting. 0 disables it (size is pure conviction x kelly);
+# above 0 it is the annualised volatility the position is scaled toward,
+# so size gets divided by the forecast vol and a quiet name gets more
+# capital than a wild one for the same conviction.
+#
+# This is the one place the information audit's actual POSITIVE result
+# is used. atr_pct -> vol_5d measured incremental rho = +0.168 at
+# q = 0.021 - the only signal found anywhere in this project that is
+# both statistically real and large enough to matter (rho = 0.156 is
+# what 55% directional accuracy would need).
+#
+# BE CLEAR ABOUT WHAT IT BUYS. Volatility targeting does not create
+# directional edge and cannot. It stabilises risk per unit of exposure,
+# which raises Sharpe for whatever directional signal exists - including
+# a zero one, where it raises Sharpe from 0 to 0. It is the correct use
+# of a vol forecast in a cash-equity book, and it is not a substitute
+# for having something to forecast.
+VOL_TARGET_RANGE = (0.0, 0.30)
 
 
 @dataclass
@@ -135,6 +178,7 @@ class DecodedStrategy:
     kelly_fraction: float
     regime_sensitivity: float
     conviction_floor: float
+    vol_target: float = 0.0
 
     def top_indicators(self, n: int = 5) -> List[Tuple[str, float]]:
         order = np.argsort(-self.indicator_weights)[:n]
@@ -166,6 +210,7 @@ class DecodedStrategy:
             "kelly_fraction": float(self.kelly_fraction),
             "regime_sensitivity": float(self.regime_sensitivity),
             "conviction_floor": float(self.conviction_floor),
+            "vol_target": float(self.vol_target),
         }
 
 
@@ -203,6 +248,7 @@ def decode(genome: np.ndarray) -> DecodedStrategy:
         kelly_fraction=_lerp(g[IDX_KELLY], *KELLY_RANGE),
         regime_sensitivity=_lerp(g[IDX_REGIME], *REGIME_RANGE),
         conviction_floor=_lerp(g[IDX_CONVICTION], *CONVICTION_RANGE),
+        vol_target=_lerp(g[IDX_VOL_TARGET], *VOL_TARGET_RANGE),
     )
 
 
