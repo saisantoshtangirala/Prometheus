@@ -74,7 +74,7 @@ on:
         required: false
         default: "full"
         type: choice
-        options: [pretrain, finetune, meta, evolve, full, nightevolver-ga, nightevolver-rl]
+        options: [pretrain, finetune, meta, evolve, full, nightevolver-ga, nightevolver-rl, intraday-audit]
       generations:
         description: "nightevolver-ga only: GA generations (population is 50)"
         required: false
@@ -116,6 +116,12 @@ jobs:
           echo "mode=${{ github.event.inputs.mode || 'full' }}" >> "$GITHUB_OUTPUT"
           echo "generations=${{ github.event.inputs.generations || '20' }}" >> "$GITHUB_OUTPUT"
           echo "history_start=${{ github.event.inputs.history_start || '2022-01-01' }}" >> "$GITHUB_OUTPUT"
+          # Only the intraday path touches Kite. Everything else trains on
+          # bhavcopy / yfinance and must not drag a credential through CI.
+          case "${{ github.event.inputs.mode || 'full' }}" in
+            intraday-audit) echo "needs_kite=true"  >> "$GITHUB_OUTPUT" ;;
+            *)              echo "needs_kite=false" >> "$GITHUB_OUTPUT" ;;
+          esac
           echo "gpu_type=${{ github.event.inputs.gpu_type || 'auto' }}" >> "$GITHUB_OUTPUT"
           echo "cloud_type=${{ github.event.inputs.cloud_type || 'COMMUNITY' }}" >> "$GITHUB_OUTPUT"
           N_ASSETS=$(python3 -c "
@@ -158,6 +164,63 @@ jobs:
           if [ "$SHOULD_RUN" != "true" ]; then
             echo "Not a trading day (weekend or NSE holiday) - skipping, no pod will be created."
           fi
+
+      # ------------------------------------------------------------------
+      # Kite token relay: Hetzner -> here -> the pod.
+      #
+      # The token is fetched over the SSH access this workflow ALREADY has
+      # to Hetzner. It is deliberately NOT a GitHub secret and Hetzner
+      # deliberately holds NO GitHub credential:
+      #
+      #   * Writing it into GitHub secrets would need a PAT with
+      #     secrets:write sitting on the box that holds the trading
+      #     account. Compromise of that box would then mean write access
+      #     to every workflow's configuration.
+      #   * A secret at rest in GitHub also outlives its usefulness - the
+      #     token expires daily, so a stored copy is stale within hours
+      #     and is one more place to leak from.
+      #
+      # Reading it just-in-time keeps ONE source of truth
+      # (/etc/nightevolver/kite.env on Hetzner) and leaves nothing behind.
+      #
+      # VALIDATED BEFORE THE POD IS CREATED. An expired token discovered
+      # after provisioning wastes a GPU; discovered here it costs nothing.
+      - name: Fetch and validate the Kite token (intraday modes only)
+        id: kite
+        if: steps.gate.outputs.should_run == 'true' && steps.params.outputs.needs_kite == 'true'
+        run: |
+          set -euo pipefail
+          eval "$(ssh-agent -s)" >/dev/null
+          ssh-add - <<< "${{ secrets.HETZNER_SSH_KEY }}" >/dev/null 2>&1
+          ssh-keyscan -H "${{ secrets.HETZNER_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
+
+          TOKEN=$(ssh -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new \
+            "${{ secrets.HETZNER_USER }}@${{ secrets.HETZNER_HOST }}" \
+            "grep -h '^KITE_ACCESS_TOKEN=' /etc/nightevolver/kite.env 2>/dev/null | cut -d= -f2-" || true)
+          KEY=$(ssh -o ConnectTimeout=15 \
+            "${{ secrets.HETZNER_USER }}@${{ secrets.HETZNER_HOST }}" \
+            "grep -h '^KITE_API_KEY=' /etc/nightevolver/kite.env 2>/dev/null | cut -d= -f2-" || true)
+
+          if [ -z "$TOKEN" ] || [ -z "$KEY" ]; then
+            echo "::error::No Kite credentials in /etc/nightevolver/kite.env on Hetzner."
+            echo "::error::Run scripts/kite_login.py on your laptop and deploy the token."
+            exit 1
+          fi
+          # Mask BEFORE the value can reach any later log line.
+          echo "::add-mask::$TOKEN"
+          echo "::add-mask::$KEY"
+
+          CODE=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 \
+            -H "X-Kite-Version: 3" -H "Authorization: token $KEY:$TOKEN" \
+            https://api.kite.trade/user/profile || echo 000)
+          if [ "$CODE" != "200" ]; then
+            echo "::error::Kite rejected the token (HTTP $CODE). It expires daily -"
+            echo "::error::re-run scripts/kite_login.py and redeploy before training."
+            exit 1
+          fi
+          echo "Kite token validated (HTTP 200) - no pod has been created yet."
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+          echo "key=$KEY" >> "$GITHUB_OUTPUT"
 
       - name: Load RunPod SSH key
         if: steps.gate.outputs.should_run == 'true'
@@ -341,6 +404,21 @@ jobs:
           echo "::error::SSH never came up inside the container."
           exit 1
 
+      # Written over STDIN into a mode-600 file rather than passed on the
+      # command line: an `ssh host "KITE_ACCESS_TOKEN=... python ..."`
+      # would put the token in the pod's process list, readable by
+      # anything else running there.
+      - name: Deliver the Kite token to the pod
+        if: steps.gate.outputs.should_run == 'true' && steps.params.outputs.needs_kite == 'true'
+        run: |
+          set -euo pipefail
+          printf 'KITE_API_KEY=%s\nKITE_ACCESS_TOKEN=%s\n' \
+            "${{ steps.kite.outputs.key }}" "${{ steps.kite.outputs.token }}" \
+          | ssh -o ConnectTimeout=15 -p "${{ steps.connect.outputs.port }}" \
+              "root@${{ steps.connect.outputs.host }}" \
+              'umask 077 && cat > /root/.kite.env'
+          echo "Token delivered to the pod (mode 600, not in any process list)."
+
       - name: Train
         if: steps.gate.outputs.should_run == 'true'
         run: |
@@ -361,6 +439,7 @@ jobs:
             pip install -q -e .
             pip install -q pyyaml yfinance
             MODE="'"${{ steps.params.outputs.mode }}"'"
+            [ -f /root/.kite.env ] && . /root/.kite.env && export KITE_API_KEY KITE_ACCESS_TOKEN
             case "$MODE" in
               nightevolver-ga)
                 # CPU-bound by design (see scripts/train_nightevolver.py) -
@@ -376,6 +455,11 @@ jobs:
                   --tickers "'"${{ steps.params.outputs.tickers }}"'" \
                   --start "'"${{ steps.params.outputs.history_start }}"'" \
                   --episodes 1000
+                ;;
+              intraday-audit)
+                python scripts/run_intraday_audit.py \
+                  --symbols "'"${{ steps.params.outputs.tickers }}"'" \
+                  --start "'"${{ steps.params.outputs.history_start }}"'"
                 ;;
               *)
                 python scripts/train.py --mode "$MODE" --device cuda \

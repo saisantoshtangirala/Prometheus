@@ -55,7 +55,44 @@ def parse_args():
     p.add_argument("--api-key", default=os.environ.get("KITE_API_KEY"))
     p.add_argument("--write-env", default=None,
                    help="also write an env file (chmod 600) at this path")
+    p.add_argument("--deploy-to", default=None, metavar="USER@HOST",
+                   help="push the token straight to the execution box's "
+                        "/etc/nightevolver/kite.env over ssh. Only the API "
+                        "KEY and daily TOKEN are sent - never api_secret, "
+                        "which nothing on that machine reads.")
+    p.add_argument("--remote-path", default="/etc/nightevolver/kite.env",
+                   help="destination path on the remote host")
     return p.parse_args()
+
+
+def deploy(api_key: str, token: str, target: str, remote_path: str) -> bool:
+    """Write the credentials to `target` over ssh, mode 600.
+
+    Piped over STDIN rather than passed as an argument: an
+    `ssh host "echo TOKEN > file"` would place the token in the remote
+    process list, readable by anything else on the box.
+    """
+    import subprocess
+
+    payload = f"KITE_API_KEY={api_key}\nKITE_ACCESS_TOKEN={token}\n"
+    remote = (f"sudo install -d -m 755 $(dirname {remote_path}) && "
+              f"umask 077 && sudo tee {remote_path} >/dev/null && "
+              f"sudo chmod 600 {remote_path}")
+    try:
+        r = subprocess.run(
+            ["ssh", "-o", "ConnectTimeout=15", target, remote],
+            input=payload, text=True, capture_output=True, timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        print(f"\ndeploy FAILED: {type(e).__name__}: {e}")
+        return False
+    if r.returncode != 0:
+        print(f"\ndeploy FAILED (exit {r.returncode}): {r.stderr.strip()[:300]}")
+        print("  - is passwordless sudo available for this user?")
+        print(f"  - does {target} accept your key?")
+        return False
+    print(f"\ndeployed to {target}:{remote_path} (mode 600)")
+    return True
 
 
 def login_checksum(api_key: str, request_token: str, api_secret: str) -> str:
@@ -131,7 +168,7 @@ def main() -> int:
     print("\n" + "=" * 66)
     print(f"  logged in as: {data.get('user_name', '?')} "
           f"({data.get('user_id', '?')})")
-    print(f"  valid until:  the next Kite daily expiry (early morning IST)")
+    print("  valid until:  the next Kite daily expiry (early morning IST)")
     print("=" * 66)
     print("\nExport this where the recorder runs:\n")
     print(f"  export KITE_API_KEY={api_key}")
@@ -147,6 +184,10 @@ def main() -> int:
         except OSError:
             print(f"WARNING: could not chmod 600 {path} - check its permissions")
         print(f"written: {path} (mode 600)\n")
+
+    if args.deploy_to and not deploy(api_key, token, args.deploy_to,
+                                     args.remote_path):
+        return 1
     return 0
 
 
