@@ -56,7 +56,7 @@ import urllib.request
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
