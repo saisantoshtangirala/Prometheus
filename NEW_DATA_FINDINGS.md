@@ -223,6 +223,68 @@ seconds; the GA took sixteen runs to agree.
 
 ---
 
+## 5b. Universe expansion — and a conclusion that did not replicate
+
+The 10-name runs could not measure their own out-of-sample results: a
+median of 9 trades, **0/8 seeds** clearing the 20-trade threshold. Since
+bhavcopy is one file per session containing every listed symbol, going
+to 50 names costs no extra fetching. Selected point-in-time by turnover
+as of 2024-01-02; 48 survived the 90% coverage filter.
+
+```
+universe 48 assets x 588 bars | validation 150 (derived)
+
+seed  IS Shrp  OOS Shrp  OOStr  hold  OOS PF   defl
+   0    +1.62     +0.65     27    51    1.17  0.003
+   1    +1.99     -1.27     36    33    0.68  0.000
+   2    +2.66     -0.10     65    19    0.97  0.000
+   3    +2.43     +0.53     35    30    1.16  0.002
+   4    +2.51     -0.91     50    25    0.71  0.000
+   5    +2.63     +1.31     25    19    1.53  0.012
+   6    +2.00     +0.01     49    34    1.00  0.001
+   7    +2.59     -1.14     87    21    0.66  0.000
+
+  OOS trades median 42        (10-name: 9)
+  seeds with >=20 OOS trades: 8/8   (10-name: 0/8)
+```
+
+**A CORRECTION.** On the 10-name run this document previously reported
+8/8 seeds with out-of-sample profit factor below 1.0, sign test
+p=0.0078, and concluded the strategies "reliably lose money out of
+sample". **That does not replicate.** With an adequately powered window
+it is **4/8, p=1.000**:
+
+```
+                      10 names (9 trades)   48 names (42 trades)
+  PF < 1.0                 8/8  p=0.008          4/8  p=1.000
+  OOS Sharpe mean            -1.57                  -0.12
+  t-test vs zero                 -              t=-0.35  p=0.735
+```
+
+The "reliably loses" result was an artefact of the underpowered window,
+not a finding. Nine trades per seed, with 22bp of cost on every one, is
+not enough to distinguish losing from not trading well. The corrected
+statement is weaker and duller: **out-of-sample performance is
+statistically indistinguishable from zero** (p=0.735).
+
+That is exactly what no edge looks like once it is measured properly,
+and it is worth noticing that the underpowered version of this
+measurement produced a *more confident and more wrong* conclusion than
+the powered one — in the direction I already expected, which is the
+direction bias runs.
+
+**The gate still refuses, correctly.** Max deflated P(SR>0) across the
+8 seeds is **0.012** against the 0.95 requirement. Seed 5 looks
+appealing in isolation — OOS Sharpe +1.31, profit factor 1.53 — and is
+one draw out of eight with a deflated probability of 0.012. That is the
+control doing its job on the one seed a human would have wanted to
+believe.
+
+In-sample +2.30 against out-of-sample -0.12 is still a **+2.42
+overfitting gap**.
+
+---
+
 ## 6. What this changes about what to do next
 
 - **Direction is done.** Three independent measurements now agree: the
