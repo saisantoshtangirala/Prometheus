@@ -269,6 +269,34 @@ class TestGAEngine:
         assert fitness(loser) < fitness(none) < fitness(winner)
         assert none.abstained and not loser.abstained
 
+    def test_validation_window_scales_with_the_holding_period(self):
+        """A 63-bar window cannot evaluate a 49-day hold, and nothing
+        errors when you try - you just get a confident Sharpe on almost
+        no trades. Measured: after the hold floor rose to 5 days the GA
+        settled at a 49-day median hold, and the unchanged 63-bar window
+        produced a median of TWO out-of-sample trades over 8 seeds."""
+        from nightevolver.ga_engine import (
+            MIN_TRADES_FOR_A_CLAIM, required_validation_bars,
+        )
+        # 20 trades, 10 assets, 90-day hold -> 180 bars
+        assert required_validation_bars(90, 10) == 180
+        assert required_validation_bars(20, 10) == 40
+        # longer holds must demand strictly longer windows
+        assert required_validation_bars(90, 10) > required_validation_bars(49, 10)
+        # more assets amortise the requirement
+        assert required_validation_bars(90, 20) < required_validation_bars(90, 10)
+        # and the window it returns really does clear the bar
+        for hold in (10, 49, 90):
+            w = required_validation_bars(hold, 10)
+            assert 10 * w / hold >= MIN_TRADES_FOR_A_CLAIM
+
+    def test_required_validation_bars_rejects_nonsense(self):
+        from nightevolver.ga_engine import required_validation_bars
+        with pytest.raises(ValueError):
+            required_validation_bars(0, 10)
+        with pytest.raises(ValueError):
+            required_validation_bars(30, 0)
+
     def test_vol_targeting_matches_an_explicit_rolling_std(self):
         """The forecast is a vectorised rolling std. The readable version
         is a Python loop over T, but vol_hat depends only on prices, not

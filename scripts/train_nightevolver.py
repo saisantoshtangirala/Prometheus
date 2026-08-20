@@ -39,7 +39,10 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from nightevolver.data_loader import build_market_data, fetch_nse_data
-from nightevolver.ga_engine import GAConfig, GeneticEvolver
+from nightevolver.ga_engine import (
+    MIN_TRADES_FOR_A_CLAIM, GAConfig, GeneticEvolver, required_validation_bars,
+)
+from nightevolver.genome import HOLD_DAYS_RANGE
 from nightevolver.rl_trainer import QConfig, train_q_learning
 from nightevolver.saver import (
     CHECKPOINT_DIR, MIN_DEFLATED_SHARPE_PROB, package_checkpoint, save_checkpoint,
@@ -71,11 +74,14 @@ def parse_args():
     p.add_argument("--generations", type=int, default=20)
     p.add_argument("--population", type=int, default=50)
     p.add_argument("--episodes", type=int, default=1000, help="RL only")
-    p.add_argument("--validation-bars", type=int, default=63,
-                   help="held-out bars. Default 63 (~3 months), NOT the "
-                        "spec's 21: a Sharpe estimated on 21 observations "
-                        "has a standard error near 1.0, so it cannot "
-                        "distinguish a good strategy from a lucky one.")
+    p.add_argument("--validation-bars", type=int, default=None,
+                   help="held-out bars. Default is DERIVED from the hold "
+                        "ceiling and asset count so the window can actually "
+                        "contain enough trades to measure - see "
+                        "ga_engine.required_validation_bars. A fixed 63 was "
+                        "the previous default and it silently produced a "
+                        "median of TWO out-of-sample trades once the GA "
+                        "started holding for ~49 days.")
     p.add_argument("--cost-bps", type=float, default=22.0)
     p.add_argument("--max-position", type=float, default=0.10)
     p.add_argument("--checkpoint-dir", default=str(CHECKPOINT_DIR))
@@ -121,8 +127,27 @@ def main() -> int:
     logger.info("data: %d bars x %d assets (%s .. %s)", md.n_bars, md.n_assets,
                 md.dates[0].date(), md.dates[-1].date())
 
-    vb = min(args.validation_bars, max(md.n_bars // 4, 1))
+    if args.validation_bars is not None:
+        vb = args.validation_bars
+    else:
+        vb = required_validation_bars(HOLD_DAYS_RANGE[1], md.n_assets)
+        logger.info("validation window derived from the hold ceiling: "
+                    "%d bars (hold<=%dd, %d assets, >=%d trades)",
+                    vb, HOLD_DAYS_RANGE[1], md.n_assets, MIN_TRADES_FOR_A_CLAIM)
+    # Never hand more than half the history to validation, however long
+    # the derived requirement is - a window that leaves too little to
+    # train on is its own failure.
+    vb = min(vb, max(md.n_bars // 2, 1))
     split = md.n_bars - vb
+
+    expected = md.n_assets * vb / HOLD_DAYS_RANGE[1]
+    if expected < MIN_TRADES_FOR_A_CLAIM:
+        logger.warning(
+            "validation window of %d bars can hold only ~%.0f trades for a "
+            "%d-day strategy (want >=%d). Out-of-sample Sharpe from this "
+            "window will NOT be a measurement. Extend the history or lower "
+            "the hold ceiling.", vb, expected, HOLD_DAYS_RANGE[1],
+            MIN_TRADES_FOR_A_CLAIM)
     if split < 60:
         logger.error("only %d training bars after holding out %d - too short", split, vb)
         return 1

@@ -88,6 +88,31 @@ VOL_SCALE_CAP = 3.0
 # and the summary says so out loud.
 MIN_TRADES_FOR_A_CLAIM = 20
 
+
+def required_validation_bars(max_hold_days: int, n_assets: int,
+                             min_trades: int = MIN_TRADES_FOR_A_CLAIM) -> int:
+    """Shortest validation window that can actually evaluate a strategy
+    holding for `max_hold_days`.
+
+    THE HOLDING PERIOD DICTATES THE WINDOW, and getting this wrong is
+    subtle because nothing errors - you just get a confident Sharpe
+    computed on almost no trades. A strategy holding h days completes
+    roughly W/h rounds per asset, so A assets give about A*W/h trades:
+
+        validation  63 bars, hold 49d, 10 assets -> ~12.9 trades
+        validation  63 bars, hold 90d, 10 assets -> ~ 7.0 trades
+        validation 189 bars, hold 90d, 10 assets -> ~21.0 trades
+
+    Measured consequence of ignoring it: after the hold floor was raised
+    to 5 days the GA settled on a median hold of 49 days, and the
+    unchanged 63-bar window then produced a median of TWO out-of-sample
+    trades across 8 seeds. The resulting OOS Sharpe of -1.70 is not a
+    result in either direction - there is nothing in it to measure.
+    """
+    if n_assets < 1 or max_hold_days < 1:
+        raise ValueError("n_assets and max_hold_days must be >= 1")
+    return int(np.ceil(min_trades * max_hold_days / n_assets))
+
 # Not exactly 0.0. Zero used to beat every negative score, which made
 # never-trading the global optimum as soon as a search started failing -
 # measured: 3 of 8 seeds abstained and their 0.00s pulled an arm's mean
