@@ -34,7 +34,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from nightevolver.data_loader import build_market_data
-from nightevolver.genome import INDICATOR_NAMES
+from nightevolver.genome import INDICATOR_NAMES, N_TECHNICAL
 from nightevolver.information_audit import (
     DEFAULT_BLOCK_BARS, DEFAULT_FDR_ALPHA, DEFAULT_N_PERMUTATIONS, audit_features,
 )
@@ -94,7 +94,8 @@ def main() -> int:
         md = _synthetic_market(args.tickers, seed=args.seed)
     elif args.source == "bhav":
         from nightevolver.nse_prices import fetch_nse_prices
-        md = fetch_nse_prices(args.tickers, args.start, args.end)
+        md = fetch_nse_prices(args.tickers, args.start, args.end,
+                              with_flows=not args.no_flows)
     else:
         from nightevolver.data_loader import fetch_nse_data
         tk = [t if t.upper().endswith(".NS") else f"{t}.NS" for t in args.tickers]
@@ -103,21 +104,13 @@ def main() -> int:
     logger.info("data: %d bars x %d assets (%s .. %s)", md.n_bars, md.n_assets,
                 md.dates[0].date(), md.dates[-1].date())
 
-    features = md.indicators                       # [T, A, 20]
+    # build_market_data already appends the market-wide flow channels
+    # (zeros when unavailable), so the audit sees exactly the channel set
+    # the genome votes on - no second, divergent assembly path.
+    features = md.indicators                       # [T, A, N_INDICATORS]
     names = list(INDICATOR_NAMES)
-
-    if not args.no_flows and not args.synthetic:
-        from nightevolver.flows import FLOW_FEATURE_NAMES, load_flow_features
-        flows = load_flow_features(md.dates)       # [T, F] market-wide
-        # Broadcast the market-wide series across assets. This is an
-        # honest representation: these features genuinely cannot
-        # distinguish between names, which caps what they can say about
-        # a cross-sectional target.
-        flow_3d = np.repeat(flows[:, None, :], md.n_assets, axis=1)
-        features = np.concatenate([features, flow_3d], axis=2)
-        names += list(FLOW_FEATURE_NAMES)
-        logger.info("features: %d indicators + %d flow = %d channels",
-                    len(INDICATOR_NAMES), len(FLOW_FEATURE_NAMES), len(names))
+    logger.info("features: %d channels (%d technical + %d flow)",
+                len(names), N_TECHNICAL, len(names) - N_TECHNICAL)
 
     targets = build_targets(md.close)
     for t in targets.values():

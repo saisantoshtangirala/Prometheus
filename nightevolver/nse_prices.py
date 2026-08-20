@@ -247,7 +247,7 @@ def build_adjusted_frames(days: Dict[pd.Timestamp, pd.DataFrame],
 
 def fetch_nse_prices(tickers: Sequence[str], start: str, end: Optional[str] = None,
                      max_workers: int = 6, use_cache: bool = True,
-                     require_actions: bool = True):
+                     require_actions: bool = True, with_flows: bool = False):
     """Convenience: bhavcopy -> MarketData, bypassing yfinance entirely.
 
     `tickers` are NSE symbols WITHOUT the .NS suffix (RELIANCE, not
@@ -265,4 +265,9 @@ def fetch_nse_prices(tickers: Sequence[str], start: str, end: Optional[str] = No
         days, syms, require_actions=require_actions)
     logger.info("[prices] %d bars x %d tickers (%s .. %s)", len(close),
                 close.shape[1], close.index[0].date(), close.index[-1].date())
-    return build_market_data(close, high, low, vol)
+
+    flows = None
+    if with_flows:
+        from nightevolver.flows import load_flow_features
+        flows = load_flow_features(close.index)
+    return build_market_data(close, high, low, vol, flows=flows)

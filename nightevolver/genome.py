@@ -46,7 +46,7 @@ import numpy as np
 # mis-decoded - a silent, catastrophic failure where gene 7 stops
 # meaning what it meant when it was evolved. `GENOME_VERSION` exists so
 # that mismatch is detected at load time instead of at trade time.
-INDICATOR_NAMES: Tuple[str, ...] = (
+TECHNICAL_INDICATOR_NAMES: Tuple[str, ...] = (
     "rsi_14", "rsi_28",
     "macd_hist", "macd_signal_cross",
     "bb_position", "bb_width",
@@ -59,9 +59,46 @@ INDICATOR_NAMES: Tuple[str, ...] = (
     "mom_5", "mom_21",
     "vol_ratio", "ret_zscore",
 )
+
+# FII/DII participant-positioning channels, appended AFTER the technical
+# indicators so that the first 20 gene positions keep the meaning they
+# had in GENOME_VERSION 1.
+#
+# These are market-wide: one value per session, identical across every
+# asset. That is worth stating where the genome can see it, because the
+# information audit measured what they carry, and at market level - their
+# honest sample size - it was nothing: no flow channel survived FDR
+# correction against any of the four targets, and the best (fii_stk_fut_net
+# -> rel_strength_1d) landed at p=0.60 once the T*A inflation was removed.
+#
+# They are wired in because adding them was asked for and because the
+# measurement should be reproducible, not because they are expected to
+# help. Enabling them widens the search space by 30% at no information
+# gain, which raises the best-of-N noise ceiling the deflated Sharpe has
+# to clear. Expect the gate to get HARDER to pass, not easier.
+FLOW_CHANNEL_NAMES: Tuple[str, ...] = (
+    "fii_idx_fut_net", "fii_idx_fut_net_chg", "fii_stk_fut_net",
+    "dii_idx_fut_net", "client_idx_fut_net", "fii_opt_directional",
+)
+
+N_TECHNICAL = len(TECHNICAL_INDICATOR_NAMES)
+N_FLOW = len(FLOW_CHANNEL_NAMES)
+
+# One STATIC layout rather than a runtime toggle. A toggle would have to
+# rebind these module globals, and every module that does
+# `from nightevolver.genome import INDICATOR_NAMES` captures the binding
+# at import time - so the layout could differ between two modules in the
+# same process. That is precisely the "gene 7 means something else now"
+# failure this ordering comment warns about, so the flow channels are
+# always present and are filled with ZEROS when flow data is unavailable.
+# A zero channel casts a zero vote, so it is inert rather than absent.
+INDICATOR_NAMES: Tuple[str, ...] = TECHNICAL_INDICATOR_NAMES + FLOW_CHANNEL_NAMES
 N_INDICATORS = len(INDICATOR_NAMES)
 
-GENOME_VERSION = 1
+# 2: flow channels appended. Version 1 genomes decode incorrectly against
+# this layout and load_checkpoint must reject them - which is the point
+# of the field.
+GENOME_VERSION = 2
 
 # Gene layout in the flat [0,1] vector.
 _W0, _W1 = 0, N_INDICATORS                              # indicator weights

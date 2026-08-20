@@ -112,11 +112,25 @@ class TestGenome:
 
 class TestIndicators:
     def test_channel_count_matches_genome(self):
+        """compute_indicators emits the TECHNICAL block only; the flow
+        channels are appended by build_market_data, so the genome's full
+        channel count is technical + flow."""
+        from nightevolver.genome import N_FLOW, N_TECHNICAL
         close = _random_walk(200, 4)
-        ind = compute_indicators(close, close, close,
-                                 pd.DataFrame(1e6, index=close.index, columns=close.columns))
-        assert ind.shape == (200, 4, N_INDICATORS)
+        vol = pd.DataFrame(1e6, index=close.index, columns=close.columns)
+        ind = compute_indicators(close, close, close, vol)
+        assert ind.shape == (200, 4, N_TECHNICAL)
         assert np.all(np.isfinite(ind))
+        assert N_TECHNICAL + N_FLOW == N_INDICATORS
+
+    def test_build_market_data_emits_the_full_genome_channel_set(self):
+        close = _random_walk(200, 4)
+        md = build_market_data(close)
+        assert md.indicators.shape[2] == N_INDICATORS
+        # Flow channels are inert (zero) when no flow data is supplied,
+        # rather than absent - the layout must not change with the data.
+        from nightevolver.genome import N_TECHNICAL
+        assert np.allclose(md.indicators[:, :, N_TECHNICAL:], 0.0)
 
     def test_indicators_are_bounded(self):
         """tanh-squashed, so thresholds in [0,1] are on a comparable scale."""

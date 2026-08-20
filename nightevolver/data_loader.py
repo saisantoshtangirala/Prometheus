@@ -36,7 +36,9 @@ from typing import List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
-from nightevolver.genome import INDICATOR_NAMES, N_INDICATORS
+from nightevolver.genome import (
+    FLOW_CHANNEL_NAMES, INDICATOR_NAMES, N_FLOW, N_INDICATORS, N_TECHNICAL,
+)
 
 logger = logging.getLogger("nightevolver.data")
 
@@ -207,10 +209,11 @@ def compute_indicators(close: pd.DataFrame, high: pd.DataFrame,
     rets = close.pct_change()
     raw.append(rets / rets.rolling(20, min_periods=20).std().replace(0.0, np.nan))  # ret_zscore
 
-    if len(raw) != N_INDICATORS:
+    if len(raw) != N_TECHNICAL:
         raise RuntimeError(
-            f"assembled {len(raw)} indicators but genome expects {N_INDICATORS} - "
-            "INDICATOR_NAMES and compute_indicators() have drifted apart"
+            f"assembled {len(raw)} indicators but genome expects {N_TECHNICAL} "
+            "technical channels - TECHNICAL_INDICATOR_NAMES and "
+            "compute_indicators() have drifted apart"
         )
 
     # Causal z-score then tanh-squash, per asset. Puts every channel on
@@ -226,7 +229,8 @@ def compute_indicators(close: pd.DataFrame, high: pd.DataFrame,
 
 def build_market_data(close: pd.DataFrame, high: Optional[pd.DataFrame] = None,
                       low: Optional[pd.DataFrame] = None,
-                      volume: Optional[pd.DataFrame] = None) -> MarketData:
+                      volume: Optional[pd.DataFrame] = None,
+                      flows: Optional[np.ndarray] = None) -> MarketData:
     """Assemble MarketData from OHLCV frames (high/low/volume optional).
 
     Missing high/low/volume are synthesised from close so the system can
@@ -248,6 +252,21 @@ def build_market_data(close: pd.DataFrame, high: Optional[pd.DataFrame] = None,
     volume = volume.reindex(idx).ffill().fillna(1.0)
 
     indicators = compute_indicators(close, high, low, volume)
+
+    # Append the market-wide flow channels. When flows are unavailable
+    # these are zeros, which cast a zero vote and are therefore inert -
+    # the genome layout stays fixed either way, so a genome never
+    # decodes against a different channel ordering than it evolved on.
+    if flows is None:
+        flow_block = np.zeros((len(idx), len(close.columns), N_FLOW))
+    else:
+        flows = np.asarray(flows, dtype=np.float64)
+        if flows.shape != (len(idx), N_FLOW):
+            raise ValueError(
+                f"flows must be [{len(idx)}, {N_FLOW}] (one row per bar, "
+                f"market-wide); got {flows.shape}")
+        flow_block = np.repeat(flows[:, None, :], len(close.columns), axis=1)
+    indicators = np.concatenate([indicators, flow_block], axis=2)
 
     c = close.to_numpy(dtype=np.float64)
     # forward_returns[t] = return from t to t+1. A signal computed at t
