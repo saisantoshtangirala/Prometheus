@@ -278,9 +278,11 @@ class TestGAEngine:
         from nightevolver.ga_engine import (
             MIN_TRADES_FOR_A_CLAIM, required_validation_bars,
         )
-        # 20 trades, 10 assets, 90-day hold -> 180 bars
-        assert required_validation_bars(90, 10) == 180
-        assert required_validation_bars(20, 10) == 40
+        # 20 trades, 10 assets, 90-day hold, duty cycle 0.25 -> 720 bars.
+        # The duty-cycle factor is measured, not assumed: without it this
+        # returned 180 bars claiming >=20 trades, and the run delivered 9.
+        assert required_validation_bars(90, 10) == 720
+        assert required_validation_bars(90, 10, duty_cycle=1.0) == 180
         # longer holds must demand strictly longer windows
         assert required_validation_bars(90, 10) > required_validation_bars(49, 10)
         # more assets amortise the requirement
@@ -288,7 +290,18 @@ class TestGAEngine:
         # and the window it returns really does clear the bar
         for hold in (10, 49, 90):
             w = required_validation_bars(hold, 10)
-            assert 10 * w / hold >= MIN_TRADES_FOR_A_CLAIM
+            from nightevolver.ga_engine import TYPICAL_DUTY_CYCLE
+            assert 10 * w / hold * TYPICAL_DUTY_CYCLE >= MIN_TRADES_FOR_A_CLAIM
+
+    def test_universe_size_is_the_cheap_lever_on_window_length(self):
+        """Trade count scales linearly with the universe, and bhavcopy is
+        one file per session containing every symbol - so more names cost
+        no extra fetching, while more history is bounded by the archive
+        (UDiFF starts 2024)."""
+        from nightevolver.ga_engine import required_validation_bars
+        assert required_validation_bars(90, 50) < required_validation_bars(90, 10)
+        assert (required_validation_bars(90, 10)
+                == pytest.approx(required_validation_bars(90, 50) * 5, rel=0.02))
 
     def test_required_validation_bars_rejects_nonsense(self):
         from nightevolver.ga_engine import required_validation_bars
@@ -296,6 +309,10 @@ class TestGAEngine:
             required_validation_bars(0, 10)
         with pytest.raises(ValueError):
             required_validation_bars(30, 0)
+        with pytest.raises(ValueError):
+            required_validation_bars(30, 10, duty_cycle=0.0)
+        with pytest.raises(ValueError):
+            required_validation_bars(30, 10, duty_cycle=1.5)
 
     def test_vol_targeting_matches_an_explicit_rolling_std(self):
         """The forecast is a vectorised rolling std. The readable version

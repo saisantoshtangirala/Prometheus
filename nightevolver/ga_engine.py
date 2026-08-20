@@ -89,8 +89,21 @@ VOL_SCALE_CAP = 3.0
 MIN_TRADES_FOR_A_CLAIM = 20
 
 
+# Fraction of the always-invested trade count a real strategy achieves.
+# MEASURED, not assumed: with a 180-bar window, 10 assets and a 49-day
+# median hold, the always-invested bound is 10*180/49 = 37 trades and the
+# GA actually produced a median of 9. Ratio 0.24.
+#
+# The gap is `conviction_floor`: a position only opens when |score|
+# clears it, so most bars produce no entry. An estimate that ignores
+# that is optimistic by ~4x, which is exactly how the first version of
+# required_validation_bars promised >=20 trades and delivered 9.
+TYPICAL_DUTY_CYCLE = 0.25
+
+
 def required_validation_bars(max_hold_days: int, n_assets: int,
-                             min_trades: int = MIN_TRADES_FOR_A_CLAIM) -> int:
+                             min_trades: int = MIN_TRADES_FOR_A_CLAIM,
+                             duty_cycle: float = TYPICAL_DUTY_CYCLE) -> int:
     """Shortest validation window that can actually evaluate a strategy
     holding for `max_hold_days`.
 
@@ -108,10 +121,25 @@ def required_validation_bars(max_hold_days: int, n_assets: int,
     unchanged 63-bar window then produced a median of TWO out-of-sample
     trades across 8 seeds. The resulting OOS Sharpe of -1.70 is not a
     result in either direction - there is nothing in it to measure.
+
+    `duty_cycle` corrects the always-invested bound for the fact that
+    `conviction_floor` gates most entries. Without it this function is
+    optimistic by ~4x - its own first version returned 180 bars claiming
+    >=20 trades, and the run delivered 9.
+
+    NOTE ON WHAT THIS IMPLIES. At the measured duty cycle, validating a
+    90-day hold on 10 assets needs ~720 validation bars on top of the
+    training window - more history than the UDiFF bhavcopy archive holds
+    (it starts in 2024, ~650 sessions). The cheap fix is NOT more
+    history, it is more assets: trade count scales linearly with the
+    universe, and bhavcopy is one file per day containing every symbol,
+    so going from 10 names to 50 costs nothing extra to fetch.
     """
     if n_assets < 1 or max_hold_days < 1:
         raise ValueError("n_assets and max_hold_days must be >= 1")
-    return int(np.ceil(min_trades * max_hold_days / n_assets))
+    if not 0.0 < duty_cycle <= 1.0:
+        raise ValueError(f"duty_cycle must be in (0, 1], got {duty_cycle}")
+    return int(np.ceil(min_trades * max_hold_days / (n_assets * duty_cycle)))
 
 # Not exactly 0.0. Zero used to beat every negative score, which made
 # never-trading the global optimum as soon as a search started failing -

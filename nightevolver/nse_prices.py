@@ -245,6 +245,56 @@ def build_adjusted_frames(days: Dict[pd.Timestamp, pd.DataFrame],
             raw_vol[keep].fillna(0.0))
 
 
+def top_liquid_symbols(as_of: str, n: int = 50, use_cache: bool = True,
+                       min_price: float = 20.0) -> List[str]:
+    """The `n` most-traded NSE equities by turnover on `as_of`.
+
+    WHY POINT-IN-TIME. Picking "today's large caps" and backtesting them
+    over the past two years is survivorship bias with extra steps: every
+    name in the list is one that survived and stayed liquid, which is
+    information the strategy would not have had. Selecting on a date at
+    or before the training window starts does not eliminate the problem
+    - names that later delisted still vanish from the price panel - but
+    it removes the part that is purely an artefact of choosing the list
+    after seeing the outcome.
+
+    This is nearly free. The bhavcopy is ONE file per session containing
+    every listed security, and it is already being downloaded and cached
+    for the ten-name universe. Going to fifty names costs no extra
+    network, and trade count scales linearly with the universe - which
+    is the binding constraint on validating long-hold strategies here
+    (see ga_engine.required_validation_bars).
+    """
+    date = pd.Timestamp(as_of)
+    # Walk back to the most recent session actually present.
+    for back in range(0, 10):
+        raw, reason = _fetch_raw(date - pd.Timedelta(days=back))
+        if raw is not None:
+            break
+    else:
+        raise RuntimeError(f"no bhavcopy session within 10 days before {as_of}")
+
+    z = zipfile.ZipFile(io.BytesIO(raw))
+    df = pd.read_csv(io.BytesIO(z.read(z.namelist()[0])), low_memory=False)
+    df = df[df["SctySrs"].astype(str).str.strip().isin(EQUITY_SERIES)]
+    if "FinInstrmTp" in df.columns:
+        df = df[df["FinInstrmTp"].astype(str).str.strip() == "STK"]
+    df = df[pd.to_numeric(df["ClsPric"], errors="coerce") >= min_price]
+
+    turnover_col = "TtlTrfVal" if "TtlTrfVal" in df.columns else None
+    if turnover_col is None:
+        df["_t"] = (pd.to_numeric(df["ClsPric"], errors="coerce")
+                    * pd.to_numeric(df["TtlTradgVol"], errors="coerce"))
+        turnover_col = "_t"
+    df[turnover_col] = pd.to_numeric(df[turnover_col], errors="coerce")
+    df = df.dropna(subset=[turnover_col]).sort_values(turnover_col, ascending=False)
+
+    syms = [str(s).strip() for s in df["TckrSymb"].head(n).tolist()]
+    logger.info("[prices] top %d by turnover as of %s: %s%s", len(syms),
+                date.date(), ", ".join(syms[:8]), " ..." if len(syms) > 8 else "")
+    return syms
+
+
 def fetch_nse_prices(tickers: Sequence[str], start: str, end: Optional[str] = None,
                      max_workers: int = 6, use_cache: bool = True,
                      require_actions: bool = True, with_flows: bool = False):
