@@ -14,7 +14,10 @@ build/
 !.env.example
 kite.env
 *_secret*
+*.secret
+*totp*
 *credentials*
+kite_auth.env
 .venv
 /env/
 /venv/
