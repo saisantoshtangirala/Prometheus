@@ -239,7 +239,35 @@ def build_market_data(close: pd.DataFrame, high: Optional[pd.DataFrame] = None,
     stochastic become near-degenerate - so this is a fallback, not a
     mode to rely on.
     """
+    # PRICE VALIDATION, before anything derives from these numbers.
+    #
+    # Found by audit. A single Inf or 0.0 in the close panel produced a
+    # forward return of 1.8e308 - float max - because the guard at the
+    # bottom of this function is `np.nan_to_num(fwd, nan=0.0)`, and
+    # nan_to_num maps +inf to FLOAT MAX, not to 0. The indicators looked
+    # clean (they are tanh-squashed), so nothing downstream showed a
+    # symptom; only the TARGET was poisoned, and one 1.8e308 return
+    # dominates any mean, Sharpe or fitness it touches.
+    #
+    # Negative prices were also accepted silently.
+    bad = ~np.isfinite(close.to_numpy(dtype=np.float64)) | \
+        (close.to_numpy(dtype=np.float64) <= 0.0)
+    if bad.any():
+        n_bad = int(bad.sum())
+        close = close.mask(pd.DataFrame(bad, index=close.index,
+                                        columns=close.columns))
+        logger.warning("[data] %d non-finite or non-positive close price(s) "
+                       "masked to NaN before any derived quantity is computed",
+                       n_bad)
+
     close = close.dropna(how="any")
+    if close.empty or close.shape[1] == 0:
+        raise ValueError(
+            "no usable price rows after dropping NaNs. An all-NaN column "
+            "silently emptied the whole panel here before this check "
+            "existed, returning a MarketData with 0 bars rather than "
+            "failing - so downstream code computed statistics on empty "
+            "arrays. Check per-symbol coverage before calling this.")
     idx = close.index
     if high is None:
         high = close
@@ -282,7 +310,12 @@ def build_market_data(close: pd.DataFrame, high: Optional[pd.DataFrame] = None,
         low=low.to_numpy(dtype=np.float64)[keep],
         volume=volume.to_numpy(dtype=np.float64)[keep],
         indicators=indicators[keep],
-        forward_returns=np.nan_to_num(fwd[keep], nan=0.0),
+        # posinf/neginf are set explicitly. The default nan_to_num maps
+        # inf to FLOAT MAX (1.8e308), which is not a sane return and
+        # would swamp every downstream statistic - see the validation
+        # note at the top of this function.
+        forward_returns=np.nan_to_num(fwd[keep], nan=0.0,
+                                      posinf=0.0, neginf=0.0),
     )
 
 

@@ -164,6 +164,44 @@ class TestIndicators:
         b = compute_indicators(c2, c2, c2, vol)
         assert np.allclose(a[:250], b[:250], atol=1e-10), "future bars leaked backwards"
 
+    def test_inf_price_does_not_poison_the_target(self):
+        """FOUND BY AUDIT. A single Inf close produced a forward return of
+        1.8e308 - float max - because np.nan_to_num maps +inf to FLOAT
+        MAX, not to 0. The indicators looked clean (tanh-squashed), so
+        only the TARGET was poisoned, and one 1.8e308 return dominates
+        any mean, Sharpe or fitness it touches."""
+        close = _random_walk(300, 5, seed=41)
+        clean = build_market_data(close)
+        d = close.copy()
+        d.iloc[100:105, 1] = np.inf
+        md = build_market_data(d)
+        assert np.isfinite(md.forward_returns).all()
+        assert np.abs(md.forward_returns).max() < 1.0, \
+            f"target poisoned: max|fwd| = {np.abs(md.forward_returns).max():.3g}"
+        assert np.abs(md.forward_returns).max() == pytest.approx(
+            np.abs(clean.forward_returns).max(), rel=0.5)
+
+    def test_zero_and_negative_prices_are_rejected(self):
+        """A zero close divides by zero into the same 1.8e308; a negative
+        close is not a price at all and was silently accepted."""
+        close = _random_walk(300, 5, seed=42)
+        for bad in (0.0, -5.0):
+            d = close.copy()
+            d.iloc[200, 3] = bad
+            md = build_market_data(d)
+            assert np.isfinite(md.forward_returns).all()
+            assert np.abs(md.forward_returns).max() < 1.0, \
+                f"price {bad} poisoned the target"
+
+    def test_all_nan_column_raises_instead_of_emptying_the_panel(self):
+        """dropna(how='any') silently deleted every row and returned a
+        MarketData with 0 bars, so downstream code computed statistics on
+        empty arrays instead of failing."""
+        close = _random_walk(300, 5, seed=43)
+        close["T2"] = np.nan
+        with pytest.raises(ValueError, match="no usable price rows"):
+            build_market_data(close)
+
     def test_forward_returns_are_correctly_aligned(self):
         """forward_returns[t] must be the t -> t+1 move, never t-1 -> t."""
         close = _random_walk(200, 3, seed=5)
@@ -268,6 +306,33 @@ class TestGAEngine:
         assert ABSTENTION_FITNESS < 0.0, "0.0 would dominate every negative"
         assert fitness(loser) < fitness(none) < fitness(winner)
         assert none.abstained and not loser.abstained
+
+    def test_elites_are_carried_over_unmutated(self):
+        """Elitism must PRESERVE the top N, not just seed them. If the
+        elites were mutated, best-fitness could go backwards between
+        generations."""
+        close = _random_walk(300, 5, seed=31, drift=0.0004)
+        md = build_market_data(close)
+        res = GeneticEvolver(GAConfig(population_size=14, n_generations=10,
+                                      elitism=2, seed=7)).evolve(md)
+        best = [h["best_fitness"] for h in res.history]
+        assert all(b2 >= b1 - 1e-12 for b1, b2 in zip(best, best[1:])), \
+            f"best fitness regressed across generations: {best}"
+
+    def test_top_strategies_are_not_near_duplicates(self):
+        """Diversity check. If the top individuals are the same rule with
+        cosmetic differences, the population has collapsed and the search
+        is no longer exploring."""
+        close = _random_walk(300, 5, seed=32, drift=0.0004)
+        md = build_market_data(close)
+        ev = GeneticEvolver(GAConfig(population_size=24, n_generations=8, seed=9))
+        res = ev.evolve(md)
+        assert res.history[-1]["mean_fitness"] != res.history[0]["mean_fitness"]
+        # The evolved strategy must actually use its weight budget rather
+        # than collapsing onto a single indicator.
+        w = res.best_strategy.indicator_weights
+        assert w.max() < 0.9, f"one indicator carries {w.max():.2f} of the vote"
+        assert (w > 0.01).sum() >= 3, "fewer than 3 indicators carry any weight"
 
     def test_validation_window_scales_with_the_holding_period(self):
         """A 63-bar window cannot evaluate a 49-day hold, and nothing
