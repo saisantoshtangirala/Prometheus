@@ -365,13 +365,57 @@ class PaperTrader:
         return stats
 
     def audit(self, day: Optional[int], phase: str, message: str) -> None:
-        """Infinite logging (non-negotiable #4): every decision on the record."""
-        with self._db_lock:
-            self._conn.execute(
-                "INSERT INTO audit_log (ts, day, phase, message) VALUES (?,?,?,?)",
-                (datetime.now(timezone.utc).isoformat(), day, phase, message),
+        """Infinite logging (non-negotiable #4): every decision on the record.
+
+        Best-effort, like every other non-trading-critical write in this
+        class (_backup_trades_db, notifications elsewhere) - a transient
+        sqlite failure here must never take down the whole orchestrator.
+        Observed in production: intermittent "unable to open database
+        file" roughly once per heartbeat_minutes interval, propagating
+        uncaught through orchestrator.heartbeat() -> run_realtime() and
+        killing the entire 365-day paper-trading process, forcing a full
+        digestion->nightmare->evolution->adaptation catch-up replay on
+        every restart. Root-caused as NOT disk space (7% used), NOT
+        inode exhaustion (2% used), NOT file permissions/ownership, and
+        NOT systemd sandboxing (no PrivateTmp/ProtectSystem, WorkingDirectory
+        matches the process's actual cwd) - this box's transient I/O
+        hiccups are simply a real, recurring fact of life, and infinite
+        logging is explicitly NOT worth the whole system's availability.
+        One reconnect-and-retry before giving up: a fresh connection can
+        clear a transient VFS-level hiccup that retrying on the same
+        (possibly now-broken) connection object wouldn't.
+        """
+        entry = (datetime.now(timezone.utc).isoformat(), day, phase, message)
+        try:
+            with self._db_lock:
+                self._conn.execute(
+                    "INSERT INTO audit_log (ts, day, phase, message) VALUES (?,?,?,?)",
+                    entry,
+                )
+                self._conn.commit()
+        except sqlite3.Error as e:
+            logger.warning(
+                "[trader] audit write failed (%s) - reconnecting and retrying once",
+                e,
             )
-            self._conn.commit()
+            try:
+                with self._db_lock:
+                    self._conn.close()
+                    self._conn = sqlite3.connect(
+                        self.db_path, check_same_thread=False,
+                        isolation_level="IMMEDIATE",
+                    )
+                    self._conn.execute(
+                        "INSERT INTO audit_log (ts, day, phase, message) "
+                        "VALUES (?,?,?,?)",
+                        entry,
+                    )
+                    self._conn.commit()
+            except sqlite3.Error as e2:
+                logger.error(
+                    "[trader] audit write failed again after reconnect (%s) "
+                    "- this entry is lost, but trading continues.", e2,
+                )
 
     # -- internals ----------------------------------------------------------
 
