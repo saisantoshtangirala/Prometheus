@@ -22,3 +22,7 @@ build/
 notebooks/.ipynb_checkpoints/
 /logs/
 /KILL_SWITCH
+
+# Cached NSE source data (bhavcopy zips, participant CSVs, corp actions).
+# Re-fetchable and large; the loaders rebuild it on demand.
+/data/cache/
