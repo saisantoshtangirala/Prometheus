@@ -102,7 +102,12 @@ class ScoreNetwork(nn.Module):
         condition: torch.Tensor,  # [B, cond_dim]
     ) -> torch.Tensor:
         B = x_t.shape[0]
-        h = self.input_proj(x_t.view(B, -1))  # [B, hidden_dim]
+        # .reshape(), not .view(): x_t is not always contiguous here (e.g.
+        # AUDIT-2C's _pretrain_score_net() feeds windows sliced from a
+        # pandas DataFrame's .values, which can be Fortran-ordered) -
+        # .view() raises on non-contiguous input, .reshape() copies only
+        # when actually necessary and is otherwise identical.
+        h = self.input_proj(x_t.reshape(B, -1))  # [B, hidden_dim]
         t_emb = self.time_embed(t)             # [B, time_embed_dim]
         c_emb = self.cond_proj(condition)      # [B, hidden_dim]
         h = h + c_emb
