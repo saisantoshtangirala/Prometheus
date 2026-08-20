@@ -108,4 +108,30 @@ jobs:
             echo
             echo "=== systemd unit file - sandboxing directives that could make relative-path file access fail intermittently (PrivateTmp, ProtectSystem, ReadWritePaths, WorkingDirectory) ==="
             systemctl cat kronos.service 2>&1
+
+            echo
+            echo "=== trading activity: logs/trades.db ==="
+            echo "--- daily_performance (all days) ---"
+            sqlite3 -header -column /opt/prometheus/logs/trades.db \
+              "SELECT day, date, equity, pnl, sharpe, directional_accuracy, n_trades FROM daily_performance ORDER BY day;" 2>&1
+            echo "--- most recent 20 trades ---"
+            sqlite3 -header -column /opt/prometheus/logs/trades.db \
+              "SELECT ts, day, ticker, side, quantity, fill_price, notional FROM trades ORDER BY id DESC LIMIT 20;" 2>&1
+            echo "--- total trade count, distinct tickers traded ---"
+            sqlite3 /opt/prometheus/logs/trades.db \
+              "SELECT COUNT(*), COUNT(DISTINCT ticker) FROM trades;" 2>&1
+            echo "--- most recent 15 audit_log entries (any phase) ---"
+            sqlite3 -header -column /opt/prometheus/logs/trades.db \
+              "SELECT ts, day, phase, substr(message,1,80) FROM audit_log ORDER BY id DESC LIMIT 15;" 2>&1
+
+            echo
+            echo "=== most recent daily report ==="
+            ls -la /opt/prometheus/logs/reports/ 2>&1 | tail -5
+            LATEST_REPORT=$(ls -t /opt/prometheus/logs/reports/*.md 2>/dev/null | head -1)
+            if [ -n "$LATEST_REPORT" ]; then
+              echo "--- $LATEST_REPORT ---"
+              cat "$LATEST_REPORT" 2>&1
+            else
+              echo "(no report files found)"
+            fi
           '
