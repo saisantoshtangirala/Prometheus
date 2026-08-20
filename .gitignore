@@ -6,7 +6,15 @@ __pycache__/
 dist/
 build/
 *.so
+# Credentials. `.env` alone matches ONLY a file named exactly that - a
+# file called kite.env or .env.prod would sail straight past it.
 .env
+*.env
+.env.*
+!.env.example
+kite.env
+*_secret*
+*credentials*
 .venv
 /env/
 /venv/
