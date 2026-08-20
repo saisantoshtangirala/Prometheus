@@ -86,5 +86,26 @@ jobs:
               grep -i "open files" /proc/$KPID/limits 2>&1
               echo "--- fd targets sample (first 30) ---"
               ls -la /proc/$KPID/fd 2>&1 | head -30
+              echo "--- process CWD (SQLITE_CANTOPEN on a RELATIVE db_path=logs/trades.db depends on this) ---"
+              readlink -f /proc/$KPID/cwd 2>&1
+              echo "--- process environment (TMPDIR / HOME, relevant to sqlite temp-file and journal creation) ---"
+              tr "\0" "\n" < /proc/$KPID/environ 2>&1 | grep -E "^(TMPDIR|HOME|PWD)="
             fi
+
+            echo
+            echo "=== inode usage (df -h only shows BLOCK space - a CANTOPEN can also come from inode exhaustion even with free bytes) ==="
+            df -i / /tmp 2>&1
+
+            echo
+            echo "=== trades.db and any sibling journal/wal/shm files - ownership, permissions, staleness (a leftover -journal from a bad shutdown, owned by the wrong user, can make the NEXT open() fail with exactly this error) ==="
+            ls -la /opt/prometheus/logs/trades.db* 2>&1
+            echo "--- containing directory permissions/ownership ---"
+            ls -lad /opt/prometheus/logs 2>&1
+            echo "--- whoami / id the SSH+deploy user runs as, vs the systemd service user ---"
+            id 2>&1
+            systemctl show kronos.service -p User -p Group 2>&1
+
+            echo
+            echo "=== systemd unit file - sandboxing directives that could make relative-path file access fail intermittently (PrivateTmp, ProtectSystem, ReadWritePaths, WorkingDirectory) ==="
+            systemctl cat kronos.service 2>&1
           '
