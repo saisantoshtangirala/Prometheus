@@ -30,3 +30,7 @@ notebooks/.ipynb_checkpoints/
 # Recorded market depth. Large, append-only, and irreplaceable - back it
 # up off the box, but do not commit it.
 /data/depth/
+
+# Published project documents are deliverables, not build output - the
+# blanket *.html rule above would silently drop them.
+!docs/*.html
