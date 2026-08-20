@@ -110,19 +110,17 @@ jobs:
             systemctl cat kronos.service 2>&1
 
             echo
-            echo "=== trading activity: logs/trades.db ==="
+            echo "=== trading activity: logs/trades.db (sqlite3 CLI not installed on this box - using the venv python stdlib module instead, one flat -c per query to stay heredoc/indentation-free) ==="
+            PY=/opt/prometheus/.venv/bin/python3
+            DB=/opt/prometheus/logs/trades.db
             echo "--- daily_performance (all days) ---"
-            sqlite3 -header -column /opt/prometheus/logs/trades.db \
-              "SELECT day, date, equity, pnl, sharpe, directional_accuracy, n_trades FROM daily_performance ORDER BY day;" 2>&1
+            $PY -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); rows=c.execute(\"SELECT day, date, equity, pnl, sharpe, directional_accuracy, n_trades FROM daily_performance ORDER BY day\").fetchall(); print(chr(10).join(str(r) for r in rows)) if rows else print(\"(no rows)\")" "$DB"
             echo "--- most recent 20 trades ---"
-            sqlite3 -header -column /opt/prometheus/logs/trades.db \
-              "SELECT ts, day, ticker, side, quantity, fill_price, notional FROM trades ORDER BY id DESC LIMIT 20;" 2>&1
-            echo "--- total trade count, distinct tickers traded ---"
-            sqlite3 /opt/prometheus/logs/trades.db \
-              "SELECT COUNT(*), COUNT(DISTINCT ticker) FROM trades;" 2>&1
-            echo "--- most recent 15 audit_log entries (any phase) ---"
-            sqlite3 -header -column /opt/prometheus/logs/trades.db \
-              "SELECT ts, day, phase, substr(message,1,80) FROM audit_log ORDER BY id DESC LIMIT 15;" 2>&1
+            $PY -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); rows=c.execute(\"SELECT ts, day, ticker, side, quantity, fill_price, notional FROM trades ORDER BY id DESC LIMIT 20\").fetchall(); print(chr(10).join(str(r) for r in rows)) if rows else print(\"(no rows)\")" "$DB"
+            echo "--- total trade count / distinct tickers ---"
+            $PY -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); print(c.execute(\"SELECT COUNT(*), COUNT(DISTINCT ticker) FROM trades\").fetchone())" "$DB"
+            echo "--- most recent 15 audit_log entries ---"
+            $PY -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); rows=c.execute(\"SELECT ts, day, phase, substr(message,1,80) FROM audit_log ORDER BY id DESC LIMIT 15\").fetchall(); print(chr(10).join(str(r) for r in rows)) if rows else print(\"(no rows)\")" "$DB"
 
             echo
             echo "=== most recent daily report ==="
