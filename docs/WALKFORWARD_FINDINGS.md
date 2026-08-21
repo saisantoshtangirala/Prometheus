@@ -159,6 +159,85 @@ detected", but "an edge large enough to matter is excluded".
 
 ---
 
+## The null cloud (30 permutations)
+
+`docs/results/null_cloud.json` — `python scripts/run_null_cloud.py --n 30`.
+Matched trimming, 14 windows each, GA seed fixed at 42 so only the
+permutation varies.
+
+| statistic | real | null mean ± sd | null 95% | pct | P(null ≥ real) |
+|---|---|---|---|---|---|
+| overfitting gap | +3.254 | +2.523 ± **1.559** | [−0.510, +5.738] | 80th | 0.226 |
+| pooled OOS Sharpe | −1.125 | −0.472 ± 1.008 | [−2.428, +1.183] | 20th | 0.806 |
+| mean in-sample Sharpe | +1.897 | +1.808 ± 0.213 | [+1.496, +2.275] | 77th | 0.258 |
+| raw hit rate | 0.500 | 0.491 ± 0.009 | [0.476, 0.506] | 80th | 0.226 |
+
+**Every real statistic falls inside the null's 95% band.** Real market
+data is not distinguishable from data with its signal permuted out.
+
+**A single null draw was not enough, and an earlier version of this
+document over-claimed on one.** It read "the gaps are essentially
+identical: +2.75 real vs +2.84 null" and treated that as agreement. The
+cloud shows the null gap has **sd 1.559** and spans −1.94 to +5.84; two
+draws landing 0.09 apart is coincidence, not agreement. The conclusion
+survives, but it rests on the **in-sample Sharpe** — real +1.897 against
+null +1.808 ± 0.213, 77th percentile — not on the gap.
+
+**Power, stated honestly.** With sd 1.559 at 14 windows, the gap could
+not detect a real difference of ±1.5 Sharpe; it is close to uninformative
+here. The **hit rate** is the tight statistic (sd 0.009) and carries most
+of the evidence. Note also that the null's hit rate sits systematically
+below 0.5 (mean 0.491, max 0.506) — an asymmetry from long-only plus
+abstention, not a defect — so "real at the 80th percentile" describes a
+0.9-percentage-point difference, not an edge.
+
+---
+
+## The volatility and regime targets, same control
+
+`docs/results/target_null_cloud.json` —
+`python scripts/run_target_walkforward.py --n 30`. Per window: rank all
+26 indicators on TRAIN by incremental Spearman over the persistence
+baseline, take the best, score that one pick on TEST. 5 windows
+(train 252, test 63), 30 permutations.
+
+This is the case where the information audit **did** find signal — 7
+pairs surviving a 2,000-draw block-permutation null under BH-FDR,
+incremental ρ of 0.15–0.17 for `atr_pct` and `bb_width`.
+
+| target | IS (selected) | OOS | null OOS mean ± sd | pct | P(null ≥ real) |
+|---|---|---|---|---|---|
+| `vol_5d` | +0.2352 | +0.0779 | +0.0852 ± 0.0304 | 37th | 0.645 |
+| `regime_shift_5d` | +0.2090 | +0.0725 | +0.0822 ± 0.0220 | 33rd | 0.677 |
+| `rel_strength_1d` | +0.0474 | +0.0401 | +0.0394 ± 0.0150 | 57th | 0.452 |
+| `direction_1d` | +0.0487 | +0.0377 | +0.0501 ± 0.0141 | 17th | 0.839 |
+
+**All four inside the cloud**, and on the two targets the audit
+flagged, the real OOS score is *below* the null mean.
+
+**But the picks are stable, unlike the GA's.** `vol_5d` and
+`regime_shift_5d` both select `bb_width, bb_width, bb_width, atr_pct,
+atr_pct` — two distinct features across five windows, and exactly the two
+the audit named, against the GA's 15-distinct-in-16. The selection is not
+thrashing on noise; it reliably locates the relationship the audit found.
+That relationship simply does not pay out-of-sample above what permuted
+data delivers, because a max-over-26 selection extracts ~+0.085
+incremental Spearman from a series with no signal in it.
+
+**These are not the same test as the audit**, and both results stand.
+The audit asked *"does a relationship exist in this history?"* and
+answered yes at p=0.0005. This asks *"can it be selected in advance and
+beat noise?"* and answers no. A real but unusable relationship satisfies
+both.
+
+**Limits.** Five windows is thin. What argues against "underpowered
+rather than absent" is the direction: the real point estimate is below
+the null mean on three of four targets. The OOS score also takes `abs()`,
+so a feature that flips sign out-of-sample still counts as a success —
+generous to the real data, and it still does not clear the null.
+
+---
+
 ## Reading per-window figures
 
 At a 21-bar test window, individual windows carry 2–10 trades. **A
