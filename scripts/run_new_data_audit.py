@@ -60,7 +60,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 from nightevolver.delivery import fetch_delivery_features          # noqa: E402
 from nightevolver.derivatives import fetch_derivative_features     # noqa: E402
 from nightevolver.information_audit import audit_features          # noqa: E402
-from nightevolver.nse_prices import fetch_nse_prices               # noqa: E402
+from nightevolver.nse_prices import fetch_bhav_range, fetch_nse_prices  # noqa: E402
+from nightevolver.patterns import build_pattern_features           # noqa: E402
 from nightevolver.targets import build_targets                     # noqa: E402
 from run_evolved_walkforward import DEFAULT_TICKERS, resolve_universe  # noqa: E402
 
@@ -87,6 +88,47 @@ def align(frame: pd.DataFrame, dates, tickers) -> np.ndarray:
         if t not in f.columns:
             f[t] = np.nan
     return f[list(tickers)].to_numpy(dtype=float)
+
+
+def adjusted_ohlc(md, tickers, start, end=None):
+    """Raw bhavcopy OHLC rescaled onto the ADJUSTED close.
+
+    md.close is corporate-action back-adjusted; the bhavcopy's open,
+    high and low are the actual traded prices. Feeding a mixture into
+    the pattern features would repeat the bug measured in bse_prices.py,
+    where differencing an adjusted series against an unadjusted one
+    produced a stable -16,977 bps "arbitrage" that was purely the two
+    conventions.
+
+    Per bar the adjustment is a single multiplicative factor, so
+    factor = adjusted_close / raw_close recovers it exactly, and
+    applying it to open/high/low puts all four legs on one scale.
+    Within-bar ratios (body/range, shadow/range) are invariant to it
+    anyway; the cross-bar patterns - engulfing, harami, three soldiers -
+    are the ones that would otherwise break across an ex-date.
+    """
+    raw = fetch_bhav_range(list(tickers), start, end)
+    days = sorted(raw)
+    if not days:
+        return None, None, None
+
+    def col(field):
+        return pd.DataFrame(
+            {s: {d: raw[d].set_index("TckrSymb")[field].get(s, np.nan)
+                 for d in days} for s in tickers})
+
+    o, h, l, c = (col(f) for f in ("OpnPric", "HghPric", "LwPric", "ClsPric"))
+    idx = pd.DatetimeIndex(md.dates)
+    o, h, l, c = (x.reindex(index=idx, columns=list(tickers)) for x in (o, h, l, c))
+
+    adj = pd.DataFrame(md.close, index=idx, columns=list(tickers))
+    factor = adj / c.replace(0.0, np.nan)
+    n_adj = int((factor.round(6).nunique() > 1).sum())
+    if n_adj:
+        logger.info("[audit] %d/%d names carry a non-constant adjustment "
+                    "factor - rescaling OHLC onto the adjusted close",
+                    n_adj, len(tickers))
+    return (o * factor).to_numpy(), (h * factor).to_numpy(), (l * factor).to_numpy()
 
 
 def parse_args():
@@ -117,12 +159,27 @@ def main() -> int:
     dates, tickers = md.dates, list(md.tickers)
     logger.info("price panel: %d bars x %d tickers", md.n_bars, len(tickers))
 
+    logger.info("building classical TA / microstructure channels")
+    p_open, p_high, p_low = adjusted_ohlc(md, tickers, a.start, a.end)
+    pattern_channels = {}
+    if p_open is not None:
+        pattern_channels = build_pattern_features(
+            md.close, p_high, p_low, md.volume, open_=p_open)
+        logger.info("  %d pattern channels", len(pattern_channels))
+
     logger.info("fetching derivative features (cached after first run)")
     deriv = fetch_derivative_features(tickers, a.start, a.end)
     logger.info("fetching delivery features")
     deliv = fetch_delivery_features(tickers, a.start, a.end)
 
     channels: Dict[str, np.ndarray] = {}
+    for name, arr in pattern_channels.items():
+        cov = float(np.isfinite(arr).mean())
+        if cov < 0.05:
+            logger.warning("[audit] dropping %s - %.1f%% coverage", name, cov * 100)
+            continue
+        channels[name] = arr
+
     for name, frame in list(deriv.items()) + list(deliv.items()):
         arr = align(frame, dates, tickers)
         cov = float(np.isfinite(arr).mean())
