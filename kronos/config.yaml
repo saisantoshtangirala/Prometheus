@@ -128,9 +128,18 @@ nightevolver:
   max_position: 0.10
   require_gate: true             # never load a checkpoint below the DSR gate
 
-# Not yet wired into KronosOrchestrator - see kronos/execution_adapter.py's
-# module docstring for why (needs the operator's real IBKR paper-account
-# credentials and weeks of proven stability before any live wiring).
+# WIRED. KronosOrchestrator routes every order through
+# build_execution_adapter(); it no longer calls PaperTrader.execute()
+# directly. `simulated` is a thin shim over the same PaperTrader, so this
+# default behaves exactly as the direct calls did.
+#
+# Setting `ibkr` routes orders to a BROKER. It requires ib_insync and the
+# operator's own paper-account credentials, logs at WARNING when
+# selected, and raises rather than falling back to simulation if the
+# broker is unreachable - a system that believes it is trading live while
+# filling against a paper book is worse than one that refuses to start.
+# An unrecognised value raises too: defaulting a typo to either option is
+# a way to trade somewhere nobody chose.
 execution:
   mode: "simulated"    # simulated | ibkr
 

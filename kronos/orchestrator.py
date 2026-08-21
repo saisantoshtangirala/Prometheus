@@ -51,6 +51,7 @@ from kronos.calendar_utils import (
 from kronos.config import KronosConfig, load_config
 from kronos.data_pipeline import DataPipeline, DailyMemory, DataUnavailableError
 from kronos.evolver import KronosEvolver, EvolutionResult
+from kronos.execution_adapter import build_execution_adapter
 from kronos.nightmare_generator import NightmareGenerator, NightmareBuffer
 from kronos.notifier import TelegramNotifier
 from kronos.paper_trader import PaperTrader
@@ -123,6 +124,15 @@ class KronosOrchestrator:
         # opinion" - so the default build behaves exactly as it did
         # before this was wired.
         self.nightevolver = NightEvolverBridge.from_config(self.cfg)
+        # The execution seam. Until now ExecutionAdapter was dead code -
+        # the orchestrator called self.trader.execute() directly in four
+        # places, so the abstraction existed, was tested, and routed
+        # nothing. Routing through it changes no behaviour in the default
+        # `simulated` mode (SimulatedExecutionAdapter is a thin shim over
+        # the same PaperTrader) but makes the seam real, so the IBKR path
+        # is reachable by configuration rather than by editing the
+        # orchestrator.
+        self.execution = build_execution_adapter(self.cfg, self.trader)
 
         self.state = DayState()
         self.master_model: Optional[torch.nn.Module] = None
@@ -469,7 +479,7 @@ class KronosOrchestrator:
                     decision.position_cap,
                     decision.asset_caps.get(ticker, 1.0),
                 )
-                self.trader.execute(
+                self.execution.submit_order(
                     self.state.day, ticker, target, price,
                     (bar_volumes or {}).get(ticker, 0.0),
                     position_cap=asset_cap,
@@ -536,7 +546,7 @@ class KronosOrchestrator:
     def _auto_flatten(self, reason: str) -> None:
         for ticker, price in list(self.trader.last_prices.items()):
             if self.trader.positions.get(ticker, 0.0) != 0.0:
-                self.trader.execute(
+                self.execution.submit_order(
                     self.state.day, ticker, 0.0, price, bar_volume=1e9,
                 )
         self.trader.audit(self.state.day, "risk", f"auto-flatten: {reason}")
@@ -858,14 +868,14 @@ class KronosOrchestrator:
         directive = directive.upper()
         if "FLATTEN" in directive:
             for ticker, price in list(self.trader.last_prices.items()):
-                self.trader.execute(
+                self.execution.submit_order(
                     self.state.day, ticker, 0.0, price, bar_volume=1e9
                 )
         elif directive.startswith("SELL ALL "):
             ticker = directive.split()[-1]
             price = self.trader.last_prices.get(ticker)
             if price:
-                self.trader.execute(
+                self.execution.submit_order(
                     self.state.day, ticker, 0.0, price, bar_volume=1e9
                 )
         elif "HALT" in directive:

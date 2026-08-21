@@ -227,3 +227,44 @@ class IBKRExecutionAdapter(ExecutionAdapter):
             if v.tag == "TotalCashValue":
                 return float(v.value)
         raise RuntimeError("IBKR accountSummary() returned no TotalCashValue")
+
+
+def build_execution_adapter(cfg, trader) -> ExecutionAdapter:
+    """Pick the adapter named by `execution.mode`, defaulting to simulated.
+
+    THE DEFAULT IS LOAD-BEARING, not a convenience. `simulated` routes to
+    SimulatedExecutionAdapter, a thin shim over the same PaperTrader the
+    orchestrator used directly before this seam existed, so wiring the
+    abstraction in changes no behaviour at all. Anything else has to be
+    asked for explicitly in config.
+
+    `ibkr` is constructed only on an explicit request and logs at WARNING
+    when it is, because a broker adapter that gets selected quietly is
+    the one failure here that costs real money. If ib_insync or the
+    credentials are missing it raises rather than silently falling back
+    to simulation - a system that believes it is trading live while
+    filling against a paper book is worse than one that refuses to
+    start.
+    """
+    mode = "simulated"
+    try:
+        block = cfg.get("execution", None)
+        if block:
+            mode = str(block.get("mode", "simulated")).strip().lower()
+    except Exception:                                            # noqa: BLE001
+        pass
+
+    if mode == "simulated":
+        return SimulatedExecutionAdapter(trader)
+
+    if mode == "ibkr":
+        logger.warning(
+            "[execution] mode=ibkr - constructing the IBKR adapter. Orders "
+            "will be routed to a BROKER, not to the paper book. This is "
+            "only correct if you set execution.mode deliberately.")
+        return IBKRExecutionAdapter(trader)
+
+    raise ValueError(
+        f"unknown execution.mode {mode!r} - expected 'simulated' or 'ibkr'. "
+        f"Refusing to guess: defaulting an unrecognised execution mode to "
+        f"either option is a way to trade somewhere nobody chose.")
