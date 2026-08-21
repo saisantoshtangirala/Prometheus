@@ -61,7 +61,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -113,9 +113,17 @@ def load_auth(path: str) -> Dict[str, str]:
     return creds
 
 
+# The 2FA step authenticates a COOKIE JAR, and step 3 must reuse it -
+# a fresh jar would arrive at /connect/login unauthenticated and be sent
+# back to the login page instead of the redirect carrying the token.
+opener_cookiejar: http.cookiejar.CookieJar = http.cookiejar.CookieJar()
+
+
 def _opener() -> urllib.request.OpenerDirector:
-    cj = http.cookiejar.CookieJar()
-    return urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+    global opener_cookiejar
+    opener_cookiejar = http.cookiejar.CookieJar()
+    return urllib.request.build_opener(
+        urllib.request.HTTPCookieProcessor(opener_cookiejar))
 
 
 def _post(opener, url: str, data: Dict[str, str]) -> Dict:
@@ -155,30 +163,76 @@ def web_login(creds: Dict[str, str]) -> str:
     # life left to survive the round trip - see totp_with_headroom.
     code = totp_with_headroom(creds["KITE_TOTP_SECRET"], min_seconds=3.0)
     logger.info("step 2/3: submitting generated 2FA code")
-    _post(opener, f"{KITE_WEB}/api/twofa", {
+    r2 = _post(opener, f"{KITE_WEB}/api/twofa", {
         "user_id": creds["KITE_USER_ID"],
         "request_id": request_id,
         "twofa_value": code,
         "twofa_type": "totp",
     })
+    # Kite can report a REJECTED code with HTTP 200 and status="error".
+    # Without this check a bad seed looks like a step-3 problem and sends
+    # you hunting through redirect-URL configuration instead.
+    if str(r2.get("status", "success")).lower() == "error":
+        raise KiteAuthError(
+            f"2FA rejected: {r2.get('message', r2)}. The TOTP seed is most "
+            f"likely for a different account, or the server clock has "
+            f"drifted more than 30s.")
 
     logger.info("step 3/3: collecting request_token")
+    # DO NOT FOLLOW THE REDIRECT.
+    #
+    # Kite answers /connect/login with a 302 to the app's registered
+    # redirect URL, and `?request_token=...` rides in that Location
+    # header. urllib follows redirects by default, so the first version
+    # read f.geturl() - the end of the chain - and lost the token
+    # whenever the redirect URL was unreachable (http://127.0.0.1/ is
+    # the recommended registration and nothing listens there) or itself
+    # redirected onward. Capturing Location directly makes this work
+    # regardless of what the redirect URL points at.
+    seen: List[str] = []
+
+    class _Capture(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            seen.append(newurl)
+            return None            # stop here; do not fetch newurl
+
+    cap_opener = urllib.request.build_opener(
+        urllib.request.HTTPCookieProcessor(opener_cookiejar), _Capture())
+
     url = f"{KITE_WEB}/connect/login?v=3&api_key={urllib.parse.quote(creds['KITE_API_KEY'])}"
-    token: Optional[str] = None
+    final = ""
     try:
-        with opener.open(urllib.request.Request(
+        with cap_opener.open(urllib.request.Request(
                 url, headers={"User-Agent": "Mozilla/5.0"}), timeout=30) as f:
             final = f.geturl()
     except urllib.error.HTTPError as e:
-        final = e.headers.get("Location", "") if e.headers else ""
-    qs = urllib.parse.parse_qs(urllib.parse.urlparse(final).query)
-    token = (qs.get("request_token") or [None])[0]
+        if e.headers and e.headers.get("Location"):
+            seen.append(e.headers["Location"])
+    except urllib.error.URLError:
+        pass                       # unreachable redirect target is fine
+
+    token: Optional[str] = None
+    for candidate in seen + [final]:
+        if not candidate:
+            continue
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(candidate).query)
+        got = (qs.get("request_token") or [None])[0]
+        if got:
+            token = got
+            break
 
     if not token:
+        # Report WHERE it went, with the query stripped - the redirect
+        # target is the single most diagnostic fact here and it is not a
+        # secret, while the query could carry one.
+        hops = [urllib.parse.urlunparse(
+                    urllib.parse.urlparse(u)._replace(query="", fragment=""))
+                for u in seen if u] or ["(no redirect issued)"]
         raise KiteAuthError(
-            "no request_token after 2FA. Usual causes: the app's redirect "
-            "URL does not match the console, the TOTP seed is for a "
-            "different account, or the password changed.")
+            f"no request_token after 2FA. Redirect chain went to: "
+            f"{' -> '.join(hops)}. Usual causes: the app's redirect URL on "
+            f"the Kite developer console does not match, the TOTP seed is "
+            f"for a different account, or the password changed.")
     return token
 
 
