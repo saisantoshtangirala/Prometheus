@@ -109,6 +109,21 @@ jobs:
             git reset --hard origin/claude/prometheus-causal-market-ol2pau
             test -f scripts/kite_auto_login.py \
               || { echo "kite_auto_login.py missing after pull"; exit 1; }
+
+            # REINSTALL after the pull. Pulling the source is not enough:
+            # if the venv holds a non-editable install, `nightevolver`
+            # resolves to a site-packages copy that predates the new
+            # modules, and the failure is a bare ModuleNotFoundError far
+            # from its cause. Measured exactly that on the first run:
+            # "No module named nightevolver.totp" against a checkout that
+            # plainly contained the file.
+            source .venv/bin/activate 2>/dev/null || true
+            pip install -q -e . 2>&1 | tail -3 || true
+
+            # Prove the module the next step needs is importable HERE,
+            # where the message can name the real problem.
+            python -c "import nightevolver.totp; print(\"nightevolver.totp importable\")" \
+              || { echo "::error::nightevolver.totp still not importable after pip install -e ."; exit 1; }
             echo "code up to date"
           '
 
@@ -167,7 +182,15 @@ jobs:
             set -euo pipefail
             cd /opt/prometheus
             source .venv/bin/activate 2>/dev/null || true
-            python scripts/kite_auto_login.py --check 2>&1 | grep -v -i "token\|secret\|password" || true
+            # No output filter. The first version piped this through
+            # `grep -v -i "token|secret|password"`, which would have
+            # HIDDEN any traceback mentioning those words - and the whole
+            # point of this step is to surface why a login failed. The
+            # script is tested (tests/test_totp.py) never to log, print or
+            # return the seed, and load_auth/write_env are asserted not to
+            # leak; that is the control, not a blanket grep that also
+            # eats diagnostics.
+            python scripts/kite_auto_login.py --check 2>&1 || true
             test -f /etc/nightevolver/kite.env \
               || { echo "no token file produced"; exit 1; }
             [ "$(stat -c %a /etc/nightevolver/kite.env)" = "600" ] \
