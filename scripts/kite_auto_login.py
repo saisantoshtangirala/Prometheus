@@ -264,16 +264,43 @@ def collect_request_token(api_key: str, cookiejar=None) -> str:
 
     hops = [_strip_query(u) for u in seen if u] or ["(no redirect issued)"]
     landed = _strip_query(final) if final else hops[-1]
-    hint = ("The app looks like it still needs its ONE-TIME authorisation: "
-            "open the login URL once in any browser, sign in and press "
-            "Authorise, then re-run this. "
-            if "authoriz" in body.lower() or "authoris" in body.lower()
-            else "")
+
+    # THE CONSENT SCREEN, detected by PATH not by body text.
+    #
+    # A Connect app that the account has never approved gets served
+    # /connect/authorize - Zerodha's "this app wants access to your
+    # account" page - and the chain stops there with a 200. Measured on
+    # run #5: login -> /connect/finish -> /connect/authorize.
+    #
+    # The first version of this check scanned the page BODY for
+    # "authoriz", and missed: the page is a JS shell whose HTML does not
+    # contain the word. The path does, always, and it is the one part of
+    # the response that cannot be re-templated out from under us.
+    #
+    # Deliberately NOT auto-submitted. Approving an application for full
+    # account access - orders and funds - is the account holder's
+    # consent to give, and automating a consent screen is exactly the
+    # step that should stay manual. It is also a ONE-TIME cost: once
+    # approved, this hop disappears and every later login is unattended.
+    if "/connect/authorize" in landed or any(
+            "/connect/authorize" in h for h in hops):
+        raise KiteAuthError(
+            "the Kite app has not been authorised for this account yet. "
+            "Kite stopped at its consent screen (/connect/authorize), which "
+            "needs ONE manual approval and then never appears again. On any "
+            "browser, phone included, open "
+            "https://kite.zerodha.com/connect/login?v=3&api_key=YOUR_API_KEY "
+            "(the login URL shown on the app's page at console.zerodha.com), "
+            "sign in, press Authorise, and re-run this. The page failing to "
+            "load AFTER you press it is expected and means it worked. "
+            "This step is not automated on purpose: granting an app access "
+            "to orders and funds is your consent to give, not this script's.")
+
     raise KiteAuthError(
         f"no request_token after 2FA. Chain: {' -> '.join(hops)}; landed on "
-        f"{landed}. {hint}Other causes: the app's redirect URL on the Kite "
-        f"developer console does not match, the TOTP seed is for a different "
-        f"account, or the password changed.")
+        f"{landed}. Causes: the app's redirect URL on the Kite developer "
+        f"console does not match, the TOTP seed is for a different account, "
+        f"or the password changed.")
 
 
 def exchange(creds: Dict[str, str], request_token: str) -> Dict:

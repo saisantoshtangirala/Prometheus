@@ -175,20 +175,66 @@ class TestDiagnostics:
             _run(mod, routes)
         assert "/connect/login" in str(e.value)
 
-    def test_the_pending_authorisation_case_is_called_out(self, mod):
+    def test_the_consent_screen_is_named_by_path_not_body_text(self, mod):
         """A brand-new Connect app needs one manual Authorise click.
 
-        Indistinguishable from a bad redirect URL unless the page is
-        read - and that difference is a five-minute fix versus an hour
-        of console archaeology.
+        Run #5 landed exactly here, and the previous check - scanning the
+        page BODY for "authoriz" - missed it, because /connect/authorize
+        is a JS shell whose HTML does not contain the word. The path
+        does. This test therefore serves a body with NO such text, so it
+        fails again if anyone reverts to body sniffing.
         """
-        routes = {
-            "/connect/login": (
-                200, {"Content-Type": "text/html"},
-                b"<html><button>Authorize</button></html>"),
-        }
-        with pytest.raises(mod.KiteAuthError, match="ONE-TIME authorisation"):
-            _run(mod, routes)
+        with _Server({}) as srv:
+            srv.routes = {
+                "/connect/login": (
+                    302, {"Location": f"{srv.base}/connect/finish"}, b""),
+                "/connect/finish": (
+                    302, {"Location": f"{srv.base}/connect/authorize"}, b""),
+                "/connect/authorize": (
+                    200, {"Content-Type": "text/html"},
+                    b"<html><div id=app></div></html>"),
+            }
+            mod.KITE_WEB = srv.base
+            with pytest.raises(mod.KiteAuthError, match="not been authorised"):
+                mod.collect_request_token(
+                    "k", cookiejar=http.cookiejar.CookieJar())
+
+    def test_the_consent_error_says_it_is_one_time_and_manual(self, mod):
+        """The two facts that stop someone re-running this five times."""
+        with _Server({}) as srv:
+            srv.routes = {
+                "/connect/login": (
+                    302, {"Location": f"{srv.base}/connect/authorize"}, b""),
+                "/connect/authorize": (200, {}, b"<html></html>"),
+            }
+            mod.KITE_WEB = srv.base
+            with pytest.raises(mod.KiteAuthError) as e:
+                mod.collect_request_token(
+                    "k", cookiejar=http.cookiejar.CookieJar())
+            msg = str(e.value)
+            assert "never appears again" in msg
+            assert "console.zerodha.com" in msg
+
+    def test_a_consent_screen_that_still_yields_a_token_is_not_hijacked(self, mod):
+        """The consent branch must not pre-empt an actual token.
+
+        If Kite ever routes through /connect/authorize AND still issues
+        the redirect, the token wins - the error path is for when there
+        is genuinely nothing to return.
+        """
+        dead = _dead_port()
+        with _Server({}) as srv:
+            srv.routes = {
+                "/connect/login": (
+                    302, {"Location": f"{srv.base}/connect/authorize"}, b""),
+                "/connect/authorize": (
+                    302,
+                    {"Location": f"http://127.0.0.1:{dead}/?request_token=OK7"},
+                    b""),
+            }
+            mod.KITE_WEB = srv.base
+            assert mod.collect_request_token(
+                "k", cookiejar=http.cookiejar.CookieJar()) == "OK7"
 
     def test_the_query_string_is_never_in_the_error(self, mod):
         """Hops carry sess_id, and errors get shipped to CI logs."""
