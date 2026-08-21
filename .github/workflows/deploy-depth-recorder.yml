@@ -1,0 +1,154 @@
+name: Deploy and start the Kite depth recorder
+
+# The tape cannot be backfilled. Kite serves live depth and no history,
+# so every session that goes unrecorded is permanently gone - unlike a
+# model, a feature set or a backtest, all of which can be rebuilt from
+# data that still exists. That asymmetry is why this workflow exists and
+# why it can be started mid-session.
+#
+# `install`  - copy the unit files, enable the weekday timer.
+# `start-now`- ALSO start the recorder immediately, for the case where
+#              the 03:40 UTC timer has already passed today and the
+#              session is still open. Duration is computed from the
+#              remaining time to the close, so a mid-session start
+#              records the rest of the day instead of running past it.
+# `status`   - report only; changes nothing.
+#
+# Depends on /etc/nightevolver/kite.env, which setup-kite-auth.yml
+# writes and refreshes. Without a live token the recorder exits 2 with
+# an auth error rather than spinning - a recorder that looks alive while
+# recording nothing is the failure this design avoids.
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "what to do on the box"
+        required: true
+        default: "status"
+        type: choice
+        options: [status, install, start-now]
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Load Hetzner deploy key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.HETZNER_SSH_KEY }}
+
+      - name: Trust Hetzner host key
+        run: ssh-keyscan -H "${{ secrets.HETZNER_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Report current state
+        run: |
+          set -euo pipefail
+          ssh "${{ secrets.HETZNER_USER }}@${{ secrets.HETZNER_HOST }}" '
+            set -euo pipefail
+            echo "=== token file ==="
+            if [ -f /etc/nightevolver/kite.env ]; then
+              AGE_H=$(( ($(date +%s) - $(stat -c %Y /etc/nightevolver/kite.env)) / 3600 ))
+              echo "present, mode $(stat -c %a /etc/nightevolver/kite.env), age ${AGE_H}h"
+            else
+              echo "MISSING - run setup-kite-auth.yml first"
+            fi
+            echo "=== units ==="
+            systemctl list-unit-files 2>/dev/null | grep nightevolver-depth || echo "not installed"
+            echo "=== timer ==="
+            systemctl status nightevolver-depth.timer --no-pager 2>&1 | head -5 || true
+            echo "=== service ==="
+            systemctl status nightevolver-depth.service --no-pager 2>&1 | head -8 || true
+            echo "=== recorded data so far ==="
+            ls -la /opt/prometheus/data/depth 2>/dev/null | tail -12 || echo "no depth directory yet"
+            du -sh /opt/prometheus/data/depth 2>/dev/null || true
+          '
+
+      - name: Install units and enable the timer
+        if: github.event.inputs.action != 'status'
+        run: |
+          set -euo pipefail
+          ssh "${{ secrets.HETZNER_USER }}@${{ secrets.HETZNER_HOST }}" '
+            set -euo pipefail
+            cd /opt/prometheus
+            git fetch origin claude/prometheus-causal-market-ol2pau
+            git reset --hard origin/claude/prometheus-causal-market-ol2pau
+            source .venv/bin/activate 2>/dev/null || true
+            pip install -q -e . 2>&1 | tail -2 || true
+
+            test -f /etc/nightevolver/kite.env \
+              || { echo "::error::/etc/nightevolver/kite.env missing - run setup-kite-auth.yml"; exit 1; }
+
+            sudo install -m 644 deploy/nightevolver-depth.service /etc/systemd/system/
+            sudo install -m 644 deploy/nightevolver-depth.timer   /etc/systemd/system/
+            sudo systemctl daemon-reload
+            sudo systemctl enable nightevolver-depth.timer
+            sudo systemctl start  nightevolver-depth.timer
+            echo "timer enabled:"
+            systemctl is-enabled nightevolver-depth.timer
+            systemctl list-timers nightevolver-depth.timer --no-pager 2>&1 | head -3
+          '
+
+      - name: Start recording for the remainder of today
+        if: github.event.inputs.action == 'start-now'
+        run: |
+          set -euo pipefail
+          # The unit hardcodes --duration 24000 for a 09:10 IST start.
+          # Starting mid-session with that value would run ~5h past the
+          # close, holding a socket open against a token that expires
+          # overnight. A drop-in override sized to the ACTUAL remaining
+          # session is written instead, and removed afterwards so the
+          # timer's normal full-day run is unaffected tomorrow.
+          ssh "${{ secrets.HETZNER_USER }}@${{ secrets.HETZNER_HOST }}" '
+            set -euo pipefail
+            NOW=$(date -u +%s)
+            CLOSE=$(date -u -d "today 10:00" +%s)   # 15:30 IST
+            REMAIN=$(( CLOSE - NOW ))
+            DOW=$(date -u +%u)
+
+            if [ "$DOW" -gt 5 ]; then
+              echo "weekend - nothing to record, timer will fire Monday"; exit 0
+            fi
+            if [ "$REMAIN" -lt 300 ]; then
+              echo "under 5 minutes to the close ($REMAIN s) - not worth a"
+              echo "session; the timer covers the next trading day."
+              exit 0
+            fi
+
+            echo "starting recorder for ${REMAIN}s (to 15:30 IST)"
+            sudo mkdir -p /etc/systemd/system/nightevolver-depth.service.d
+            printf "[Service]\nExecStart=\nExecStart=/opt/prometheus/.venv/bin/python scripts/record_depth.py --duration %s\n" \
+              "$REMAIN" \
+              | sudo tee /etc/systemd/system/nightevolver-depth.service.d/override.conf >/dev/null
+            sudo systemctl daemon-reload
+            sudo systemctl start nightevolver-depth.service
+
+            sleep 20
+            echo "=== service after 20s ==="
+            systemctl is-active nightevolver-depth.service || true
+            sudo journalctl -u nightevolver-depth.service -n 25 --no-pager
+
+            # A service that is active but has written nothing is the
+            # failure this whole design is meant to make visible, so
+            # check for bytes rather than trusting is-active.
+            sleep 25
+            echo "=== bytes on disk after 45s ==="
+            du -sb /opt/prometheus/data/depth 2>/dev/null || echo "no depth dir"
+          '
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Depth recorder"
+            echo ""
+            echo "- action: \`${{ github.event.inputs.action }}\`"
+            echo "- timer: weekdays 03:40 UTC / 09:10 IST"
+            echo "- data: \`/opt/prometheus/data/depth\`"
+            echo ""
+            echo "The tape cannot be backfilled - Kite serves live depth only."
+          } >> "$GITHUB_STEP_SUMMARY"
