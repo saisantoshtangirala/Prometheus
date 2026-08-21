@@ -172,3 +172,76 @@ class TestParsing:
         day T's file describes day T's close."""
         f = fo_frame()
         assert "TradDt" in f.columns and f["TradDt"].iloc[0] == TRAD
+
+
+class TestLegacyFilesHaveNoUnderlyingPrice:
+    """THE SILENTLY-EMPTY-EPOCH BUG, pinned.
+
+    Pre-2024 F&O bhavcopies carry no UndrlygPric column. Four of the
+    eight channels - atm_iv, iv_skew, iv_term, basis_annualised - need a
+    spot to compute moneyness, so without one they are NaN for every
+    session in that epoch while the other four look perfectly healthy.
+
+    fetch_derivative_features called day_features WITHOUT spot. The
+    2019-2023 backfill exists to extend atm_iv -> vol_5d from ~16 windows
+    to ~30; every new window would have been NaN, the run would have
+    completed, and the reported "no improvement" would have been a
+    missing column rather than a fact about the market. Nothing would
+    have raised.
+    """
+
+    def legacy_frame(self, **kw):
+        """The same day with UndrlygPric stripped, as the legacy parser
+        leaves it."""
+        df = fo_frame(**kw)
+        df["UndrlygPric"] = np.nan
+        return df
+
+    def test_without_spot_the_iv_channels_are_empty(self):
+        """Documents the failure mode itself, so the fix has something
+        to be a fix OF."""
+        f = day_features(self.legacy_frame(), ["RELIANCE"])
+        for ch in ("atm_iv", "iv_skew", "iv_term", "basis_annualised"):
+            assert pd.isna(f.at["RELIANCE", ch]), \
+                f"{ch} computed without a spot - from what moneyness?"
+
+    def test_the_other_four_channels_still_look_healthy(self):
+        """Why this was invisible. Half the feature set is fine, so
+        coverage checks on the block as a whole pass."""
+        f = day_features(self.legacy_frame(), ["RELIANCE"])
+        for ch in ("pcr_oi", "pcr_volume", "oi_change_norm",
+                   "opt_volume_ratio"):
+            assert np.isfinite(f.at["RELIANCE", ch]), ch
+
+    def test_supplying_spot_recovers_every_channel(self):
+        f = day_features(self.legacy_frame(), ["RELIANCE"],
+                         spot={"RELIANCE": 1000.0})
+        for ch in FEATURE_NAMES:
+            assert np.isfinite(f.at["RELIANCE", ch]), f"{ch} still empty"
+
+    def test_the_recovered_iv_is_the_one_the_options_were_priced_at(self):
+        """Not merely finite - correct. A spot that is present but wrong
+        would give a plausible IV that is not the market's."""
+        f = day_features(self.legacy_frame(vol=0.25), ["RELIANCE"],
+                         spot={"RELIANCE": 1000.0})
+        assert f.at["RELIANCE", "atm_iv"] == pytest.approx(0.25, abs=0.01)
+
+    def test_udiff_still_works_without_an_explicit_spot(self):
+        """The modern file supplies its own UndrlygPric, and the new
+        argument must not become mandatory."""
+        f = day_features(fo_frame(vol=0.25), ["RELIANCE"])
+        assert f.at["RELIANCE", "atm_iv"] == pytest.approx(0.25, abs=0.01)
+
+    def test_the_range_fetcher_passes_spot_through(self):
+        """The actual regression. day_features has accepted `spot` all
+        along; the bug was that the range-level fetcher never passed it,
+        which no test of day_features alone can catch."""
+        import inspect
+
+        from nightevolver.derivatives import fetch_derivative_features
+        src = inspect.getsource(fetch_derivative_features)
+        assert "spot=spot" in src, \
+            "fetch_derivative_features dropped spot again - every " \
+            "pre-2024 IV channel is silently NaN"
+        assert "fetch_bhav_day" in src, \
+            "no equity close is being fetched to serve as spot"

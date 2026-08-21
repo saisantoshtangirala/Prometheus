@@ -439,8 +439,23 @@ def fetch_derivative_features(symbols: Sequence[str], start: str,
     Returns {feature_name: DataFrame[date x symbol]} so the result drops
     straight into the same [T, A] layout build_market_data uses for
     price-derived channels.
+
+    SPOT IS SUPPLIED FROM THE EQUITY BHAVCOPY, and it has to be. The
+    UDiFF F&O file (2024+) carries UndrlygPric; the legacy file does not.
+    Without a spot there is no moneyness, hence no ATM strike, hence no
+    atm_iv, iv_skew, iv_term or basis_annualised - so calling
+    day_features without one returns FOUR SILENTLY EMPTY CHANNELS for
+    every pre-2024 session while the other four look perfectly healthy.
+
+    That is the precise failure this would have caused: the 2019-2023
+    backfill exists to extend atm_iv -> vol_5d from ~16 windows to ~30,
+    and every one of the new windows would have been NaN. The run would
+    have completed, reported no improvement, and the conclusion would
+    have been about a missing column rather than about the market.
     """
     from concurrent.futures import ThreadPoolExecutor
+
+    from .nse_prices import fetch_bhav_day
 
     syms = [str(s).upper().replace(".NS", "") for s in symbols]
     dates = pd.bdate_range(start, end or pd.Timestamp.today().normalize())
@@ -448,22 +463,35 @@ def fetch_derivative_features(symbols: Sequence[str], start: str,
     def one(d):
         raw, reason = fetch_fo_raw(d, use_cache=use_cache)
         if raw is None:
-            return d, None, reason
-        return d, parse_fo(raw), reason
+            return d, None, None, reason
+        eq, _ = fetch_bhav_day(d, syms, use_cache=use_cache)
+        spot = (eq.set_index("TckrSymb")["ClsPric"].to_dict()
+                if eq is not None else None)
+        return d, parse_fo(raw), spot, reason
 
     rows: Dict[pd.Timestamp, pd.DataFrame] = {}
     stats = {"ok": 0, "cached": 0, "absent": 0, "throttled": 0, "error": 0}
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        for d, df, reason in ex.map(one, dates):
+        for d, df, spot, reason in ex.map(one, dates):
             stats[reason] = stats.get(reason, 0) + 1
             if df is not None:
-                rows[d] = day_features(df, syms)
+                rows[d] = day_features(df, syms, spot=spot)
 
     if not rows:
         logger.warning("[derivatives] no days fetched: %s", stats)
         return {f: pd.DataFrame() for f in FEATURE_NAMES}
 
     logger.info("[derivatives] %d/%d sessions (%s)", len(rows), len(dates), stats)
+
+    # Per-channel coverage, logged because the failure above is invisible
+    # otherwise: a channel that is empty for a whole epoch has the right
+    # shape, the right name and no values.
+    for f in ("atm_iv", "basis_annualised"):
+        have = sum(1 for d in rows if rows[d][f].notna().any())
+        if have < 0.5 * len(rows):
+            logger.warning("[derivatives] %s present on only %d/%d sessions "
+                           "- check that spot is reaching day_features",
+                           f, have, len(rows))
     idx = sorted(rows)
     return {
         f: pd.DataFrame({d: rows[d][f] for d in idx}).T.reindex(columns=syms)
