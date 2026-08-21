@@ -49,6 +49,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from .nethttp import TRANSIENT_NET_ERRORS
 
 logger = logging.getLogger("nightevolver.kite")
 
@@ -304,7 +305,7 @@ def _get(url: str, creds: Optional[Credentials] = None,
                 continue
             if 400 <= e.code < 500:
                 raise RuntimeError(f"Kite HTTP {e.code}: {body!r}") from e
-        except (urllib.error.URLError, OSError, TimeoutError) as e:
+        except TRANSIENT_NET_ERRORS as e:
             last = e
         time.sleep(min(8.0, 0.5 * (2 ** attempt)))
     raise RuntimeError(f"Kite request failed after {max_attempts} attempts: {last}")

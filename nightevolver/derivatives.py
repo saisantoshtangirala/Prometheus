@@ -56,6 +56,7 @@ from typing import Dict, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+from .nethttp import TRANSIENT_NET_ERRORS
 
 logger = logging.getLogger("nightevolver.derivatives")
 
@@ -177,6 +178,14 @@ def implied_vol(price: float, spot: float, strike: float, t: float,
 # Fetch + cache
 # ---------------------------------------------------------------------
 
+def _zip_is_intact(raw: bytes) -> bool:
+    """True if every member's CRC matches - i.e. the download completed."""
+    try:
+        return zipfile.ZipFile(io.BytesIO(raw)).testzip() is None
+    except (zipfile.BadZipFile, ValueError, OSError):
+        return False
+
+
 def _cache_path(date: pd.Timestamp) -> Path:
     return CACHE_DIR / f"fo_{date:%Y%m%d}.zip"
 
@@ -212,7 +221,10 @@ def fetch_fo_raw(date: pd.Timestamp, timeout: int = 30,
                 req = urllib.request.Request(url, headers=_UA)
                 with urllib.request.urlopen(req, timeout=timeout) as f:
                     raw = f.read()
-                if use_cache:
+                # See nse_prices._zip_is_intact: only a zip whose CRCs
+                # check out is persisted, so a truncated body costs a
+                # retry rather than a permanent cached hole.
+                if use_cache and _zip_is_intact(raw):
                     CACHE_DIR.mkdir(parents=True, exist_ok=True)
                     p.write_bytes(raw)
                 return raw, "ok"
@@ -221,7 +233,7 @@ def fetch_fo_raw(date: pd.Timestamp, timeout: int = 30,
                     absent += 1
                     continue
                 reason = "throttled" if e.code in (403, 429) else "error"
-            except (urllib.error.URLError, OSError, TimeoutError):
+            except TRANSIENT_NET_ERRORS:
                 reason = "error"
         if absent == len(urls):
             return None, "absent"          # genuine non-trading day

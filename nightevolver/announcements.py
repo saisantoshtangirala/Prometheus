@@ -46,6 +46,7 @@ from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 import pandas as pd
+from .nethttp import TRANSIENT_NET_ERRORS
 
 logger = logging.getLogger("nightevolver.announcements")
 
@@ -81,7 +82,7 @@ def _make_opener() -> urllib.request.OpenerDirector:
     try:
         op.open(urllib.request.Request(NSE_HOME, headers=_HEADERS),
                 timeout=25).read(2048)
-    except (urllib.error.URLError, OSError, TimeoutError) as e:
+    except TRANSIENT_NET_ERRORS as e:
         logger.warning("[announcements] homepage warm-up failed: %s", e)
     return op
 
@@ -128,7 +129,7 @@ def fetch_announcements(from_date: Optional[str] = None,
             if e.code not in (401, 403, 429, 503):
                 logger.warning("[announcements] HTTP %s", e.code)
                 return []
-        except (urllib.error.URLError, OSError, ValueError, TimeoutError):
+        except (*TRANSIENT_NET_ERRORS, ValueError):
             pass
         if attempt < max_attempts - 1:
             time.sleep(2.0 * (attempt + 1))

@@ -52,6 +52,7 @@ from typing import Dict, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+from .nethttp import TRANSIENT_NET_ERRORS
 
 logger = logging.getLogger("nightevolver.bse")
 
@@ -130,7 +131,7 @@ def fetch_bse_raw(date: pd.Timestamp, timeout: int = 30,
             if e.code == 404:
                 return None, "absent"
             reason = "throttled" if e.code in (403, 429) else "error"
-        except (urllib.error.URLError, OSError, TimeoutError):
+        except TRANSIENT_NET_ERRORS:
             reason = "error"
         if attempt < max_attempts - 1:
             time.sleep(min(6.0, 0.5 * (2 ** attempt)) * (0.5 + random.random()))

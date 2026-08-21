@@ -61,6 +61,7 @@ from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 import pandas as pd
+from .nethttp import TRANSIENT_NET_ERRORS
 
 logger = logging.getLogger("nightevolver.news")
 
@@ -130,7 +131,7 @@ def _gdelt_get(params: Dict[str, str], max_attempts: int = 6,
             if e.code not in (429, 503):
                 logger.warning("[news] GDELT HTTP %s", e.code)
                 return None
-        except (urllib.error.URLError, OSError, ValueError, TimeoutError):
+        except (*TRANSIENT_NET_ERRORS, ValueError):
             pass
         if attempt < max_attempts - 1:
             time.sleep(5.0 * (attempt + 1))
@@ -311,7 +312,7 @@ def poll_feeds(feeds: Optional[Dict[str, str]] = None,
             req = urllib.request.Request(url, headers=_UA)
             with urllib.request.urlopen(req, timeout=timeout) as f:
                 items = parse_rss(f.read())
-        except (urllib.error.URLError, OSError, TimeoutError) as e:
+        except TRANSIENT_NET_ERRORS as e:
             logger.warning("[news] %s unreachable: %s", name, e)
             continue
         age = feed_age_days(items)

@@ -58,6 +58,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from .nethttp import TRANSIENT_NET_ERRORS
 
 logger = logging.getLogger("nightevolver.flows")
 
@@ -188,7 +189,7 @@ def fetch_participant_day(date: pd.Timestamp,
                 # Retrying cannot help and only adds load.
                 return None, "absent"
             reason = "throttled" if e.code in (403, 429) else "error"
-        except (urllib.error.URLError, OSError, TimeoutError):
+        except TRANSIENT_NET_ERRORS:
             reason = "error"
         # Exponential backoff with jitter. Without the jitter, threads
         # that collide once tend to collide again in lockstep.

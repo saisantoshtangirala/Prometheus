@@ -47,6 +47,7 @@ bias no matter how clean the prices are.
 
 from __future__ import annotations
 
+import http.client
 import io
 import logging
 import random
@@ -60,6 +61,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+from .nethttp import TRANSIENT_NET_ERRORS
 
 logger = logging.getLogger("nightevolver.prices")
 
@@ -122,7 +124,7 @@ def _fetch_raw(date: pd.Timestamp, timeout: int = 25,
                     absent += 1
                     continue
                 reason = "throttled" if e.code in (403, 429) else "error"
-            except (urllib.error.URLError, OSError, TimeoutError):
+            except TRANSIENT_NET_ERRORS:
                 reason = "error"
         # Both formats 404 -> a real non-trading day. Anything else is
         # throttling, which measured up to FOUR consecutive 403s on the
@@ -164,6 +166,14 @@ def _parse_bhav(raw: bytes, tickers: Sequence[str]) -> Optional[pd.DataFrame]:
     return df if not df.empty else None
 
 
+def _zip_is_intact(raw: bytes) -> bool:
+    """True if every member's CRC matches - i.e. the download completed."""
+    try:
+        return zipfile.ZipFile(io.BytesIO(raw)).testzip() is None
+    except (zipfile.BadZipFile, ValueError, OSError):
+        return False
+
+
 def _cache_path(date: pd.Timestamp) -> Path:
     return CACHE_DIR / f"{date:%Y%m%d}.zip"
 
@@ -182,13 +192,24 @@ def fetch_bhav_day(date: pd.Timestamp, tickers: Sequence[str],
     raw, reason = _fetch_raw(date)
     if raw is None:
         return None, reason
-    if use_cache:
+    parsed = _parse_bhav(raw, tickers)
+    # Only a STRUCTURALLY INTACT zip gets persisted. A short read that
+    # does not raise IncompleteRead - chunked transfer can end cleanly on
+    # a truncated body - would otherwise write a corrupt file that every
+    # later run reads from cache and treats as a missing session, with no
+    # fetch to correct it. Validating costs one CRC pass and turns a
+    # permanent hole into one retry.
+    #
+    # The test is the zip, NOT `parsed is not None`: parsing also returns
+    # None when the file is perfect but carries none of the requested
+    # tickers, and refusing to cache those would re-download a good
+    # bhavcopy on every run.
+    if use_cache and _zip_is_intact(raw):
         try:
             CACHE_DIR.mkdir(parents=True, exist_ok=True)
             cp.write_bytes(raw)
         except OSError:
             pass
-    parsed = _parse_bhav(raw, tickers)
     return parsed, (reason if parsed is not None else "error")
 
 
