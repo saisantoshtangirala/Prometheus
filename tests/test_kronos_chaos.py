@@ -638,22 +638,67 @@ class TestNeatEvolution:
         out = ens(torch.randn(3, 4))
         assert torch.isfinite(out).all()
 
-    def test_nea04_time_budget_caps_generations(self, config, memory):
-        """NEA-04: an exhausted wall-clock budget stops evolution early."""
+    def test_nea04_time_budget_caps_generations(self, config, memory,
+                                                monkeypatch):
+        """NEA-04: an exhausted wall-clock budget stops evolution early.
+
+        THE GENERATION COST IS INJECTED, not assumed. The original version
+        set n_generations=50 with the comment "would take far too long"
+        and a 0.5s budget - which is a claim about the machine, not about
+        the code. It held on this container (50 generations, 2.9s) and
+        failed on a faster CI runner, where all 50 finished INSIDE the
+        budget, the break never fired, and the test reported a defect in
+        a mechanism that was working perfectly.
+
+        A test whose outcome depends on how fast the hardware is cannot
+        distinguish "the budget was ignored" from "there was nothing to
+        cut", which is the only thing it exists to check. So each
+        generation is made to cost a known 0.1s and the budget is set to
+        0.5s: roughly 5 generations must run, far short of 50, on any
+        machine at any speed.
+        """
         cfg = config
-        cfg.override("evolution.n_generations", 50)   # would take far too long
+        cfg.override("evolution.n_generations", 50)
         evolver = KronosEvolver(cfg)
+
+        per_gen = 0.1
+        budget = 0.5
+        make = evolver._make_evolver
+
+        def slow_make(*a, **k):
+            inner = make(*a, **k)
+            real = inner.evolve
+
+            def slow(*aa, **kk):
+                _time.sleep(per_gen)
+                return real(*aa, **kk)
+
+            inner.evolve = slow
+            return inner
+
+        monkeypatch.setattr(evolver, "_make_evolver", slow_make)
+
         buffer = self._buffer(cfg, memory)
         gens_run = []
         t0 = _time.monotonic()
         result = evolver.evolve(
             buffer,
-            time_budget_seconds=0.5,
+            time_budget_seconds=budget,
             on_generation=lambda gen, pop: gens_run.append(gen),
         )
         elapsed = _time.monotonic() - t0
+
         assert result is not None, "Budgeted evolution must still return a master"
+        assert gens_run, (
+            "No generation ran at all - the budget cut everything, which "
+            "is not 'stopping early', it is not starting")
         assert len(gens_run) < 50, "Budget must cap the generation count"
+        # ~5 generations fit in 0.5s at 0.1s each. The ceiling is loose
+        # because the break is checked BEFORE a generation, so the last
+        # one always overruns the budget by up to per_gen.
+        assert len(gens_run) <= 15, (
+            f"budget of {budget}s allowed {len(gens_run)} generations at "
+            f"{per_gen}s each - the check is not being applied per generation")
         assert elapsed < 30, "Evolution must stop soon after the budget expires"
 
 
