@@ -137,22 +137,38 @@ def _fetch_raw(date: pd.Timestamp, timeout: int = 25,
     return None, reason
 
 
-def _parse_bhav(raw: bytes, tickers: Sequence[str]) -> Optional[pd.DataFrame]:
-    """Extract the requested equity tickers from one bhavcopy zip."""
+def _read_bhav_csv(raw: bytes) -> Optional[pd.DataFrame]:
+    """Bhavcopy zip -> frame with UDiFF column names, whatever the era.
+
+    THE NORMALISATION LIVES HERE AND NOWHERE ELSE. It used to be inlined
+    in _parse_bhav, and top_liquid_symbols - which opens the same zip for
+    a different purpose - carried its own copy that predated legacy
+    support. Resolving a 2019 universe therefore died on
+
+        KeyError: 'SctySrs'
+
+    which is the loud version of this bug. The quiet version is a second
+    reader that renames SOME columns and silently drops the rest.
+    """
     try:
         z = zipfile.ZipFile(io.BytesIO(raw))
-        name = z.namelist()[0]
-        df = pd.read_csv(io.BytesIO(z.read(name)), low_memory=False)
-    except (zipfile.BadZipFile, ValueError, KeyError, OSError):
+        df = pd.read_csv(io.BytesIO(z.read(z.namelist()[0])), low_memory=False)
+    except (zipfile.BadZipFile, ValueError, KeyError, OSError, IndexError):
         return None
 
-    # Normalise the legacy schema onto UDiFF names at the edge, so no
-    # downstream code needs an era check - the one that gets forgotten
-    # yields silently empty features for a whole epoch.
     df.columns = [str(c).strip() for c in df.columns]
     if "SYMBOL" in df.columns and "TckrSymb" not in df.columns:
         df = df.rename(columns=_LEGACY_RENAME)
         df["FinInstrmTp"] = "STK"      # legacy equity files are all stock
+    return df
+
+
+def _parse_bhav(raw: bytes, tickers: Sequence[str]) -> Optional[pd.DataFrame]:
+    """Extract the requested equity tickers from one bhavcopy zip."""
+    df = _read_bhav_csv(raw)
+    if df is None:
+        return None
+
     missing = [c for c in _COLS if c not in df.columns]
     if missing:
         return None
@@ -358,8 +374,11 @@ def top_liquid_symbols(as_of: str, n: int = 50, use_cache: bool = True,
     else:
         raise RuntimeError(f"no bhavcopy session within 10 days before {as_of}")
 
-    z = zipfile.ZipFile(io.BytesIO(raw))
-    df = pd.read_csv(io.BytesIO(z.read(z.namelist()[0])), low_memory=False)
+    df = _read_bhav_csv(raw)
+    if df is None or "SctySrs" not in df.columns:
+        raise RuntimeError(
+            f"bhavcopy for {date.date()} is unreadable or has no series "
+            "column - cannot rank a universe from it")
     df = df[df["SctySrs"].astype(str).str.strip().isin(EQUITY_SERIES)]
     if "FinInstrmTp" in df.columns:
         df = df[df["FinInstrmTp"].astype(str).str.strip() == "STK"]
