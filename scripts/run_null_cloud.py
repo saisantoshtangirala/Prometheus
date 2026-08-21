@@ -52,7 +52,7 @@ from nightevolver.data_loader import build_market_data           # noqa: E402
 from nightevolver.ga_engine import GAConfig                      # noqa: E402
 from nightevolver.nse_prices import fetch_nse_prices             # noqa: E402
 from run_evolved_walkforward import (                            # noqa: E402
-    DEFAULT_TICKERS, block_permute_prices,
+    DEFAULT_TICKERS, block_permute_prices, resolve_universe,
 )
 
 logging.basicConfig(level=logging.INFO,
@@ -102,6 +102,10 @@ def parse_args():
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--start", default="2024-01-01")
     p.add_argument("--tickers", nargs="*", default=DEFAULT_TICKERS)
+    p.add_argument("--universe", type=int, default=None, metavar="N",
+                   help="top N NSE equities by turnover instead of --tickers")
+    p.add_argument("--universe-as-of", default=None, metavar="DATE",
+                   help="point-in-time date for universe selection (default: --start)")
     p.add_argument("--train-window", type=int, default=252)
     p.add_argument("--test-window", type=int, default=21)
     p.add_argument("--population", type=int, default=50)
@@ -121,6 +125,8 @@ def pct_of(value: float, cloud: np.ndarray) -> float:
 def main() -> int:
     args = parse_args()
 
+    args.tickers = resolve_universe(args.tickers, args.universe,
+                                    args.universe_as_of or args.start)
     md0 = fetch_nse_prices(args.tickers, args.start, use_cache=True,
                            require_actions=True)
     close = pd.DataFrame(md0.close, index=pd.DatetimeIndex(md0.dates),

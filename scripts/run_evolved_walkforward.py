@@ -75,11 +75,52 @@ DEFAULT_TICKERS = [
 ]
 
 
+def resolve_universe(tickers, universe_n, as_of):
+    """Explicit ticker list, or the top-N by turnover as of a date.
+
+    BREADTH IS THE CHEAPEST STATISTICAL POWER AVAILABLE HERE. Trade count
+    scales linearly with the number of assets, and trade count is the
+    binding constraint on validating anything with a multi-week holding
+    period - see ga_engine.required_validation_bars, which computes that
+    a 90-day hold on 10 assets needs ~720 validation bars at the measured
+    duty cycle, more history than the archive holds. At 100 assets the
+    same claim needs ~72.
+
+    `top_liquid_symbols` has existed and been correct since it was
+    written, with zero callers. It costs no extra network - the bhavcopy
+    is one file per session containing every listed security and is
+    already downloaded and cached for the ten-name universe.
+
+    POINT-IN-TIME. `as_of` should be at or before the first training
+    window's start. Selecting "today's most liquid names" and testing
+    them across two years of history is survivorship bias with extra
+    steps: every name in that list is one that stayed liquid, which the
+    strategy could not have known.
+    """
+    if not universe_n:
+        return list(tickers)
+    from nightevolver.nse_prices import top_liquid_symbols
+    syms = top_liquid_symbols(as_of, n=universe_n)
+    logger.info("universe: top %d by turnover as of %s (point-in-time)",
+                len(syms), as_of)
+    return syms
+
+
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__.split("\n")[1])
     p.add_argument("--start", default="2024-01-01")
     p.add_argument("--end", default=None)
     p.add_argument("--tickers", nargs="*", default=DEFAULT_TICKERS)
+    p.add_argument("--universe", type=int, default=None, metavar="N",
+                   help="use the top N NSE equities by turnover instead of "
+                        "--tickers. Breadth is the cheapest statistical "
+                        "power available: trade count scales linearly with "
+                        "the universe.")
+    p.add_argument("--universe-as-of", default=None, metavar="DATE",
+                   help="date for the point-in-time universe selection. "
+                        "Defaults to --start, which is at or before every "
+                        "training window and so avoids picking names for "
+                        "having survived.")
     p.add_argument("--train-window", type=int, default=252)
     p.add_argument("--test-window", type=int, default=21,
                    help="OOS bars per window. See the module docstring on "
@@ -142,6 +183,8 @@ def block_permute_prices(close, block: int, seed: int):
 def main() -> int:
     args = parse_args()
 
+    args.tickers = resolve_universe(args.tickers, args.universe,
+                                    args.universe_as_of or args.start)
     logger.info("loading %d tickers from %s (cached bhavcopy)",
                 len(args.tickers), args.start)
     try:

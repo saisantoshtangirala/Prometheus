@@ -67,7 +67,7 @@ from nightevolver.targets import (                               # noqa: E402
     build_targets, persistence_baseline,
 )
 from run_evolved_walkforward import (                            # noqa: E402
-    DEFAULT_TICKERS, block_permute_prices,
+    DEFAULT_TICKERS, block_permute_prices, resolve_universe,
 )
 
 logging.basicConfig(level=logging.INFO,
@@ -176,6 +176,10 @@ def parse_args():
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--start", default="2024-01-01")
     p.add_argument("--tickers", nargs="*", default=DEFAULT_TICKERS)
+    p.add_argument("--universe", type=int, default=None, metavar="N",
+                   help="top N NSE equities by turnover instead of --tickers")
+    p.add_argument("--universe-as-of", default=None, metavar="DATE",
+                   help="point-in-time date for universe selection (default: --start)")
     p.add_argument("--train-window", type=int, default=252)
     p.add_argument("--test-window", type=int, default=63,
                    help="wider than the GA harness's 21: these are "
@@ -189,6 +193,8 @@ def parse_args():
 
 def main() -> int:
     a = parse_args()
+    a.tickers = resolve_universe(a.tickers, a.universe,
+                                 a.universe_as_of or a.start)
     md0 = fetch_nse_prices(a.tickers, a.start, use_cache=True,
                            require_actions=True)
     close = pd.DataFrame(md0.close, index=pd.DatetimeIndex(md0.dates),
