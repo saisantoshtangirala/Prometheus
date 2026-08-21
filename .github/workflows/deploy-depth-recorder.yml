@@ -119,12 +119,25 @@ jobs:
               exit 0
             fi
 
+            # RUN AS THE OWNER OF THE CHECKOUT, not a hardcoded name.
+            # The unit shipped with User=prometheus/Group=prometheus and
+            # that account does not exist on this box, so the first run
+            # died instantly with 217/USER having written nothing.
+            # Deriving the user from the checkout owner keeps this
+            # working whatever the box is set up as, and cannot drift
+            # away from the directory the recorder must write into.
+            RUN_USER=$(stat -c %U /opt/prometheus)
+            RUN_GROUP=$(stat -c %G /opt/prometheus)
+            echo "running as ${RUN_USER}:${RUN_GROUP} (owner of /opt/prometheus)"
+            sudo install -d -o "$RUN_USER" -g "$RUN_GROUP" -m 755 /opt/prometheus/data/depth
+
             echo "starting recorder for ${REMAIN}s (to 15:30 IST)"
             sudo mkdir -p /etc/systemd/system/nightevolver-depth.service.d
-            printf "[Service]\nExecStart=\nExecStart=/opt/prometheus/.venv/bin/python scripts/record_depth.py --duration %s\n" \
-              "$REMAIN" \
+            printf "[Service]\nUser=%s\nGroup=%s\nExecStart=\nExecStart=/opt/prometheus/.venv/bin/python scripts/record_depth.py --duration %s\n" \
+              "$RUN_USER" "$RUN_GROUP" "$REMAIN" \
               | sudo tee /etc/systemd/system/nightevolver-depth.service.d/override.conf >/dev/null
             sudo systemctl daemon-reload
+            sudo systemctl reset-failed nightevolver-depth.service 2>/dev/null || true
             sudo systemctl start nightevolver-depth.service
 
             sleep 20
@@ -132,12 +145,23 @@ jobs:
             systemctl is-active nightevolver-depth.service || true
             sudo journalctl -u nightevolver-depth.service -n 25 --no-pager
 
-            # A service that is active but has written nothing is the
-            # failure this whole design is meant to make visible, so
-            # check for bytes rather than trusting is-active.
+            # BYTES, AND FAIL ON ZERO.
+            #
+            # The first version of this check printed `du` and fell back
+            # to `echo "no depth dir"`, so the step passed while nothing
+            # had been recorded - reproducing, one level up, the exact
+            # "alive but recording nothing" failure the design is meant
+            # to expose. A verification that cannot fail is decoration.
             sleep 25
             echo "=== bytes on disk after 45s ==="
-            du -sb /opt/prometheus/data/depth 2>/dev/null || echo "no depth dir"
+            BYTES=$(du -sb /opt/prometheus/data/depth 2>/dev/null | cut -f1 || echo 0)
+            echo "${BYTES} bytes in /opt/prometheus/data/depth"
+            if [ "${BYTES:-0}" -lt 1000 ]; then
+              echo "::error::recorder wrote ${BYTES} bytes in 45s of an OPEN session - it is not recording"
+              sudo journalctl -u nightevolver-depth.service -n 40 --no-pager
+              exit 1
+            fi
+            echo "recording confirmed"
           '
 
       - name: Summary
