@@ -58,6 +58,7 @@ from kronos.reflex import ReflexArc
 from kronos.reporter import GodsEyeReporter
 from kronos.risk_guard import RiskGuard
 from kronos.bias_estimator import compute_daily_bias
+from kronos.nightevolver_bridge import NightEvolverBridge
 from kronos.runpod_trigger import CHECKPOINT_DIR as RUNPOD_CHECKPOINT_DIR, load_runpod_checkpoint
 from kronos.warmer import KronosWarmer, WarmupResult
 
@@ -117,6 +118,11 @@ class KronosOrchestrator:
         self.reporter = GodsEyeReporter(self.cfg)
         self.notifier = TelegramNotifier(self.cfg)
         self.risk_guard = RiskGuard(self.cfg)
+        # The GA checkpoint consumer. None whenever the config block is
+        # absent or disabled, and every call site treats None as "no
+        # opinion" - so the default build behaves exactly as it did
+        # before this was wired.
+        self.nightevolver = NightEvolverBridge.from_config(self.cfg)
 
         self.state = DayState()
         self.master_model: Optional[torch.nn.Module] = None
@@ -260,7 +266,45 @@ class KronosOrchestrator:
             f"memory built from {memory.source_used}, "
             f"flags={memory.quality_flags}",
         )
+        self._refresh_nightevolver()
         return memory
+
+    def _refresh_nightevolver(self) -> None:
+        """Adopt any new GA checkpoint and reload its deep history.
+
+        Runs once per day, in digestion, because both halves are daily
+        artifacts: the checkpoint is written by the nightly RunPod job,
+        and the history is daily bars. Doing it per tick would re-read a
+        rejected checkpoint 375 times a session.
+
+        Wrapped whole: a failure here must never take down digestion,
+        which the rest of the day depends on. The bridge stays inert and
+        the SNN trades alone.
+        """
+        if self.nightevolver is None:
+            return
+        try:
+            adopted = self.nightevolver.maybe_reload()
+            if adopted:
+                hist = self.pipeline.fetch_history(self.nightevolver.history_days)
+                if hist is not None:
+                    self.nightevolver.set_history(hist[0], hist[1])
+                else:
+                    self.nightevolver.set_history(None)
+            elif self.nightevolver.active:
+                # Same checkpoint, new day - the history still needs to
+                # move forward or the strategy trades a stale window.
+                hist = self.pipeline.fetch_history(self.nightevolver.history_days)
+                if hist is not None:
+                    self.nightevolver.set_history(hist[0], hist[1])
+            self.trader.audit(self.state.day, "nightevolver",
+                              self.nightevolver.status)
+            logger.info("[orchestrator] nightevolver: %s",
+                        self.nightevolver.status)
+        except Exception as e:                                   # noqa: BLE001
+            logger.warning("[orchestrator] nightevolver refresh failed: %s", e)
+            self.trader.audit(self.state.day, "nightevolver",
+                              f"refresh failed, staying inert: {e}")
 
     def run_nightmare(self) -> Optional[NightmareBuffer]:
         if self.state.memory is None:
@@ -385,11 +429,32 @@ class KronosOrchestrator:
         if bar_prices:
             tickers = self.state.memory.tickers
             kelly_fraction = float(self.cfg.trading.kelly_fraction)
+
+            # Mix in the GA checkpoint's opinion, if one is loaded, gated
+            # and covering these names. Applied to the RAW signal, before
+            # Kelly and the position cap below, so sizing still happens in
+            # exactly one place - feeding in the decoder's already-sized
+            # target_weight would apply Kelly twice.
+            #
+            # This sits BEFORE the risk guard and the caps on purpose:
+            # nothing here can widen a position beyond what the SNN path
+            # was already allowed to take, and every order still passes
+            # sanity_check_order and decision.position_cap below.
+            signals = list(decision.signals)
+            if self.nightevolver is not None:
+                try:
+                    signals = self.nightevolver.blend(
+                        tickers, signals, bar_prices)
+                except Exception as e:                           # noqa: BLE001
+                    logger.warning("[orchestrator] nightevolver blend failed, "
+                                   "using SNN signal alone: %s", e)
+                    signals = list(decision.signals)
+
             for i, ticker in enumerate(tickers):
-                if ticker not in bar_prices or i >= len(decision.signals):
+                if ticker not in bar_prices or i >= len(signals):
                     continue
                 price = bar_prices[ticker]
-                target = 0.0 if halted else float(decision.signals[i]) \
+                target = 0.0 if halted else float(signals[i]) \
                     * kelly_fraction * float(self.cfg.trading.max_position_pct)
                 if not halted:
                     rejection = self.risk_guard.sanity_check_order(

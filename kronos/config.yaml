@@ -104,6 +104,30 @@ reporting:
   top_movers: 3
   volatility_windows: [5, 20]
 
+# The GA-evolved strategy trained on RunPod by nightevolver/. Wired
+# through kronos/nightevolver_bridge.py, which loads the checkpoint only
+# if it clears the deflated-Sharpe gate in nightevolver/saver.py.
+#
+# DISABLED BY DEFAULT, and that is a finding rather than caution: this
+# project's information audit could not establish a directional edge in
+# this data by three independent methods, and the break-even win rate
+# implied by NSE's ~22bp round-trip sits above what the measured
+# correlations support. The wiring makes the checkpoint reachable and
+# auditable; it does not make it profitable.
+#
+# blend_weight is the fraction of the signal handed to the GA strategy
+# on the tickers it covers - 0.0 means "loaded, verified, reported, and
+# trading nothing". Tickers outside the checkpoint's universe keep the
+# SNN's signal untouched. Raise this deliberately, in paper mode, and
+# only with out-of-sample evidence in hand.
+nightevolver:
+  enabled: false
+  checkpoint_path: "checkpoints/nightevolver/nightevolver_best.json"
+  blend_weight: 0.0              # 0.0 = observe only; 1.0 = fully replace
+  history_days: 180              # must exceed WARMUP_BARS + 2 = 62
+  max_position: 0.10
+  require_gate: true             # never load a checkpoint below the DSR gate
+
 # Not yet wired into KronosOrchestrator - see kronos/execution_adapter.py's
 # module docstring for why (needs the operator's real IBKR paper-account
 # credentials and weeks of proven stability before any live wiring).

@@ -268,6 +268,42 @@ class DataPipeline:
             if frame is not None
         }
 
+    def fetch_history(self, days: int) -> Optional[tuple]:
+        """A DEEPER price history than the daily cycle needs. (close, volume).
+
+        The daily lifecycle runs on `data.lookback_days` (30), which is
+        plenty for the SNN's return window but well under the 62 bars
+        NightEvolver's indicators need to warm up. Rather than raise
+        lookback_days - which would change the input to every other phase
+        - this fetches a longer window on its own, through the same
+        sources and the same `_clean` path, so there is no second parsing
+        implementation to drift.
+
+        Returns None if every source fails; the caller must treat that as
+        "no history", never as "no positions".
+        """
+        tickers = list(self.cfg.data.tickers)
+        for source in self._sources:
+            try:
+                raw = source.fetch(tickers, days)
+            except Exception as e:                               # noqa: BLE001
+                logger.warning("[history] source %s failed at %dd: %s",
+                               source.name, days, e)
+                continue
+            try:
+                closes, volumes, _flags = self._clean(raw)
+            except Exception as e:                               # noqa: BLE001
+                logger.warning("[history] could not clean %s frame: %s",
+                               source.name, e)
+                continue
+            if closes is None or closes.empty:
+                continue
+            logger.info("[history] %d bars x %d tickers from %s",
+                        len(closes), closes.shape[1], source.name)
+            return closes, volumes
+        logger.warning("[history] every source failed for a %dd fetch", days)
+        return None
+
     # -- cross-validation ---------------------------------------------------
 
     def cross_validate(
