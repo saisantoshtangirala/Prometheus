@@ -66,6 +66,22 @@ logger = logging.getLogger("nightevolver.prices")
 BHAV_URL = ("https://archives.nseindia.com/content/cm/"
             "BhavCopy_NSE_CM_0_0_0_{yyyymmdd}_F_0000.csv.zip")
 
+# UDiFF begins in 2024; before that the archive uses the legacy layout.
+# Supporting both is what makes a ~7-year panel reachable instead of
+# ~2.5, and history is the binding constraint on the one live result in
+# this project (atm_iv -> vol_5d at p=0.065, limited by power).
+LEGACY_BHAV_URL = ("https://archives.nseindia.com/content/historical/"
+                   "EQUITIES/{yyyy}/{MON}/cm{dd}{MON}{yyyy}bhav.csv.zip")
+UDIFF_START = pd.Timestamp("2024-01-01")
+
+# Legacy -> UDiFF names for the columns this module reads.
+_LEGACY_RENAME = {
+    "SYMBOL": "TckrSymb", "SERIES": "SctySrs", "OPEN": "OpnPric",
+    "HIGH": "HghPric", "LOW": "LwPric", "CLOSE": "ClsPric",
+    "PREVCLOSE": "PrvsClsgPric", "TOTTRDQTY": "TtlTradgVol",
+    "TOTTRDVAL": "TtlTrfVal", "TIMESTAMP": "TradDt",
+}
+
 CACHE_DIR = Path(__file__).parent.parent / "data" / "cache" / "nse_bhav"
 
 _UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "Accept": "*/*"}
@@ -87,19 +103,33 @@ def _fetch_raw(date: pd.Timestamp, timeout: int = 25,
     nightevolver/flows.py for the measurement. Retry on 403; treat 404
     as a genuine non-trading day.
     """
-    url = BHAV_URL.format(yyyymmdd=f"{date:%Y%m%d}")
+    mon = f"{date:%b}".upper()
+    urls = [BHAV_URL.format(yyyymmdd=f"{date:%Y%m%d}"),
+            LEGACY_BHAV_URL.format(yyyy=f"{date:%Y}", MON=mon, dd=f"{date:%d}")]
+    if date < UDIFF_START:
+        urls.reverse()
+
     reason = "error"
     for attempt in range(max_attempts):
-        try:
-            req = urllib.request.Request(url, headers=_UA)
-            with urllib.request.urlopen(req, timeout=timeout) as f:
-                return f.read(), "ok"
-        except urllib.error.HTTPError as e:
-            if e.code == 404:
-                return None, "absent"
-            reason = "throttled" if e.code in (403, 429) else "error"
-        except (urllib.error.URLError, OSError, TimeoutError):
-            reason = "error"
+        absent = 0
+        for url in urls:
+            try:
+                req = urllib.request.Request(url, headers=_UA)
+                with urllib.request.urlopen(req, timeout=timeout) as f:
+                    return f.read(), "ok"
+            except urllib.error.HTTPError as e:
+                if e.code == 404:
+                    absent += 1
+                    continue
+                reason = "throttled" if e.code in (403, 429) else "error"
+            except (urllib.error.URLError, OSError, TimeoutError):
+                reason = "error"
+        # Both formats 404 -> a real non-trading day. Anything else is
+        # throttling, which measured up to FOUR consecutive 403s on the
+        # legacy path before succeeding - collapsing that into "absent"
+        # is what manufactured phantom holidays in flows.py.
+        if absent == len(urls):
+            return None, "absent"
         if attempt < max_attempts - 1:
             time.sleep(min(6.0, 0.5 * (2 ** attempt)) * (0.5 + random.random()))
     return None, reason
@@ -110,10 +140,21 @@ def _parse_bhav(raw: bytes, tickers: Sequence[str]) -> Optional[pd.DataFrame]:
     try:
         z = zipfile.ZipFile(io.BytesIO(raw))
         name = z.namelist()[0]
-        df = pd.read_csv(io.BytesIO(z.read(name)), usecols=list(_COLS),
-                         low_memory=False)
+        df = pd.read_csv(io.BytesIO(z.read(name)), low_memory=False)
     except (zipfile.BadZipFile, ValueError, KeyError, OSError):
         return None
+
+    # Normalise the legacy schema onto UDiFF names at the edge, so no
+    # downstream code needs an era check - the one that gets forgotten
+    # yields silently empty features for a whole epoch.
+    df.columns = [str(c).strip() for c in df.columns]
+    if "SYMBOL" in df.columns and "TckrSymb" not in df.columns:
+        df = df.rename(columns=_LEGACY_RENAME)
+        df["FinInstrmTp"] = "STK"      # legacy equity files are all stock
+    missing = [c for c in _COLS if c not in df.columns]
+    if missing:
+        return None
+    df = df[[c for c in _COLS if c in df.columns]]
 
     df = df[df["SctySrs"].astype(str).str.strip().isin(EQUITY_SERIES)]
     if "FinInstrmTp" in df.columns:

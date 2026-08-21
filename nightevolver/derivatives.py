@@ -62,6 +62,27 @@ logger = logging.getLogger("nightevolver.derivatives")
 FO_URL = ("https://archives.nseindia.com/content/fo/"
           "BhavCopy_NSE_FO_0_0_0_{yyyymmdd}_F_0000.csv.zip")
 
+# The UDiFF format begins in 2024. Everything before that is the legacy
+# layout, which is what makes a ~7-year history reachable instead of
+# ~2.5 - and history is the binding constraint on the one live result
+# here (atm_iv -> vol_5d at p=0.065, limited by power, not effect size).
+LEGACY_FO_URL = ("https://archives.nseindia.com/content/historical/"
+                 "DERIVATIVES/{yyyy}/{MON}/fo{dd}{MON}{yyyy}bhav.csv.zip")
+UDIFF_START = pd.Timestamp("2024-01-01")
+
+# Legacy -> UDiFF column names. The two files describe the same market
+# with different vocabularies; normalising at the edge means nothing
+# downstream has to know which era a row came from.
+_LEGACY_RENAME = {
+    "SYMBOL": "TckrSymb", "EXPIRY_DT": "XpryDt", "STRIKE_PR": "StrkPric",
+    "OPTION_TYP": "OptnTp", "CLOSE": "ClsPric", "SETTLE_PR": "SttlmPric",
+    "OPEN_INT": "OpnIntrst", "CHG_IN_OI": "ChngInOpnIntrst",
+    "CONTRACTS": "TtlTradgVol", "TIMESTAMP": "TradDt",
+}
+_LEGACY_INSTRUMENT = {
+    "FUTSTK": "STF", "OPTSTK": "STO", "FUTIDX": "IDF", "OPTIDX": "IDO",
+}
+
 CACHE_DIR = Path(__file__).parent.parent / "data" / "cache" / "nse_fo"
 
 _UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "Accept": "*/*"}
@@ -174,23 +195,36 @@ def fetch_fo_raw(date: pd.Timestamp, timeout: int = 30,
     if use_cache and p.exists() and p.stat().st_size > 0:
         return p.read_bytes(), "cached"
 
-    url = FO_URL.format(yyyymmdd=f"{date:%Y%m%d}")
+    # Try the format that matches the date first, then the other one.
+    # The changeover is documented as 2024 but a hard cutoff would lose
+    # any straddling week, and a 404 from the wrong format is cheap.
+    mon = f"{date:%b}".upper()
+    urls = [FO_URL.format(yyyymmdd=f"{date:%Y%m%d}"),
+            LEGACY_FO_URL.format(yyyy=f"{date:%Y}", MON=mon, dd=f"{date:%d}")]
+    if date < UDIFF_START:
+        urls.reverse()
+
     reason = "error"
     for attempt in range(max_attempts):
-        try:
-            req = urllib.request.Request(url, headers=_UA)
-            with urllib.request.urlopen(req, timeout=timeout) as f:
-                raw = f.read()
-            if use_cache:
-                CACHE_DIR.mkdir(parents=True, exist_ok=True)
-                p.write_bytes(raw)
-            return raw, "ok"
-        except urllib.error.HTTPError as e:
-            if e.code == 404:
-                return None, "absent"
-            reason = "throttled" if e.code in (403, 429) else "error"
-        except (urllib.error.URLError, OSError, TimeoutError):
-            reason = "error"
+        absent = 0
+        for url in urls:
+            try:
+                req = urllib.request.Request(url, headers=_UA)
+                with urllib.request.urlopen(req, timeout=timeout) as f:
+                    raw = f.read()
+                if use_cache:
+                    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                    p.write_bytes(raw)
+                return raw, "ok"
+            except urllib.error.HTTPError as e:
+                if e.code == 404:
+                    absent += 1
+                    continue
+                reason = "throttled" if e.code in (403, 429) else "error"
+            except (urllib.error.URLError, OSError, TimeoutError):
+                reason = "error"
+        if absent == len(urls):
+            return None, "absent"          # genuine non-trading day
         if attempt < max_attempts - 1:
             time.sleep(min(6.0, 0.5 * (2 ** attempt)) * (0.5 + random.random()))
     return None, reason
@@ -204,6 +238,26 @@ def parse_fo(raw: bytes) -> Optional[pd.DataFrame]:
                          low_memory=False)
     except (zipfile.BadZipFile, ValueError, KeyError, OSError):
         return None
+    # LEGACY SCHEMA NORMALISATION. Pre-2024 files use a different
+    # vocabulary for the same market. Renaming at the edge means nothing
+    # downstream needs to know which era a row came from - the
+    # alternative is an era check at every use site, and the one that
+    # gets forgotten produces silently empty features for a whole epoch.
+    df.columns = [str(c).strip() for c in df.columns]
+    if "INSTRUMENT" in df.columns and "FinInstrmTp" not in df.columns:
+        df = df.rename(columns=_LEGACY_RENAME)
+        df["FinInstrmTp"] = (df["INSTRUMENT"].astype(str).str.strip()
+                             .map(_LEGACY_INSTRUMENT))
+        # Legacy has NO underlying-price column. It is filled from the
+        # equity bhavcopy by the caller; left absent here so a missing
+        # spot is visible as NaN rather than silently defaulted.
+        if "UndrlygPric" not in df.columns:
+            df["UndrlygPric"] = np.nan
+        # Futures rows carry OPTION_TYP 'XX' rather than an empty string.
+        if "OptnTp" in df.columns:
+            df["OptnTp"] = df["OptnTp"].astype(str).str.strip().replace(
+                {"XX": ""})
+
     keep = [c for c in _USECOLS if c in df.columns]
     if "FinInstrmTp" not in keep or "TckrSymb" not in keep:
         return None
@@ -281,7 +335,8 @@ def _atm_iv_and_skew(opts: pd.DataFrame, spot: float,
 
 
 def day_features(df: pd.DataFrame,
-                 symbols: Sequence[str]) -> pd.DataFrame:
+                 symbols: Sequence[str],
+                 spot: Optional[Dict[str, float]] = None) -> pd.DataFrame:
     """One day's F&O frame -> [symbol x FEATURE_NAMES].
 
     Ratios are returned as LOGS. A raw put/call ratio is bounded below by
@@ -312,6 +367,17 @@ def day_features(df: pd.DataFrame,
         if c_v > 0 and p_v > 0:
             out.at[sym, "pcr_volume"] = math.log(p_v / c_v)
 
+        # SPOT. UDiFF supplies UndrlygPric; the legacy file does not, so
+        # the caller passes the equity close instead. Without a spot
+        # there is no moneyness, hence no ATM strike, hence no IV, skew
+        # or basis - the four features that make this data worth having.
+        # Falling back to the future's own price was considered and
+        # rejected: basis would become identically zero by construction,
+        # a fabricated reading rather than a missing one.
+        sym_spot = float("nan")
+        if spot is not None and sym in spot:
+            sym_spot = float(spot[sym])
+
         if not futs.empty:
             near = futs.sort_values("XpryDt").iloc[0]
             f_oi = float(near.get("OpnIntrst", np.nan))
@@ -319,14 +385,16 @@ def day_features(df: pd.DataFrame,
             if np.isfinite(f_oi) and f_oi > 0 and np.isfinite(f_doi):
                 out.at[sym, "oi_change_norm"] = f_doi / f_oi
 
-            spot = float(near.get("UndrlygPric", np.nan))
+            spot_ = float(near.get("UndrlygPric", np.nan))
+            if not np.isfinite(spot_):
+                spot_ = sym_spot
             fpx = float(near.get("ClsPric", np.nan))
             xp = near.get("XpryDt")
-            if (np.isfinite(spot) and spot > 0 and np.isfinite(fpx)
+            if (np.isfinite(spot_) and spot_ > 0 and np.isfinite(fpx)
                     and trad_dt is not None and pd.notna(xp)):
                 days = max((xp - trad_dt).days, 1)
                 out.at[sym, "basis_annualised"] = \
-                    (fpx / spot - 1.0) * (365.0 / days)
+                    (fpx / spot_ - 1.0) * (365.0 / days)
 
             f_v = futs["TtlTradgVol"].sum()
             o_v = opts["TtlTradgVol"].sum()
@@ -335,7 +403,7 @@ def day_features(df: pd.DataFrame,
 
             if not opts.empty and trad_dt is not None:
                 expiries = sorted(x for x in opts["XpryDt"].dropna().unique())
-                spot_u = spot if (np.isfinite(spot) and spot > 0) else float("nan")
+                spot_u = spot_ if (np.isfinite(spot_) and spot_ > 0) else float("nan")
                 ivs = []
                 for xd in expiries[:2]:
                     t = max((pd.Timestamp(xd) - trad_dt).days, 1) / 365.0
