@@ -1,0 +1,395 @@
+{
+  "run_at": "2026-08-21T05:56:32.052553+00:00",
+  "config": {
+    "tickers": [
+      "RELIANCE",
+      "TCS",
+      "HDFCBANK",
+      "INFY",
+      "ICICIBANK",
+      "HINDUNILVR",
+      "ITC",
+      "SBIN",
+      "BHARTIARTL",
+      "KOTAKBANK"
+    ],
+    "start": "2024-01-01",
+    "end": null,
+    "walk_forward": {
+      "train_window": 252,
+      "test_window": 21,
+      "cost_bps": 22.0,
+      "n_trials": 3
+    },
+    "ga": {
+      "population_size": 50,
+      "n_generations": 20,
+      "tournament_size": 3,
+      "crossover_prob": 0.7,
+      "mutation_rate": 0.1,
+      "mutation_sigma": 0.05,
+      "elitism": 2,
+      "cost_bps": 22.0,
+      "max_position": 0.1,
+      "seed": 42
+    },
+    "max_windows": null
+  },
+  "n_bars": 589,
+  "result": {
+    "hit_rate": 0.49806490026793687,
+    "hit_rate_p_value": 0.8359742756356079,
+    "n_calls": 3359,
+    "pearson_r": -0.011780226274601117,
+    "pearson_p": 0.49484927239066206,
+    "total_return": -0.06148779724463804,
+    "cagr": -0.04647970123355749,
+    "sharpe": -1.0690464197273322,
+    "deflated_sharpe_prob": 9.32184198727393e-08,
+    "max_drawdown": -0.08084840697962131,
+    "win_rate": 0.3601190476190476,
+    "avg_turnover": 0.022741019027391347,
+    "n_windows": 16,
+    "total_trials": 16800,
+    "mean_overfitting_gap": 2.7502050847086466,
+    "mean_in_sample_sharpe": 2.015775363238709
+  },
+  "windows": [
+    {
+      "window": 1,
+      "in_sample_sharpe": 1.9286266594710175,
+      "oos_sharpe": 0.02448629154789951,
+      "oos_win_rate": 0.5,
+      "oos_trades": 9,
+      "top_indicators": [
+        [
+          "rsi_28",
+          0.07058060100996424
+        ],
+        [
+          "vol_ratio",
+          0.06903021005841417
+        ],
+        [
+          "stoch_k",
+          0.06805773536695262
+        ]
+      ]
+    },
+    {
+      "window": 2,
+      "in_sample_sharpe": 2.9603346467436586,
+      "oos_sharpe": 1.406541823814077,
+      "oos_win_rate": 0.5,
+      "oos_trades": 7,
+      "top_indicators": [
+        [
+          "ret_zscore",
+          0.07178259559576544
+        ],
+        [
+          "stoch_k",
+          0.0689998621728117
+        ],
+        [
+          "dii_idx_fut_net",
+          0.06878864007709465
+        ]
+      ]
+    },
+    {
+      "window": 3,
+      "in_sample_sharpe": 3.101321343975497,
+      "oos_sharpe": 2.7272477688393284,
+      "oos_win_rate": 0.5,
+      "oos_trades": 10,
+      "top_indicators": [
+        [
+          "atr_pct",
+          0.07749178329570847
+        ],
+        [
+          "stoch_d_cross",
+          0.07604916057485218
+        ],
+        [
+          "ret_zscore",
+          0.07500721988054317
+        ]
+      ]
+    },
+    {
+      "window": 4,
+      "in_sample_sharpe": 2.4658966334386068,
+      "oos_sharpe": -7.199071714095781,
+      "oos_win_rate": 0.4,
+      "oos_trades": 5,
+      "top_indicators": [
+        [
+          "fii_opt_directional",
+          0.06626862986525313
+        ],
+        [
+          "vol_ratio",
+          0.06621916597609731
+        ],
+        [
+          "bb_position",
+          0.06513036107542469
+        ]
+      ]
+    },
+    {
+      "window": 5,
+      "in_sample_sharpe": 2.8679718544228536,
+      "oos_sharpe": 1.1052392741136607,
+      "oos_win_rate": 0.6666666666666666,
+      "oos_trades": 4,
+      "top_indicators": [
+        [
+          "vwap_gap",
+          0.07506555980808154
+        ],
+        [
+          "atr_pct",
+          0.07315975267462857
+        ],
+        [
+          "stoch_k",
+          0.07045626368579681
+        ]
+      ]
+    },
+    {
+      "window": 6,
+      "in_sample_sharpe": 1.322420712903187,
+      "oos_sharpe": 1.020644918925621,
+      "oos_win_rate": 0.5,
+      "oos_trades": 2,
+      "top_indicators": [
+        [
+          "stoch_k",
+          0.06342937188993168
+        ],
+        [
+          "di_spread",
+          0.06342937188993168
+        ],
+        [
+          "ema_21_50_cross",
+          0.06338676003364598
+        ]
+      ]
+    },
+    {
+      "window": 7,
+      "in_sample_sharpe": 1.4273663488404909,
+      "oos_sharpe": 0.37458644938911534,
+      "oos_win_rate": 0.5,
+      "oos_trades": 2,
+      "top_indicators": [
+        [
+          "stoch_d_cross",
+          0.0855951430650044
+        ],
+        [
+          "fii_idx_fut_net_chg",
+          0.07300616402800034
+        ],
+        [
+          "stoch_k",
+          0.0715982410213449
+        ]
+      ]
+    },
+    {
+      "window": 8,
+      "in_sample_sharpe": 1.3651170063666083,
+      "oos_sharpe": 1.3258622892985252,
+      "oos_win_rate": 0.25,
+      "oos_trades": 10,
+      "top_indicators": [
+        [
+          "fii_idx_fut_net",
+          0.07473970381543638
+        ],
+        [
+          "macd_signal_cross",
+          0.06932933064230457
+        ],
+        [
+          "mom_5",
+          0.0637569888658155
+        ]
+      ]
+    },
+    {
+      "window": 9,
+      "in_sample_sharpe": 1.613982160860633,
+      "oos_sharpe": -3.170194689520567,
+      "oos_win_rate": 0.0,
+      "oos_trades": 2,
+      "top_indicators": [
+        [
+          "rsi_14",
+          0.06477355780906026
+        ],
+        [
+          "fii_idx_fut_net_chg",
+          0.06282580377429793
+        ],
+        [
+          "price_vs_ema50",
+          0.06268547690165344
+        ]
+      ]
+    },
+    {
+      "window": 10,
+      "in_sample_sharpe": 1.3861217706507984,
+      "oos_sharpe": 3.052104495965996,
+      "oos_win_rate": 0.42857142857142855,
+      "oos_trades": 7,
+      "top_indicators": [
+        [
+          "client_idx_fut_net",
+          0.07763341031395994
+        ],
+        [
+          "bb_position",
+          0.07645193035705102
+        ],
+        [
+          "rsi_14",
+          0.07040417984803694
+        ]
+      ]
+    },
+    {
+      "window": 11,
+      "in_sample_sharpe": 1.9964480288275324,
+      "oos_sharpe": -6.8800566023580965,
+      "oos_win_rate": 0.0,
+      "oos_trades": 4,
+      "top_indicators": [
+        [
+          "dii_idx_fut_net",
+          0.07168935982358811
+        ],
+        [
+          "adx_14",
+          0.06954819305196024
+        ],
+        [
+          "macd_signal_cross",
+          0.0682500661278637
+        ]
+      ]
+    },
+    {
+      "window": 12,
+      "in_sample_sharpe": 1.5187044683546373,
+      "oos_sharpe": 2.304418383756931,
+      "oos_win_rate": 0.5,
+      "oos_trades": 5,
+      "top_indicators": [
+        [
+          "mom_21",
+          0.0925283844790726
+        ],
+        [
+          "rsi_28",
+          0.0920920725190214
+        ],
+        [
+          "bb_width",
+          0.0900124568260832
+        ]
+      ]
+    },
+    {
+      "window": 13,
+      "in_sample_sharpe": 1.8481914828504287,
+      "oos_sharpe": -5.14112485891863,
+      "oos_win_rate": 0.4166666666666667,
+      "oos_trades": 26,
+      "top_indicators": [
+        [
+          "di_spread",
+          0.06489102482086408
+        ],
+        [
+          "bb_position",
+          0.06258309929988357
+        ],
+        [
+          "client_idx_fut_net",
+          0.05984668590215161
+        ]
+      ]
+    },
+    {
+      "window": 14,
+      "in_sample_sharpe": 1.9704864030111535,
+      "oos_sharpe": -4.177320878441748,
+      "oos_win_rate": 0.2,
+      "oos_trades": 4,
+      "top_indicators": [
+        [
+          "fii_opt_directional",
+          0.07905273878447297
+        ],
+        [
+          "client_idx_fut_net",
+          0.07633222538065422
+        ],
+        [
+          "rsi_28",
+          0.07527415269735008
+        ]
+      ]
+    },
+    {
+      "window": 15,
+      "in_sample_sharpe": 2.281472534323963,
+      "oos_sharpe": 3.449838961874454,
+      "oos_win_rate": 0.3333333333333333,
+      "oos_trades": 2,
+      "top_indicators": [
+        [
+          "macd_signal_cross",
+          0.07456624307055698
+        ],
+        [
+          "stoch_d_cross",
+          0.07196637245143528
+        ],
+        [
+          "di_spread",
+          0.06730278600055414
+        ]
+      ]
+    },
+    {
+      "window": 16,
+      "in_sample_sharpe": 2.197943756778276,
+      "oos_sharpe": -1.9740774577097868,
+      "oos_win_rate": 0.3333333333333333,
+      "oos_trades": 4,
+      "top_indicators": [
+        [
+          "bb_position",
+          0.07595512318991837
+        ],
+        [
+          "price_vs_ema50",
+          0.0703387647216882
+        ],
+        [
+          "macd_hist",
+          0.06793270707472479
+        ]
+      ]
+    }
+  ]
+}

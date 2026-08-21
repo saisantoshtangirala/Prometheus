@@ -1,0 +1,146 @@
+# NightEvolver walk-forward: the measurement nothing ever ran
+
+**2026-08-21.** Raw results in `docs/results/` (tracked deliberately —
+`logs/` is gitignored, and 16,800 GA evaluations of evidence should not
+live only in a container that gets reclaimed).
+
+Reproduce offline, no network or GPU, against the cached UDiFF bhavcopy:
+
+```
+python scripts/run_evolved_walkforward.py                    # 16 windows
+python scripts/run_evolved_walkforward.py --rebuild          # matched to null
+python scripts/run_evolved_walkforward.py --null             # control
+```
+
+---
+
+## What was missing
+
+`nightevolver/backtest_evolved.py` implements the one test that can
+answer whether this GA produces durable strategies: a walk-forward that
+**re-evolves inside every window** and scores strictly out-of-sample. It
+existed, correct, with **no caller**. `grep -rl backtest_evolved` found
+the module, its export, its unit test and the README — not
+`scripts/train_nightevolver.py`, whose own docstring says the backtest is
+*"not even imported by this path"*, and not `train-runpod.yml`.
+
+Every number this project had quoted about the GA came from a **single
+train/test split**. That split, as stored in
+`checkpoints/nightevolver/nightevolver_best.json`:
+
+| | |
+|---|---|
+| in-sample | 3 trades over 459 bars, Sharpe 0.60 |
+| out-of-sample | **0 trades** |
+| deflated P(SR>0) | 0.0119 (gate 0.95) |
+| beats_noise | False |
+
+The OOS Sharpe of 0.0 is not "no edge" — it is *nothing happened*. The
+strategy never fired in the holdout, so there was nothing to measure, and
+the reported 0.60 "overfitting gap" is in-sample minus a number that does
+not exist. Both figures looked like measurements.
+
+---
+
+## Results
+
+| | real (full) | real (matched) | **null** |
+|---|---|---|---|
+| bars / windows | 589 / 16 | 528 / 14 | 528 / 14 |
+| hit rate | 49.8% (p=0.836) | 50.0% (p=1.000) | 49.3% (p=0.505) |
+| n directional calls | 3,359 | 2,748 | 2,758 |
+| Pearson r | −0.0118 (p=0.49) | +0.0083 (p=0.66) | −0.0090 (p=0.64) |
+| net Sharpe | −1.07 | −1.12 | −1.39 |
+| total return | −6.15% | −4.48% | −8.65% |
+| mean in-sample Sharpe | +2.02 | +1.90 | +1.71 |
+| **overfitting gap** | **+2.75** | **+3.25** | **+2.84** |
+| OOS trades | 103 | 59 | 114 |
+| deflated P(SR>0) | 0.000 | 0.000 | 0.000 |
+
+`n_trials` for the deflated Sharpe is windows × GA budget — 16,800 and
+14,700 — the honest count when a 1,000-evaluation search is re-run every
+window.
+
+**Which column to quote.** The full real run is the primary result: most
+data, most windows, 103 out-of-sample trades. The matched pair exists
+only for the real-vs-null comparison, because `--null` rebuilds
+MarketData and incurs a second `WARMUP_BARS` trim (589 − 61 = 528); the
+matched run puts real data through that identical path so permutation is
+the only difference. Its 59 pooled trades make it thinner evidence on its
+own.
+
+---
+
+## What it means
+
+**1. The GA overfits, by a factor that is now measured.** In-sample
+Sharpe is positive in **16 of 16 windows** (mean +2.02). Out-of-sample it
+delivers −1.07. A gap of +2.75, reproduced across sixteen independent
+re-evolutions.
+
+**2. The in-sample number is a search artifact, not signal we lost.**
+This is what the null control settles, and it is the finding that changes
+what to do next. Block-permuted data — signal destroyed by construction —
+produces in-sample +1.71 and a gap of **+2.84**, statistically the same
+as real data's +2.75, and on the matched comparison real data's gap
+(+3.25) is *larger* than the null's. A +2.75 gap alone invites the
+response *"we have signal, we just need better regularisation"* — smaller
+population, stronger penalties, fewer generations. The null shows that is
+wrong. Tuning the search cannot recover an edge that is not there.
+
+**3. The search never finds the same thing twice.** Across 16 windows
+there are **15 distinct indicators in the #1 slot**; the most any one
+repeats is 2, and the top-3 has touched 23 of 26 available indicators.
+Durable structure would show the same indicators winning repeatedly.
+This is what fitting noise looks like from the inside — and permuted data
+behaves the same way.
+
+**4. The per-window win rate actively misleads.** 10 of 16 windows were
+OOS-profitable (62.5%, binomial p=0.45), which reads as encouraging until
+the sizes are compared:
+
+```
+wins:    +3.45  +3.05  +2.73  +2.30  +1.41  +1.33  +1.11  +1.02  +0.37  +0.02
+losses:  −7.20  −6.88  −5.14  −4.18  −3.17  −1.97
+```
+
+Win often, lose big; mean −0.73. Reporting "62.5% of windows profitable"
+would state the exact opposite of the truth.
+
+**5. There is no edge hiding behind a sign error.** Hit rates are 49.8%,
+50.0%, 49.3% — one is *exactly* a coin flip at p=1.000 on 2,748 calls.
+At n=3,359 the 95% interval is roughly 48.1–51.5%: not "no edge
+detected", but "an edge large enough to matter is excluded".
+
+---
+
+## Reading per-window figures
+
+At a 21-bar test window, individual windows carry 2–10 trades. **A
+per-window Sharpe on that many trades is noise.** Window 15 shows +3.45
+on two trades; window 13 shows −5.14 on twenty-six. Only the pooled
+series has the sample size to carry a claim. `run_evolved_walkforward.py`
+prints a warning when the median falls below ~2 trades/window, and
+`required_validation_bars()` in `nightevolver/ga_engine.py` exists
+because this project already made this mistake once.
+
+---
+
+## Consequences
+
+The `nightevolver.enabled: false` default in `kronos/config.yaml` and the
+0.95 deflated-Sharpe gate in `nightevolver/saver.py` are now backed by a
+direct measurement rather than inferred from the information audit. The
+gate rejects the current checkpoint at P(SR>0) = 0.000.
+
+Worth naming: had the bridge been wired and switched on without this run,
+the gate would have refused the checkpoint anyway — but nobody would have
+known *why*, and the obvious next move would have been to loosen the
+gate. That is precisely the wrong move, and only the null control makes
+it visibly wrong.
+
+Three independent lines now agree — the information audit (no directional
+edge by three methods), the cost arithmetic (break-even win rate above
+what measured correlations support), and this walk-forward with its
+control. The direction they point is away from tuning the search and
+toward the data itself.
