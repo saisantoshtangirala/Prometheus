@@ -265,7 +265,14 @@ def _atm_iv_and_skew(opts: pd.DataFrame, spot: float,
                            t_years, is_call)
 
     civ, piv = iv_at(spot, True), iv_at(spot, False)
-    atm = float(np.nanmean([civ, piv]))          # average the two ATM legs
+    # Average the two ATM legs, but guard the all-NaN case explicitly.
+    # np.nanmean of [nan, nan] returns nan AND emits "Mean of empty
+    # slice" per call - which on a 600-day fetch is thousands of lines
+    # of warning for a case that is both expected and correctly handled
+    # (a name with no liquid ATM options simply has no ATM IV). Warning
+    # noise that is always benign trains the reader to ignore warnings.
+    legs = [v for v in (civ, piv) if np.isfinite(v)]
+    atm = float(sum(legs) / len(legs)) if legs else float("nan")
     otm_p = iv_at(spot * 0.95, False)
     otm_c = iv_at(spot * 1.05, True)
     skew = (otm_p - otm_c) if (np.isfinite(otm_p) and np.isfinite(otm_c)) \
