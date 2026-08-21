@@ -15,7 +15,16 @@ build/
 kite.env
 *_secret*
 *.secret
-*totp*
+# Secret-bearing files only. NOT source.
+#
+# This line used to read `*totp*`, which also matched
+# nightevolver/totp.py and tests/test_totp.py - so `git add -A` silently
+# skipped them and a commit claiming "28 TOTP tests" shipped neither the
+# module nor the tests. The box then failed with a ModuleNotFoundError
+# for a file that plainly existed in the working tree.
+totp.secret
+totp_secret*
+*.totp
 *credentials*
 kite_auth.env
 .venv
@@ -45,3 +54,11 @@ notebooks/.ipynb_checkpoints/
 # Published project documents are deliverables, not build output - the
 # blanket *.html rule above would silently drop them.
 !docs/*.html
+
+# SAFETY NET. A secret-matching pattern above must never swallow source
+# code. This class of mistake is silent - `git add -A` skips the file and
+# the commit succeeds - so it is worth an explicit un-ignore rather than
+# care. Secrets belong in files without a source extension.
+!**/*.py
+!**/*.yml
+!**/*.yaml
