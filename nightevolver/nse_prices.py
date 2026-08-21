@@ -15,34 +15,47 @@ data the exchange publishes directly.
 is the official daily bhavcopy: open/high/low/close/volume for every
 listed security, per session.
 
-THE CORPORATE-ACTIONS PROBLEM, AND WHY THIS SOLVES IT FOR FREE
---------------------------------------------------------------
+THE CORPORATE-ACTIONS PROBLEM, AND WHY THE FIELD DOES NOT SOLVE IT
+------------------------------------------------------------------
 Raw bhavcopy closes are UNADJUSTED. A 1:5 split shows up as a -80%
 one-day return. Feed that to a volatility target and you have
 manufactured a monstrous fake event; feed it to a directional strategy
 and you have manufactured a fake crash to trade.
 
-The usual fix is to fetch a corporate-actions feed and build adjustment
-factors yourself, which is fiddly and a classic source of subtle,
-edge-manufacturing bugs.
-
-This module does not do that, because it does not have to. The bhavcopy
-carries `PrvsClsgPric` - the exchange's OFFICIAL previous close, which
-NSE itself adjusts on ex-dates for splits, bonuses and dividends. So
+THIS MODULE USED TO CLAIM THE PROBLEM WAS FREE, and it was wrong. The
+claim was that `PrvsClsgPric` is the exchange's officially ADJUSTED
+previous close, so that
 
     return(t) = ClsPric(t) / PrvsClsgPric(t) - 1
 
-is already corporate-action-adjusted, computed by the venue that
-performs the adjustment. Compounding those returns gives a continuous
-adjusted price series with no adjustment logic of our own to get wrong.
+needs no adjustment logic of our own. It was stated as the reason not to
+build a corporate-actions pipeline at all. Measured against the archive,
+on two clean splits:
 
-That is the whole corporate-actions requirement, discharged by using the
-right field instead of building a pipeline.
+    IRCTC     ex 2021-10-28, 1:5    close 913.50 vs prev 4130.15  -77.88%
+    NESTLEIND ex 2024-01-05, 1:10   close 2666.40 vs prev 27116.40 -90.17%
 
-A caveat stated plainly: this handles adjustments, not survivorship. The
-ticker list is supplied by the caller, and if that list was chosen by
-looking at today's large-caps then the backtest inherits survivorship
-bias no matter how clean the prices are.
+Those are the raw split ratios, undiminished. PrvsClsgPric carries the
+PREVIOUS SESSION'S TRADED CLOSE, not an adjusted one.
+
+So the pipeline is required after all, and corporate_actions.py is it:
+adjust_returns divides the ex-date's previous close by the action's
+price ratio, adds back dividends, masks demergers, and masks any
+residual move still exceeding 25% as an action it does not know about.
+Because PrvsClsgPric is unadjusted, that correction is applied once and
+is not a double-adjustment.
+
+This is also why `require_actions=True` is a hard error and not a
+warning. A symbol with no action list is indistinguishable from a failed
+fetch, and the cost of guessing wrong is an -80% bar. The residual mask
+would catch a move that large, but masking silently discards a real
+session; the guard makes the caller decide knowingly.
+
+A second caveat stated plainly: this handles adjustments, not
+survivorship. The ticker list is supplied by the caller, and if that
+list was chosen by looking at today's large-caps then the backtest
+inherits survivorship bias no matter how clean the prices are. Use
+top_liquid_symbols(as_of=...) to rank the universe at a point in time.
 """
 
 from __future__ import annotations
@@ -137,6 +150,42 @@ def _fetch_raw(date: pd.Timestamp, timeout: int = 25,
     return None, reason
 
 
+# Indian ISINs encode the instrument class in the first three characters,
+# and it is the ONLY field that separates company equity from the other
+# things trading in the EQ series. Both `SctySrs` and `FinInstrmTp` read
+# EQ/STK for all of them, in both file formats:
+#
+#   INE  company equity                    RELIANCE  INE002A01018
+#   INF  mutual fund / ETF units           LIQUIDBEES INF732E01037
+#   IN9  differential-voting-rights class  TATAMTRDVR IN9155A01020
+#
+# LIQUIDBEES - a money-market ETF pinned at a 1000 NAV - ranked into a
+# 2019 top-100 by turnover and sat in the panel with 27 distinct closes
+# across 1,825 bars and 0.01% annualised volatility. Nothing rejected it:
+# it is EQ, it is STK, it is enormously traded. In a volatility study a
+# constant series is not merely useless, it is selectable - the lowest-vol
+# "stock" in the universe by a factor of 2,000.
+#
+# DVR lines are excluded for a different reason: TATAMTRDVR is the same
+# company as TATAMOTORS, so keeping both counts one issuer twice and
+# inflates every cross-sectional statistic with a near-duplicate.
+EQUITY_ISIN_PREFIX = "INE"
+
+
+def _equity_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """EQ-series company equity only - no ETFs, funds or DVR classes."""
+    out = df[df["SctySrs"].astype(str).str.strip().isin(EQUITY_SERIES)]
+    if "FinInstrmTp" in out.columns:
+        out = out[out["FinInstrmTp"].astype(str).str.strip() == "STK"]
+    if "ISIN" in out.columns:
+        isin = out["ISIN"].astype(str).str.strip()
+        # Only filter when the column is actually populated; a file that
+        # omits ISINs must not silently yield an empty universe.
+        if isin.str.startswith("IN").any():
+            out = out[isin.str.startswith(EQUITY_ISIN_PREFIX)]
+    return out
+
+
 def _read_bhav_csv(raw: bytes) -> Optional[pd.DataFrame]:
     """Bhavcopy zip -> frame with UDiFF column names, whatever the era.
 
@@ -172,11 +221,13 @@ def _parse_bhav(raw: bytes, tickers: Sequence[str]) -> Optional[pd.DataFrame]:
     missing = [c for c in _COLS if c not in df.columns]
     if missing:
         return None
-    df = df[[c for c in _COLS if c in df.columns]]
 
-    df = df[df["SctySrs"].astype(str).str.strip().isin(EQUITY_SERIES)]
-    if "FinInstrmTp" in df.columns:
-        df = df[df["FinInstrmTp"].astype(str).str.strip() == "STK"]
+    # FILTER BEFORE SUBSETTING. _COLS does not carry ISIN, so narrowing
+    # the frame first would drop the only column that distinguishes an
+    # ETF from a stock - and _equity_rows would then quietly become a
+    # no-op that still looked like it was filtering.
+    df = _equity_rows(df)
+    df = df[[c for c in _COLS if c in df.columns]]
     df["TckrSymb"] = df["TckrSymb"].astype(str).str.strip()
     df = df[df["TckrSymb"].isin(set(tickers))]
     return df if not df.empty else None
@@ -379,9 +430,7 @@ def top_liquid_symbols(as_of: str, n: int = 50, use_cache: bool = True,
         raise RuntimeError(
             f"bhavcopy for {date.date()} is unreadable or has no series "
             "column - cannot rank a universe from it")
-    df = df[df["SctySrs"].astype(str).str.strip().isin(EQUITY_SERIES)]
-    if "FinInstrmTp" in df.columns:
-        df = df[df["FinInstrmTp"].astype(str).str.strip() == "STK"]
+    df = _equity_rows(df)
     df = df[pd.to_numeric(df["ClsPric"], errors="coerce") >= min_price]
 
     turnover_col = "TtlTrfVal" if "TtlTrfVal" in df.columns else None

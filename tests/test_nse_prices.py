@@ -198,3 +198,168 @@ class TestZipIntegrityGuard:
         good = zipped(udiff_csv())
         assert _zip_is_intact(good)
         assert not _zip_is_intact(good[:len(good) // 2])
+
+
+class TestPrvsClsgPricIsNotAdjusted:
+    """THE FALSE PREMISE, pinned against the archive.
+
+    The module docstring used to assert that PrvsClsgPric is the
+    exchange's ADJUSTED previous close, and used that as the reason not
+    to build a corporate-actions pipeline at all. Measured on two clean
+    splits it is simply the previous session's traded close:
+
+        IRCTC     ex 2021-10-28, 1:5    -77.88%
+        NESTLEIND ex 2024-01-05, 1:10   -90.17%
+
+    A wrong RATIONALE is more dangerous than a wrong line of code here.
+    Nothing breaks while corporate_actions.py is doing the work, but a
+    reader who believes the docstring concludes that require_actions
+    =False is harmless - and it is the difference between a real session
+    and an -80% bar.
+    """
+
+    def test_the_docstring_no_longer_claims_the_field_is_adjusted(self):
+        import inspect
+
+        import nightevolver.nse_prices as P
+        doc = inspect.getdoc(P) or ""
+        assert "already corporate-action-adjusted" not in doc, \
+            "the refuted claim is back in the module docstring"
+        assert "-77.88%" in doc or "77.88" in doc, \
+            "the measurement that refuted it is not recorded"
+
+    def test_a_split_bar_is_a_raw_ratio_not_an_adjusted_one(self):
+        """Synthetic, so it runs offline: a 1:10 split with an unadjusted
+        previous close reads as -90%, which is what the archive shows."""
+        csv = ("TradDt,TckrSymb,SctySrs,OpnPric,HghPric,LwPric,ClsPric,"
+               "PrvsClsgPric,TtlTradgVol,TtlTrfVal,FinInstrmTp\n"
+               "2024-01-05,SPLITCO,EQ,2700,2700,2600,2666.40,27116.40,"
+               "100,1000,STK\n")
+        df = _parse_bhav(zipped(csv), ["SPLITCO"]).set_index("TckrSymb")
+        r = df.at["SPLITCO", "ClsPric"] / df.at["SPLITCO", "PrvsClsgPric"] - 1
+        assert r < -0.85, (
+            "an unadjusted split bar must read as a large negative return - "
+            "if this passes at ~0 the field really is adjusted and the "
+            "pipeline is double-correcting")
+
+    def _split_panel(self):
+        idx = pd.date_range("2024-01-02", periods=3, freq="B")
+        return (idx,
+                pd.DataFrame({"SPLITCO": [100.0, 100.0, 10.0]}, index=idx),
+                pd.DataFrame({"SPLITCO": [100.0, 100.0, 100.0]}, index=idx))
+
+    def test_a_failed_fetch_refuses_rather_than_warns(self):
+        """The guard that the false docstring would have talked someone
+        out of. None means the fetch failed, so we do not know whether
+        that -90% is a split or a crash."""
+        from nightevolver.corporate_actions import adjust_returns
+        _, close, prev = self._split_panel()
+        with pytest.raises(RuntimeError, match="fetch FAILED"):
+            adjust_returns(close, prev, {"SPLITCO": None},
+                           require_actions=True)
+
+    def test_a_genuinely_actionless_symbol_does_NOT_block_a_run(self):
+        """[] is an answer, not a failure. NSE's endpoint serves only
+        currently-listed symbols under their current name, so a 2019
+        top-100 always contains names it answers emptily for - NIITTECH
+        (now COFORGE), MCDOWELL-N (UNITDSPR), SRTRANSFIN (SHRIRAMFIN).
+        Refusing those would drop exactly the renamed and delisted names,
+        reintroducing the survivorship bias that as-of universe selection
+        exists to remove."""
+        from nightevolver.corporate_actions import adjust_returns
+        _, close, prev = self._split_panel()
+        rets, masked = adjust_returns(close, prev, {"SPLITCO": []},
+                                      require_actions=True)
+        assert rets is not None
+
+    def test_an_unknown_action_is_masked_not_kept(self):
+        """What protects the actionless names: a move still beyond 25%
+        after adjustment is dropped as an action we do not know about."""
+        import numpy as np
+
+        from nightevolver.corporate_actions import adjust_returns
+        idx, close, prev = self._split_panel()
+        rets, masked = adjust_returns(close, prev, {"SPLITCO": []},
+                                      require_actions=True)
+        assert bool(masked.at[idx[2], "SPLITCO"]), \
+            "an unexplained -90% move was neither adjusted nor masked"
+        assert not np.isfinite(rets.at[idx[2], "SPLITCO"])
+
+    def test_missing_entirely_is_treated_as_a_failure(self):
+        """A symbol absent from the dict is 'we never asked', which is a
+        failure, not an empty answer."""
+        from nightevolver.corporate_actions import adjust_returns
+        _, close, prev = self._split_panel()
+        with pytest.raises(RuntimeError, match="fetch FAILED"):
+            adjust_returns(close, prev, {}, require_actions=True)
+
+
+class TestETFsAndDVRsAreNotEquity:
+    """LIQUIDBEES ranked into a 2019 top-100 by turnover and sat in the
+    panel with 27 distinct closes across 1,825 bars at 0.01% annualised
+    volatility. Nothing rejected it: a money-market ETF is EQ series, is
+    FinInstrmTp STK, and is enormously traded. Only the ISIN prefix
+    separates it.
+
+    In a volatility study a constant series is not merely useless, it is
+    SELECTABLE - the lowest-vol 'stock' in the universe by a factor of
+    2,000, and a search told to find low volatility will find it.
+    """
+
+    ISIN_CSV = (
+        "TradDt,TckrSymb,SctySrs,OpnPric,HghPric,LwPric,ClsPric,"
+        "PrvsClsgPric,TtlTradgVol,TtlTrfVal,FinInstrmTp,ISIN\n"
+        # a real company
+        "2025-02-10,RELIANCE,EQ,1250,1260,1240,1253.65,1250,1000,"
+        "1000000,STK,INE002A01018\n"
+        # a money-market ETF, pinned at 1000, with HUGE turnover
+        "2025-02-10,LIQUIDBEES,EQ,1000,1000,1000,1000.00,1000,900000,"
+        "900000000,STK,INF732E01037\n"
+        # a DVR class of a company already in the panel
+        "2025-02-10,TATAMTRDVR,EQ,89,90,88,89.05,89,5000,"
+        "500000,STK,IN9155A01020\n"
+    )
+
+    def test_an_etf_is_excluded_from_parsed_prices(self):
+        df = _parse_bhav(zipped(self.ISIN_CSV),
+                         ["RELIANCE", "LIQUIDBEES", "TATAMTRDVR"])
+        assert set(df["TckrSymb"]) == {"RELIANCE"}
+
+    def test_an_etf_cannot_win_the_universe_on_turnover(self, monkeypatch):
+        """LIQUIDBEES has 900x RELIANCE's turnover here. Ranking without
+        the ISIN filter puts it first."""
+        import nightevolver.nse_prices as P
+        monkeypatch.setattr(P, "_fetch_raw",
+                            lambda *a, **k: (zipped(self.ISIN_CSV), "ok"))
+        syms = top_liquid_symbols("2025-02-10", n=10, min_price=0.0)
+        assert "LIQUIDBEES" not in syms
+        assert "TATAMTRDVR" not in syms
+        assert syms == ["RELIANCE"]
+
+    def test_the_filter_runs_BEFORE_the_column_subset(self):
+        """_COLS does not carry ISIN. Narrowing the frame first would drop
+        the only discriminating column and turn the filter into a no-op
+        that still looked like it was filtering - which is exactly how it
+        was first written."""
+        from nightevolver.nse_prices import _COLS
+        assert "ISIN" not in _COLS
+        df = _parse_bhav(zipped(self.ISIN_CSV), ["LIQUIDBEES"])
+        assert df is None, "the ISIN filter was bypassed by the subset"
+
+    def test_a_file_without_isins_is_not_emptied(self):
+        """Defensive: an era or a file that omits ISIN must fall back to
+        the series/type filter rather than silently returning nothing."""
+        df = _parse_bhav(zipped(udiff_csv()), ["MEGACORP"])
+        assert df is not None and len(df) == 1
+
+    def test_legacy_files_are_filtered_too(self):
+        """The legacy layout carries ISIN in its own column, and
+        LIQUIDBEES was in the 2019 EQ series as well."""
+        csv = ("SYMBOL,SERIES,OPEN,HIGH,LOW,CLOSE,LAST,PREVCLOSE,TOTTRDQTY,"
+               "TOTTRDVAL,TIMESTAMP,TOTALTRADES,ISIN\n"
+               "RELIANCE,EQ,1090,1095,1085,1092.75,1092,1090,1000,1000000,"
+               "03-JAN-2019,10,INE002A01018\n"
+               "LIQUIDBEES,EQ,1000,1000,1000,1000,1000,1000,900000,900000000,"
+               "03-JAN-2019,10,INF732E01037\n")
+        df = _parse_bhav(zipped(csv), ["RELIANCE", "LIQUIDBEES"])
+        assert set(df["TckrSymb"]) == {"RELIANCE"}

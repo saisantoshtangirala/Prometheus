@@ -154,12 +154,20 @@ def _opener():
 
 def fetch_corporate_actions(symbol: str, use_cache: bool = True,
                             max_attempts: int = 6,
-                            opener=None) -> List[CorporateAction]:
+                            opener=None) -> Optional[List[CorporateAction]]:
     """All announced corporate actions for one NSE symbol.
 
-    Returns [] on persistent failure rather than raising - but the caller
-    MUST treat an empty list as "unknown", not "none". See
-    adjust_returns, which refuses to proceed silently.
+    RETURN VALUE CARRIES THREE STATES, and the difference is the whole
+    point:
+
+        [a, b, ...]  the endpoint answered and listed these actions
+        []           the endpoint answered and has none for this symbol
+        None         we could not get an answer
+
+    Collapsing the last two into [] is what let an unadjusted bonus reach
+    a price panel. adjust_returns refuses to proceed on None and accepts
+    [], so a genuinely actionless symbol does not block a run while a
+    failed fetch still does.
     """
     cp = CACHE_DIR / f"{symbol}.json"
     raw: Optional[bytes] = None
@@ -180,14 +188,19 @@ def fetch_corporate_actions(symbol: str, use_cache: bool = True,
                 break
             except urllib.error.HTTPError as e:
                 if e.code == 404:
-                    return []
+                    return []          # endpoint answered: no such symbol
             except Exception:
                 pass
             if attempt < max_attempts - 1:
                 time.sleep(min(5.0, 0.4 * (2 ** attempt)) * (0.5 + random.random()))
         if raw is None:
+            # NOT []. An empty list means "the endpoint has no actions for
+            # this symbol"; a failed fetch means "we do not know". Merging
+            # them is what let a silently unadjusted -80% split bar reach
+            # a price panel, which is the whole reason require_actions
+            # exists. None is the honest answer and the guard reads it.
             logger.warning("[corpactions] could not fetch %s", symbol)
-            return []
+            return None
         if use_cache:
             try:
                 CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -198,7 +211,7 @@ def fetch_corporate_actions(symbol: str, use_cache: bool = True,
     try:
         payload = json.loads(raw)
     except (json.JSONDecodeError, TypeError):
-        return []
+        return None                    # unreadable body is a failure, not a fact
     rows = payload if isinstance(payload, list) else payload.get("data", [])
 
     out: List[CorporateAction] = []
@@ -216,12 +229,15 @@ def fetch_corporate_actions(symbol: str, use_cache: bool = True,
 
 
 def fetch_all_corporate_actions(symbols: Sequence[str], use_cache: bool = True
-                                ) -> Dict[str, List[CorporateAction]]:
+                                ) -> Dict[str, Optional[List[CorporateAction]]]:
     op = _opener()
-    out: Dict[str, List[CorporateAction]] = {}
+    out: Dict[str, Optional[List[CorporateAction]]] = {}
     for s in symbols:
-        out[s] = fetch_corporate_actions(s, use_cache=use_cache, opener=op)
-        logger.info("[corpactions] %-12s %d actions", s, len(out[s]))
+        got = fetch_corporate_actions(s, use_cache=use_cache, opener=op)
+        out[s] = got
+        # None and [] read differently on purpose - see adjust_returns.
+        logger.info("[corpactions] %-12s %s", s,
+                    "FETCH FAILED" if got is None else f"{len(got)} actions")
     return out
 
 
@@ -235,20 +251,37 @@ def adjust_returns(close: pd.DataFrame, prev_close: pd.DataFrame,
     bars dropped because the correct adjustment is unknown (demergers,
     and unexplained extreme moves).
 
-    Raises when `require_actions` and a symbol has no action list at all,
-    because "we could not fetch it" and "there were none" are the same
-    empty list, and silently treating the first as the second is how the
+    Raises when `require_actions` and a symbol's fetch FAILED (None),
+    because "we could not fetch it" and "there were none" must not be
+    treated alike - silently reading the first as the second is how the
     original bug got in.
+
+    An empty LIST is a different thing and is allowed through. NSE's
+    corporate-actions endpoint only serves currently-listed symbols under
+    their current name, so every point-in-time universe contains names it
+    answers emptily for: a 2019 top-100 includes NIITTECH (now COFORGE),
+    MCDOWELL-N (UNITDSPR), SRTRANSFIN (SHRIRAMFIN), L&TFH (LTF). Refusing
+    those would mean dropping exactly the names that were later renamed,
+    delisted or merged - reintroducing the survivorship bias that
+    selecting the universe as-of a past date exists to remove.
+
+    What protects those names is the residual mask below: any move still
+    beyond 25% after adjustment is dropped as an action we do not know
+    about. Measured over 2019-2026 on the six such names in a 2019
+    top-100, that is 4 bars out of ~7,000 - and three of the four are
+    real crashes (IndiaBulls 2019, COVID 2020) rather than actions, so
+    the mask costs slightly more than it saves and both are negligible.
     """
     if require_actions:
-        missing = [s for s in close.columns if not actions.get(s)]
-        if missing:
+        failed = [s for s in close.columns if actions.get(s, None) is None]
+        if failed:
             raise RuntimeError(
-                f"no corporate-action data for {missing}. An empty list is "
-                f"indistinguishable from a failed fetch, and an unadjusted "
-                f"bonus injects a ~-50% fake return (see module docstring). "
-                f"Pass require_actions=False only if you have confirmed "
-                f"these symbols genuinely have no actions in the window."
+                f"corporate-action fetch FAILED for {failed} (returned None, "
+                f"not an empty list). An unadjusted bonus injects a ~-50% "
+                f"fake return (see module docstring). Re-run to retry, or "
+                f"pass require_actions=False if you accept that any "
+                f"unexplained move beyond 25% will be masked rather than "
+                f"corrected."
             )
 
     rets = close / prev_close.replace(0.0, np.nan) - 1.0
@@ -256,7 +289,7 @@ def adjust_returns(close: pd.DataFrame, prev_close: pd.DataFrame,
 
     applied = {"bonus": 0, "split": 0, "dividend": 0, "demerger": 0}
     for sym in close.columns:
-        for act in actions.get(sym, []):
+        for act in (actions.get(sym) or []):
             if act.ex_date not in close.index:
                 continue
             if act.kind == "demerger":
