@@ -145,23 +145,49 @@ jobs:
             systemctl is-active nightevolver-depth.service || true
             sudo journalctl -u nightevolver-depth.service -n 25 --no-pager
 
-            # BYTES, AND FAIL ON ZERO.
+            # GROWTH, not a byte threshold.
             #
-            # The first version of this check printed `du` and fell back
-            # to `echo "no depth dir"`, so the step passed while nothing
-            # had been recorded - reproducing, one level up, the exact
-            # "alive but recording nothing" failure the design is meant
-            # to expose. A verification that cannot fail is decoration.
-            sleep 25
-            echo "=== bytes on disk after 45s ==="
-            BYTES=$(du -sb /opt/prometheus/data/depth 2>/dev/null | cut -f1 || echo 0)
-            echo "${BYTES} bytes in /opt/prometheus/data/depth"
-            if [ "${BYTES:-0}" -lt 1000 ]; then
-              echo "::error::recorder wrote ${BYTES} bytes in 45s of an OPEN session - it is not recording"
+            # Two wrong versions preceded this one, in opposite
+            # directions, and both are worth keeping named.
+            #
+            # v1 ran `du ... || echo "no depth dir"`, which cannot fail a
+            # step. It passed while the service was dead at 217/USER and
+            # nothing existed on disk - the exact "alive but recording
+            # nothing" failure this design exists to expose, reproduced
+            # in the check meant to catch it.
+            #
+            # v2 required 1000 bytes at 45s and failed a recorder that
+            # was demonstrably working: the journal showed it connected,
+            # subscribed in full mode and writing to
+            # depth_YYYYMMDD.jsonl.gz. The output is GZIP, which buffers
+            # before flushing, so a healthy stream can leave the file
+            # near-empty on disk for the first minute. A false negative
+            # here is not harmless - it invites "fix" attempts against a
+            # recorder that is fine, during a session that cannot be
+            # replayed.
+            #
+            # Growth between two samples is the property that actually
+            # means "recording", and it is robust to buffering: a
+            # buffered writer still has to flush eventually, while a
+            # dead one never grows.
+            sleep 20
+            B1=$(du -sb /opt/prometheus/data/depth 2>/dev/null | cut -f1 || echo 0)
+            echo "t+40s: ${B1:-0} bytes"
+            sleep 75
+            B2=$(du -sb /opt/prometheus/data/depth 2>/dev/null | cut -f1 || echo 0)
+            echo "t+115s: ${B2:-0} bytes"
+
+            if ! systemctl is-active --quiet nightevolver-depth.service; then
+              echo "::error::service is not active"
               sudo journalctl -u nightevolver-depth.service -n 40 --no-pager
               exit 1
             fi
-            echo "recording confirmed"
+            if [ "${B2:-0}" -le "${B1:-0}" ]; then
+              echo "::error::no growth between t+40s and t+115s (${B1} -> ${B2} bytes) during an OPEN session"
+              sudo journalctl -u nightevolver-depth.service -n 40 --no-pager
+              exit 1
+            fi
+            echo "recording confirmed: ${B1} -> ${B2} bytes and service active"
           '
 
       - name: Summary
