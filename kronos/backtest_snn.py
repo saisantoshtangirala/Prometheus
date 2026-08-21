@@ -108,10 +108,21 @@ class SNNTrainConfig:
     pretrain_epochs: int = 5
     finetune_epochs: int = 20
     meta_epochs: int = 10
-    n_black_swans: int = 1000     # unused for library sizing (see PrometheusEngine.
-                                   # train_on_black_swans - n_scenarios is a misleading
-                                   # kwarg, kept here only to mirror scripts/train.py's
-                                   # CLI surface honestly, not because it does anything)
+    n_black_swans: int = 1000     # STILL not the library size - PrometheusEngine's
+                                   # n_scenarios only reaches a log line. Kept to
+                                   # mirror scripts/train.py's CLI surface. The two
+                                   # fields below are the ones that size the library.
+    # THE ACTUAL COST KNOBS. The scenario library is 8 templates x
+    # n_per_template + n_pure_random, and EVERY scenario runs a reverse
+    # diffusion loop of n_diffusion_steps. At the production defaults
+    # (200/500/1000) that is 2.1 MILLION network forward passes per
+    # baseline build - roughly an hour of CPU, which is why this file's
+    # end-to-end tests had to be excluded from the suite despite their
+    # docstring promising "reasonable CI time". Defaults here match
+    # production; the tests set them small.
+    n_per_template: int = 200
+    n_pure_random: int = 500
+    n_diffusion_steps: int = 1000
     batch_size: int = 16
     device: str = "cpu"
     seed: int = 42
@@ -180,12 +191,14 @@ class SNNWalkForwardBacktester:
             d_model=tc.d_model, n_heads=tc.n_heads, n_layers=tc.n_layers,
             device=tc.device, output_dir=tempfile.mkdtemp(prefix="snn_bt_pretrain_"),
             snn_layer_sizes=[32, 16], snn_output_size=n_assets,
+            n_diffusion_steps=tc.n_diffusion_steps,
         )
         engine = PrometheusEngine(cfg)
         logger.info("[backtest_snn] pretrain: %d epochs (one-time, shared)", tc.pretrain_epochs)
         engine.train_on_black_swans(
             n_scenarios=tc.n_black_swans, n_epochs=tc.pretrain_epochs,
             batch_size=tc.batch_size,
+            n_per_template=tc.n_per_template, n_pure_random=tc.n_pure_random,
         )
         logger.info("[backtest_snn] meta: %d epochs/regime (one-time, shared)", tc.meta_epochs)
         self._run_meta(engine, tc)
@@ -240,6 +253,7 @@ class SNNWalkForwardBacktester:
             d_model=tc.d_model, n_heads=tc.n_heads, n_layers=tc.n_layers,
             device=tc.device, output_dir=tempfile.mkdtemp(prefix="snn_bt_window_"),
             snn_layer_sizes=[32, 16], snn_output_size=n_assets,
+            n_diffusion_steps=tc.n_diffusion_steps,
         )
         engine = PrometheusEngine(cfg)
         engine.load(checkpoint_dir)   # weights only - optimizers stay fresh

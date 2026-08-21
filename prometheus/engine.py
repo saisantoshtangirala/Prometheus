@@ -62,7 +62,15 @@ class PrometheusConfig:
         device: str = "cpu",
         output_dir: str = "output",
         log_level: str = "INFO",
+        n_diffusion_steps: int = 1000,
     ):
+        # Reverse-sampling loop length for the diffusion simulator. It
+        # multiplies the cost of every generated scenario, so it is the
+        # single highest-leverage knob for making a run affordable.
+        # Default matches MarketDiffusionSimulator's own, so production
+        # behaviour is unchanged; only callers that lower it see a
+        # difference.
+        self.n_diffusion_steps = n_diffusion_steps
         self.n_assets = n_assets
         self.seq_len = seq_len
         self.horizon = horizon
@@ -146,10 +154,18 @@ class PrometheusEngine:
         )
 
         # Generative subsystem
+        # n_diffusion_steps is a REVERSE-SAMPLING LOOP LENGTH, so it
+        # multiplies the cost of every scenario generated. Left at the
+        # simulator's own 1000 default unless the config overrides it -
+        # production keeps 1000; tests and smoke runs set it low. Without
+        # this knob the only way to make scenario generation affordable
+        # was to not call it.
         self.diffusion = MarketDiffusionSimulator(
             n_assets=cfg.n_assets,
             seq_len=cfg.seq_len,
             device=self.device,
+            **({"n_diffusion_steps": int(cfg.n_diffusion_steps)}
+               if getattr(cfg, "n_diffusion_steps", None) else {}),
         )
         self.black_swan_gen = BlackSwanGenerator(
             simulator=self.diffusion,
@@ -465,6 +481,8 @@ class PrometheusEngine:
         on_epoch_end: Optional[callable] = None,
         real_returns: Optional[np.ndarray] = None,
         score_net_train_steps: int = 200,
+        n_per_template: int = 200,
+        n_pure_random: int = 500,
     ) -> List[Dict]:
         """
         Train the model on synthetic black-swan scenarios.
@@ -486,9 +504,19 @@ class PrometheusEngine:
         if not self.scenario_library.scenarios:
             self._pretrain_score_net(real_returns, score_net_train_steps)
             logger.info("Generating black-swan library (this may take a while)...")
+            # SIZED BY THE CALLER, not hardcoded. These were fixed at
+            # 200/500, which with 8 templates is 2,100 scenarios, each
+            # run through a 1000-step reverse diffusion loop - 2.1
+            # MILLION network forward passes per call. `n_scenarios`
+            # above looks like the size knob and is not (it only reaches
+            # a log line), so tests/test_backtest_snn.py passed
+            # n_black_swans=10 believing it had a tiny library and got
+            # the full 2,100 every time. That test cost ~1 hour of CPU
+            # and had to be excluded from the suite, which is how a
+            # gitignore bug shipped twice unnoticed.
             scenarios = self.black_swan_gen.generate_doomsday_library(
-                n_per_template=200,
-                n_pure_random=500,
+                n_per_template=n_per_template,
+                n_pure_random=n_pure_random,
             )
             self.scenario_library.add_scenarios(scenarios)
             self.scenario_library.save()

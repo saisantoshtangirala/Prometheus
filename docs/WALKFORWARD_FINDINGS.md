@@ -71,6 +71,51 @@ own.
 
 ---
 
+## Definitions
+
+**Overfitting gap.** Per window, the GA evolves on the training slice and
+the winning genome is scored on the untouched test slice. The gap is the
+mean across windows of that per-window difference:
+
+```
+gap = (1/W) * SUM_w [ Sharpe_in-sample(w) - Sharpe_out-of-sample(w) ]
+```
+
+`nightevolver/backtest_evolved.py:141`. Both terms are annualised Sharpe
+from the same `simulate()` call — same 22bp cost model, same long-only
+constraint, same vol targeting — so the difference is attributable to the
+data slice and not to a change of measurement.
+
+Three things this definition is easy to misread:
+
+- **The OOS term is the mean of per-window Sharpes, not the pooled
+  Sharpe.** For the full real run those differ: mean per-window OOS
+  Sharpe is **−0.73**, while the Sharpe of the concatenated daily-return
+  series is **−1.07**. The gap of +2.75 uses the former
+  (2.02 − (−0.73) = 2.75). The pooled figure is the better estimate of
+  what the strategy would have *earned*; the per-window mean is the right
+  input to a gap, because it pairs each in-sample number with the
+  out-of-sample number from the same evolution.
+- Mean-of-differences equals difference-of-means here, so quoting it
+  either way gives the same number — but only because every window
+  contributes one of each.
+- **It is a difference of Sharpes, so it is in Sharpe units and inherits
+  their noise.** At 2–10 trades per window a single window's OOS Sharpe
+  is unstable, which is why the gap is only quoted as a mean over windows
+  and compared against a null cloud rather than read as a point estimate.
+
+**In-sample Sharpe** is the winning genome's Sharpe on the training
+window it was evolved on — `res.in_sample.sharpe`, the GA's own fitness
+view. It is not a held-out number and is reported only to form the gap.
+
+**n_trials** in the deflated Sharpe is `windows × GA search budget`
+(`backtest_evolved.py:176`), i.e. every genome evaluation across the
+whole walk-forward. This is the honest count when a search is re-run per
+window; using the per-window budget alone would understate selection by
+the number of windows.
+
+---
+
 ## What it means
 
 **1. The GA overfits, by a factor that is now measured.** In-sample

@@ -32,6 +32,22 @@ TINY_TRAIN_CFG = SNNTrainConfig(
     seq_len=8, horizon=3, d_model=16, n_heads=2, n_layers=1,
     pretrain_epochs=1, finetune_epochs=1, meta_epochs=1,
     n_black_swans=10, batch_size=4, device="cpu", seed=1,
+    # THE FIELDS THAT ACTUALLY MAKE THIS FAST. `n_black_swans` looks
+    # like the size knob and is not - PrometheusEngine's `n_scenarios`
+    # only reaches a log line, so this file ran the FULL production
+    # library on every test: 8 templates x 200 + 500 = 2,100 scenarios,
+    # each through a 1000-step reverse diffusion loop. 2.1 million
+    # forward passes, ~1 hour of CPU, against a docstring promising
+    # "reasonable CI time".
+    #
+    # The consequence was not just slowness. The file had to be excluded
+    # from the suite, and an excluded test stops catching things - which
+    # is how a .gitignore pattern that silently swallowed nightevolver/
+    # totp.py shipped through two deploys before anyone noticed.
+    #
+    # 2 x 3 + 4 = 20 scenarios at 8 steps = 160 forward passes. Enough
+    # to exercise the wiring, which is all these tests claim to do.
+    n_per_template=2, n_pure_random=4, n_diffusion_steps=8,
 )
 
 
