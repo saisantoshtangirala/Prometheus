@@ -207,10 +207,47 @@ jobs:
           ssh "${{ secrets.HETZNER_USER }}@${{ secrets.HETZNER_HOST }}" '
             set -euo pipefail
             LINE="5 3 * * 1-5 cd /opt/prometheus && ./.venv/bin/python scripts/kite_auto_login.py --check >> /var/log/kite-refresh.log 2>&1"
-            ( sudo crontab -l 2>/dev/null | grep -v "kite_auto_login.py" ; echo "$LINE" ) \
-              | sudo crontab -
-            echo "cron installed:"
-            sudo crontab -l | grep kite_auto_login.py
+
+            # A DESTRUCTIVE FAILURE MODE, fixed. This step used to read:
+            #
+            #   ( sudo crontab -l | grep -v kite_auto_login.py ; echo "$LINE" ) \
+            #     | sudo crontab -
+            #
+            # `crontab -l` exits 1 when no crontab exists, and `grep -v`
+            # exits 1 when it filters out every line. Under `set -e`
+            # either one aborts the subshell BEFORE the echo - so an
+            # EMPTY stream reaches `crontab -`, which does not merge, it
+            # REPLACES. A step whose job is to add one line could delete
+            # every other cron job on the box, and report only a
+            # confusing exit 1 afterwards.
+            #
+            # Both reads are now explicitly allowed to fail, and the
+            # existing crontab is echoed before and after so a bad merge
+            # is visible in the log rather than inferred later.
+            EXISTING="$(sudo crontab -l 2>/dev/null || true)"
+            echo "--- crontab BEFORE (${#EXISTING} bytes) ---"
+            printf "%s\n" "$EXISTING"
+
+            KEPT="$(printf "%s\n" "$EXISTING" | grep -v "kite_auto_login.py" || true)"
+            printf "%s\n%s\n" "$KEPT" "$LINE" | grep -v "^$" | sudo crontab -
+
+            echo "--- crontab AFTER ---"
+            sudo crontab -l
+
+            # Assert the line landed. Without this the step can succeed
+            # having installed nothing.
+            sudo crontab -l | grep -q "kite_auto_login.py" \
+              || { echo "::error::refresh line missing after install"; exit 1; }
+
+            # And assert nothing was dropped: every pre-existing line
+            # that was not ours must still be there.
+            while IFS= read -r l; do
+              [ -z "$l" ] && continue
+              case "$l" in *kite_auto_login.py*) continue ;; esac
+              sudo crontab -l | grep -Fqx "$l" \
+                || { echo "::error::a pre-existing cron line was lost"; exit 1; }
+            done <<< "$EXISTING"
+            echo "cron installed; no pre-existing entries lost"
           '
 
       - name: Summary
