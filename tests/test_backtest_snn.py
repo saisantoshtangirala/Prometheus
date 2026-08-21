@@ -78,6 +78,63 @@ class TestWindows:
             assert s2 - s1 == bt.cfg.test_window
 
 
+class TestNoLookAheadInTheSharedBaseline:
+    """The baseline checkpoint is built ONCE and shared by every window,
+    so anything it is fitted on must precede every test window.
+
+    Found by profiling: the harness sat idle inside yfinance.download.
+    train_on_black_swans falls back to MarketDataFetcher.fetch_all()
+    when real_returns is omitted, and that pulls
+    `datetime.now() - lookback_days` through `datetime.now()` - i.e. the
+    diffusion ScoreNetwork that shapes the black-swan library, which
+    pretrains the SNN that trades every window, was fitted on bars
+    postdating the entire backtest.
+    """
+
+    def test_baseline_never_reaches_the_network(self, bt, monkeypatch):
+        """A backtest that phones out is neither reproducible nor
+        causal. Any FETCH here is the look-ahead path reopening.
+
+        Patches fetch_all, not the class. The first version of this test
+        replaced MarketDataFetcher itself and failed on
+        PrometheusEngine.__init__'s `self.data_fetcher =
+        MarketDataFetcher()` - construction only sets paths and calls
+        makedirs, so it is inert. Guarding construction would forbid a
+        harmless line while a real fetch elsewhere still slipped past;
+        the network call is the thing to forbid.
+        """
+        from prometheus.data import MarketDataFetcher
+
+        def explode(*a, **k):
+            raise AssertionError(
+                "the shared baseline fetched market data - that is the "
+                "look-ahead path, and it must pass real_returns instead")
+
+        monkeypatch.setattr(MarketDataFetcher, "fetch_all", explode)
+        bt.run_signal_diagnostic(max_windows=1)
+
+    def test_baseline_is_fitted_only_on_pre_test_bars(self, bt, monkeypatch):
+        """Whatever is passed must end at or before the first train_end,
+        which is where the earliest test window begins."""
+        import prometheus.engine as eng
+
+        seen = {}
+        real = eng.PrometheusEngine.train_on_black_swans
+
+        def spy(self, *a, **kw):
+            seen["real_returns"] = kw.get("real_returns")
+            return real(self, *a, **kw)
+
+        monkeypatch.setattr(eng.PrometheusEngine, "train_on_black_swans", spy)
+        bt.run_signal_diagnostic(max_windows=1)
+
+        rr = seen.get("real_returns")
+        assert rr is not None, "real_returns was not passed - fetch path is live"
+        assert len(rr) <= bt.cfg.train_window, (
+            f"baseline saw {len(rr)} bars but the first test window starts at "
+            f"{bt.cfg.train_window}; anything beyond that is future data")
+
+
 class TestEndToEnd:
     def test_single_window_runs_and_returns_valid_diagnostic(self, bt):
         diag = bt.run_signal_diagnostic(max_windows=1)

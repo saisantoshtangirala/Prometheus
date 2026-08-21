@@ -195,10 +195,31 @@ class SNNWalkForwardBacktester:
         )
         engine = PrometheusEngine(cfg)
         logger.info("[backtest_snn] pretrain: %d epochs (one-time, shared)", tc.pretrain_epochs)
+
+        # LOOK-AHEAD, FIXED. train_on_black_swans fits the diffusion
+        # ScoreNetwork on real returns, and when none are supplied it
+        # falls back to MarketDataFetcher.fetch_all() - which pulls
+        # `datetime.now() - lookback_days` through `datetime.now()`.
+        #
+        # In a walk-forward that is future data. This baseline is built
+        # ONCE and shared by every window, so a score net fitted on bars
+        # up to today shapes the black-swan library that pretrains the
+        # SNN that then trades 2024 test windows. Indirect, but it is
+        # future information reaching the model that trades - the exact
+        # class of defect this harness exists to detect.
+        #
+        # Windows advance forward from 0, so bars [0, train_window) sit
+        # before EVERY test window and are the only causally safe source
+        # for a shared artifact. Passing them explicitly also stops the
+        # network fetch, which made these tests non-hermetic (they hung
+        # on yfinance behind a proxy) and non-deterministic (the fitted
+        # data changed with the calendar).
+        warmup = self.returns.iloc[: self.cfg.train_window]
         engine.train_on_black_swans(
             n_scenarios=tc.n_black_swans, n_epochs=tc.pretrain_epochs,
             batch_size=tc.batch_size,
             n_per_template=tc.n_per_template, n_pure_random=tc.n_pure_random,
+            real_returns=warmup.values.astype(float),
         )
         logger.info("[backtest_snn] meta: %d epochs/regime (one-time, shared)", tc.meta_epochs)
         self._run_meta(engine, tc)
