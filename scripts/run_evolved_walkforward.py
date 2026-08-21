@@ -98,6 +98,11 @@ def parse_args():
                         "identical search. Answers 'what does this pipeline "
                         "produce on noise at this budget?' - without it, a "
                         "positive Sharpe has nothing to be compared against.")
+    p.add_argument("--rebuild", action="store_true",
+                   help="put REAL data through the same double-warmup trim "
+                        "--null incurs, so the two runs are matched on "
+                        "sample length and window count and the only "
+                        "difference between them is the permutation.")
     p.add_argument("--block", type=int, default=21,
                    help="permutation block length in bars (default 21 ~ one "
                         "month, preserving short-horizon autocorrelation "
@@ -153,6 +158,22 @@ def main() -> int:
         return 2
 
     logger.info("market data: %d bars x %d tickers", md.n_bars, len(md.tickers))
+
+    if args.rebuild and not args.null:
+        # MATCHED CONTROL PATH. --null rebuilds MarketData from md.close,
+        # and build_market_data trims WARMUP_BARS again - so the null
+        # loses 61 bars the real run keeps (589 -> 528, 16 windows ->
+        # 14). Comparing across different sample lengths weakens the one
+        # comparison the whole exercise rests on. This flag puts the REAL
+        # data through the identical double-build, so the only difference
+        # between the two runs is the permutation itself.
+        import pandas as pd
+
+        from nightevolver.data_loader import build_market_data
+        close = pd.DataFrame(md.close, index=pd.DatetimeIndex(md.dates),
+                             columns=list(md.tickers))
+        md = build_market_data(close)
+        logger.info("rebuilt (matched to --null trimming): %d bars", md.n_bars)
 
     if args.null:
         # Rebuild the whole MarketData from permuted prices so every
