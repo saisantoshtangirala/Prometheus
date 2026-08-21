@@ -55,6 +55,7 @@ import http.cookiejar
 import json
 import logging
 import os
+import re
 import stat
 import sys
 import urllib.error
@@ -179,61 +180,100 @@ def web_login(creds: Dict[str, str]) -> str:
             f"drifted more than 30s.")
 
     logger.info("step 3/3: collecting request_token")
-    # DO NOT FOLLOW THE REDIRECT.
-    #
-    # Kite answers /connect/login with a 302 to the app's registered
-    # redirect URL, and `?request_token=...` rides in that Location
-    # header. urllib follows redirects by default, so the first version
-    # read f.geturl() - the end of the chain - and lost the token
-    # whenever the redirect URL was unreachable (http://127.0.0.1/ is
-    # the recommended registration and nothing listens there) or itself
-    # redirected onward. Capturing Location directly makes this work
-    # regardless of what the redirect URL points at.
+    return collect_request_token(creds["KITE_API_KEY"])
+
+
+def _token_in(url: str) -> Optional[str]:
+    """`request_token` out of a URL's query, or None."""
+    if not url:
+        return None
+    qs = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+    return (qs.get("request_token") or [None])[0]
+
+
+def _strip_query(url: str) -> str:
+    """A URL safe to log: host and path only.
+
+    The path is the diagnostic fact and is not a secret; the query on
+    these hops carries sess_id and eventually request_token.
+    """
+    return urllib.parse.urlunparse(
+        urllib.parse.urlparse(url)._replace(query="", fragment=""))
+
+
+def collect_request_token(api_key: str, cookiejar=None) -> str:
+    """Walk /connect/login's redirect chain to the token.
+
+    FOLLOW THE KITE HOPS, STOP AT THE TOKEN. Two failure modes bracket
+    this, and only doing both halves gets past them:
+
+      * Following everything (urllib's default) reads f.geturl() at the
+        END of the chain. The last hop is the app's registered redirect
+        URL, and the recommended registration is http://127.0.0.1/ where
+        nothing listens - so the fetch fails and the token, which was in
+        the Location header one hop earlier, is lost.
+
+      * Stopping at the FIRST hop misses it too. Measured: /connect/login
+        302s to /connect/finish, an intermediate page on kite.zerodha.com
+        that carries sess_id and no token; /connect/finish is what issues
+        the token-bearing redirect.
+
+    So: keep following while the hop is still on Kite and has no token,
+    and stop the moment a hop carries request_token - before fetching a
+    redirect target that is probably a dead loopback address.
+    """
     seen: List[str] = []
 
     class _Capture(urllib.request.HTTPRedirectHandler):
         def redirect_request(self, req, fp, code, msg, headers, newurl):
             seen.append(newurl)
-            return None            # stop here; do not fetch newurl
+            if _token_in(newurl):
+                return None        # arrived; do not fetch the dead target
+            return super().redirect_request(req, fp, code, msg, headers,
+                                            newurl)
 
+    jar = opener_cookiejar if cookiejar is None else cookiejar
     cap_opener = urllib.request.build_opener(
-        urllib.request.HTTPCookieProcessor(opener_cookiejar), _Capture())
+        urllib.request.HTTPCookieProcessor(jar), _Capture())
 
-    url = f"{KITE_WEB}/connect/login?v=3&api_key={urllib.parse.quote(creds['KITE_API_KEY'])}"
-    final = ""
+    url = f"{KITE_WEB}/connect/login?v=3&api_key={urllib.parse.quote(api_key)}"
+    final, body = "", ""
     try:
         with cap_opener.open(urllib.request.Request(
                 url, headers={"User-Agent": "Mozilla/5.0"}), timeout=30) as f:
             final = f.geturl()
+            body = f.read(200_000).decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
+        # redirect_request returning None lands here, with Location intact.
         if e.headers and e.headers.get("Location"):
             seen.append(e.headers["Location"])
     except urllib.error.URLError:
-        pass                       # unreachable redirect target is fine
+        pass                       # unreachable redirect target is expected
 
-    token: Optional[str] = None
     for candidate in seen + [final]:
-        if not candidate:
-            continue
-        qs = urllib.parse.parse_qs(urllib.parse.urlparse(candidate).query)
-        got = (qs.get("request_token") or [None])[0]
+        got = _token_in(candidate)
         if got:
-            token = got
-            break
+            return got
 
-    if not token:
-        # Report WHERE it went, with the query stripped - the redirect
-        # target is the single most diagnostic fact here and it is not a
-        # secret, while the query could carry one.
-        hops = [urllib.parse.urlunparse(
-                    urllib.parse.urlparse(u)._replace(query="", fragment=""))
-                for u in seen if u] or ["(no redirect issued)"]
-        raise KiteAuthError(
-            f"no request_token after 2FA. Redirect chain went to: "
-            f"{' -> '.join(hops)}. Usual causes: the app's redirect URL on "
-            f"the Kite developer console does not match, the TOTP seed is "
-            f"for a different account, or the password changed.")
-    return token
+    # Last resort: a 200 page that carries the token in a JS redirect
+    # rather than a Location header. Matched narrowly, and only the
+    # token is extracted - the page body is never logged.
+    m = re.search(r"request_token=([A-Za-z0-9]+)", body)
+    if m:
+        return m.group(1)
+
+    hops = [_strip_query(u) for u in seen if u] or ["(no redirect issued)"]
+    landed = _strip_query(final) if final else hops[-1]
+    hint = ("The app looks like it still needs its ONE-TIME authorisation: "
+            "open the login URL once in any browser, sign in and press "
+            "Authorise, then re-run this. "
+            if "authoriz" in body.lower() or "authoris" in body.lower()
+            else "")
+    raise KiteAuthError(
+        f"no request_token after 2FA. Chain: {' -> '.join(hops)}; landed on "
+        f"{landed}. {hint}Other causes: the app's redirect URL on the Kite "
+        f"developer console does not match, the TOTP seed is for a different "
+        f"account, or the password changed.")
 
 
 def exchange(creds: Dict[str, str], request_token: str) -> Dict:
