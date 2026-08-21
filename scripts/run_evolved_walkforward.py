@@ -152,6 +152,26 @@ def parse_args():
     return p.parse_args()
 
 
+def block_permutation_order(n: int, block: int, seed: int) -> np.ndarray:
+    """The row order a block permutation uses. Exposed on purpose.
+
+    Any channel joined to the price panel must be permuted by the SAME
+    order, not by an independent draw. Applying a different permutation
+    to, say, implied volatility would destroy its CONTEMPORANEOUS
+    alignment with price as well as its predictive alignment - a
+    strictly stronger null than intended, which would make the real data
+    look better than it is by weakening the thing it is compared against.
+
+    Sharing the order preserves (feature[t], price[t]) pairs and
+    everything inside a block, and breaks only the long-range structure
+    the search is hunting for. That is the null we want.
+    """
+    starts = list(range(0, n, block))
+    rng = np.random.RandomState(seed)
+    rng.shuffle(starts)
+    return np.concatenate([np.arange(s, min(s + block, n)) for s in starts])
+
+
 def block_permute_prices(close, block: int, seed: int):
     """Destroy predictability, keep the marginal return distribution.
 
@@ -169,11 +189,7 @@ def block_permute_prices(close, block: int, seed: int):
     import pandas as pd
 
     rets = close.pct_change().fillna(0.0)
-    n = len(rets)
-    starts = list(range(0, n, block))
-    rng = np.random.RandomState(seed)
-    rng.shuffle(starts)
-    order = np.concatenate([np.arange(s, min(s + block, n)) for s in starts])
+    order = block_permutation_order(len(rets), block, seed)
     shuffled = rets.values[order]
     path = close.iloc[0].values * np.cumprod(1.0 + shuffled, axis=0)
     return pd.DataFrame(path, index=close.index[:len(path)],

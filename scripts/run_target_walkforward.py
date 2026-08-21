@@ -67,7 +67,8 @@ from nightevolver.targets import (                               # noqa: E402
     build_targets, persistence_baseline,
 )
 from run_evolved_walkforward import (                            # noqa: E402
-    DEFAULT_TICKERS, block_permute_prices, resolve_universe,
+    DEFAULT_TICKERS, block_permutation_order, block_permute_prices,
+    resolve_universe,
 )
 
 logging.basicConfig(level=logging.INFO,
@@ -106,9 +107,9 @@ def _score(feature: np.ndarray, target: np.ndarray, base: np.ndarray) -> float:
     return 0.0 if not np.isfinite(r) else r
 
 
-def _flat(md, target, base, s, e):
+def _flat(md, target, base, s, e, pool=None):
     """Flatten a [t0:t1] slice across assets, masked by target validity."""
-    ind = md.indicators[s:e]                      # [T, A, F]
+    ind = (md.indicators if pool is None else pool)[s:e]   # [T, A, F]
     tv, va = target.values[s:e], target.valid[s:e]
     bs = base[s:e]
     m = va & np.isfinite(tv) & np.isfinite(bs)
@@ -120,13 +121,32 @@ def _flat(md, target, base, s, e):
 
 def _one_draw(args):
     """One series (real or permuted) through the whole walk-forward."""
-    values, index, columns, perm_seed, block, train_w, test_w, horizon = args
+    (values, index, columns, perm_seed, block, train_w, test_w, horizon,
+     extra, extra_names) = args
     logging.disable(logging.INFO)
 
     close_df = pd.DataFrame(values, index=index, columns=columns)
     if perm_seed is not None:
         close_df = block_permute_prices(close_df, block, perm_seed)
     md = build_market_data(close_df)
+
+    # Extra channels ride the SAME permutation as the prices. An
+    # independent draw would also destroy each feature's contemporaneous
+    # link to its own price - a stronger null than intended, which would
+    # flatter the real run by weakening its comparison.
+    pool, names = md.indicators, list(INDICATOR_NAMES)
+    if extra is not None and extra.size:
+        ex = extra
+        if perm_seed is not None:
+            order = block_permutation_order(len(ex), block, perm_seed)
+            ex = ex[order]
+        # build_market_data trims warmup bars off the front and the last
+        # bar off the back; align the extras to what survived.
+        trim = len(ex) - md.n_bars
+        ex = ex[trim:trim + md.n_bars] if trim >= 0 else None
+        if ex is not None and len(ex) == md.n_bars:
+            pool = np.concatenate([md.indicators, ex], axis=-1)
+            names = names + list(extra_names)
 
     targets = build_targets(md.close, horizon=horizon)
     out = {"perm_seed": perm_seed, "n_bars": int(md.n_bars), "targets": {}}
@@ -142,8 +162,8 @@ def _one_draw(args):
             if te_e - tr_e < 1:
                 break
 
-            fi, ft, fb = _flat(md, target, base, start, tr_e)
-            gi, gt, gb = _flat(md, target, base, tr_e, te_e)
+            fi, ft, fb = _flat(md, target, base, start, tr_e, pool)
+            gi, gt, gb = _flat(md, target, base, tr_e, te_e, pool)
             if fi is None or gi is None:
                 start += test_w
                 continue
@@ -155,7 +175,7 @@ def _one_draw(args):
             # EVALUATE that one pick on test. Signed, because a feature
             # that flips sign out of sample is not a usable predictor.
             oos_scores.append(abs(_score(gi[:, k], gt, gb)))
-            picks.append(INDICATOR_NAMES[k] if k < len(INDICATOR_NAMES) else str(k))
+            picks.append(names[k] if k < len(names) else str(k))
             start += test_w
 
         if oos_scores:
@@ -187,6 +207,11 @@ def parse_args():
                         "rather than trades")
     p.add_argument("--horizon", type=int, default=5)
     p.add_argument("--block", type=int, default=21)
+    p.add_argument("--with-new-data", action="store_true",
+                   help="also let the selection reach the derivative and "
+                        "delivery channels. The audit found atm_iv -> vol_5d "
+                        "at incremental rho +0.27; this asks whether a SEARCH "
+                        "can find it in advance and beat the null cloud.")
     p.add_argument("--out", default="docs/results/target_null_cloud.json")
     return p.parse_args()
 
@@ -201,10 +226,30 @@ def main() -> int:
                          columns=list(md0.tickers))
     logger.info("source: %d bars x %d tickers", len(close), close.shape[1])
 
+    extra, extra_names = None, []
+    if a.with_new_data:
+        from nightevolver.delivery import fetch_delivery_features
+        from nightevolver.derivatives import fetch_derivative_features
+        from run_new_data_audit import align
+        frames = {}
+        frames.update(fetch_derivative_features(list(close.columns), a.start))
+        frames.update(fetch_delivery_features(list(close.columns), a.start))
+        keep = {n: align(f, close.index, list(close.columns))
+                for n, f in frames.items()}
+        keep = {n: v for n, v in keep.items()
+                if float(np.isfinite(v).mean()) >= 0.05}
+        if keep:
+            extra_names = sorted(keep)
+            extra = np.stack([keep[n] for n in extra_names], axis=-1)
+            logger.info("selection pool includes %d new channels: %s",
+                        len(extra_names), ", ".join(extra_names))
+
     cv, ci, cc = close.values, close.index, list(close.columns)
-    base_job = (cv, ci, cc, None, a.block, a.train_window, a.test_window, a.horizon)
+    base_job = (cv, ci, cc, None, a.block, a.train_window, a.test_window,
+                a.horizon, extra, extra_names)
     jobs = [base_job] + [
-        (cv, ci, cc, 2000 + i, a.block, a.train_window, a.test_window, a.horizon)
+        (cv, ci, cc, 2000 + i, a.block, a.train_window, a.test_window,
+         a.horizon, extra, extra_names)
         for i in range(a.n)]
     logger.info("%d jobs (1 real + %d null) on %d workers", len(jobs), a.n, a.workers)
 
@@ -239,10 +284,23 @@ def main() -> int:
             continue
         lo, hi = np.percentile(cloud, [2.5, 97.5])
         p = (int((cloud >= r["mean_oos"]).sum()) + 1) / (cloud.size + 1)
+        # THE P-VALUE HAS A FLOOR OF 1/(n+1). With 2 nulls the smallest
+        # possible p is 0.333, so "indistinguishable from noise" would be
+        # printed no matter how far outside the cloud the real value sat
+        # - a verdict determined by the draw count, not the data.
+        # Measured: a 2-null smoke run reported atm_iv -> vol_5d INSIDE
+        # the cloud while its OOS score was above the null's 97.5th
+        # percentile. n >= 19 is needed to reach p < 0.05 at all.
+        underpowered = (1.0 / (cloud.size + 1)) > 0.05
         pctile = float((cloud < r["mean_oos"]).mean() * 100)
-        verdict = ("ABOVE the null cloud - survives selection"
-                   if p < 0.05 else
-                   "INSIDE the null cloud - indistinguishable from noise")
+        if underpowered:
+            verdict = (f"UNDERPOWERED - {cloud.size} nulls floor p at "
+                       f"{1.0 / (cloud.size + 1):.3f}; no verdict is possible. "
+                       f"Re-run with --n 30.")
+        elif p < 0.05:
+            verdict = "ABOVE the null cloud - survives selection"
+        else:
+            verdict = "INSIDE the null cloud - indistinguishable from noise"
         print(f"\n  {tname}   ({r['n_windows']} windows)")
         print(f"    in-sample  (selected) {r['mean_is']:+.4f}")
         print(f"    OOS        (that pick) {r['mean_oos']:+.4f}   real")
@@ -260,7 +318,8 @@ def main() -> int:
             "null_mean": float(cloud.mean()), "null_sd": float(cloud.std(ddof=1)),
             "null_p2_5": float(lo), "null_p97_5": float(hi),
             "real_percentile": pctile, "p_null_ge_real": p,
-            "survives": bool(p < 0.05),
+            "survives": bool(p < 0.05 and not underpowered),
+            "underpowered": bool(underpowered),
         }
     print("\n" + "=" * 76)
 
