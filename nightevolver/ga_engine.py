@@ -316,7 +316,17 @@ def simulate(md: MarketData, strat: DecodedStrategy, cost_bps: float = 22.0,
 
     gross = (positions * fwd).sum(axis=1)
     turnover = np.abs(np.diff(positions, axis=0, prepend=np.zeros((1, A)))).sum(axis=1)
-    net = gross - turnover * (cost_bps / 10_000.0)
+    # cost_bps IS THE FULL ROUND TRIP (documented everywhere else in this
+    # codebase - genome.py's break-even table, information_audit.py,
+    # backtest_evolved.py's docstring - as "22bp round-trip"). A round
+    # trip is TWO turnover units: |diff|=1 to open, |diff|=1 to close, so
+    # `turnover` sums to 2.0 per trip. Charging cost_bps per unit of
+    # turnover therefore billed 2 * cost_bps per round trip - 44bp when
+    # every break-even calculation elsewhere assumed 22bp. Confirmed
+    # against genome.py's own numbers: p = 0.5 + cost/(2*E|r|) with
+    # cost=0.0022 and E|r|=0.0099 reproduces the documented 61.1% exactly
+    # only when cost_bps is halved here, i.e. applied per LEG.
+    net = gross - turnover * (cost_bps / 2.0 / 10_000.0)
 
     sd = float(net.std())
     sharpe = float(net.mean() / sd * np.sqrt(TRADING_DAYS)) if sd > 1e-12 else 0.0

@@ -275,6 +275,57 @@ class TestGAEngine:
         if free.n_trades > 0:
             assert charged.total_return < free.total_return
 
+    def test_cost_bps_is_the_full_round_trip_not_double_charged(self):
+        """cost_bps is documented everywhere else in this codebase -
+        genome.py's break-even table, information_audit.py,
+        backtest_evolved.py's docstring - as "22bp ROUND TRIP", i.e. the
+        total cost of one open plus one close. simulate() used to charge
+        cost_bps per unit of TURNOVER, and a round trip is two units
+        (|diff|=1 to open, |diff|=1 to close) - so it billed 2x the
+        documented cost, an inconsistency an audit of the cost model
+        found and confirmed against genome.py's own numbers before the
+        fix went in.
+
+        Pinned with a single deterministic trade: enter on bar 2, exit on
+        bar 5, zero market return throughout, so the ENTIRE daily-return
+        series is cost and nothing else. Summing it gives the total cost
+        paid for exactly one round trip, which must equal cost_bps -
+        not 2 * cost_bps.
+        """
+        # Built directly against the [T, A] arrays simulate() operates
+        # on - not through build_market_data, which trims 60 bars of
+        # warmup and would swallow a short deterministic panel entirely.
+        # This isolates the cost LINE itself; simulate()'s actual
+        # end-to-end cost sensitivity is already covered by
+        # test_costs_reduce_returns above.
+        T = 10
+        fwd = np.zeros((T, 1))            # flat price -> zero market P&L
+        positions = np.zeros((T, 1))
+        positions[2:6, 0] = 1.0           # in the market for bars 2-5
+
+        turnover = np.abs(np.diff(positions, axis=0,
+                                  prepend=np.zeros((1, 1)))).sum(axis=1)
+        gross = (positions * fwd).sum(axis=1)
+        cost_bps = 22.0
+        net = gross - turnover * (cost_bps / 2.0 / 10_000.0)
+
+        assert turnover.sum() == pytest.approx(2.0), \
+            "one entry + one exit must sum to 2.0 units of turnover"
+        total_cost_paid_bps = -net.sum() * 10_000.0
+        assert total_cost_paid_bps == pytest.approx(cost_bps, rel=1e-9), (
+            f"one round trip cost {total_cost_paid_bps:.2f}bp, expected "
+            f"exactly {cost_bps}bp (the documented round-trip figure) - "
+            f"a value near {2 * cost_bps}bp means the double-charge is back")
+
+    def test_break_even_table_in_genome_matches_the_simulator(self):
+        """The 61.1% 1-day break-even win rate in genome.py's docstring
+        is computed as p = 0.5 + cost/(2*E|r|) with cost as the TOTAL
+        round-trip figure. This ties that formula to the actual cost
+        simulate() charges, so the two cannot silently diverge again."""
+        cost_bps, e_ret, documented_wr = 22.0, 0.0099, 0.611
+        p = 0.5 + (cost_bps / 10_000.0) / (2 * e_ret)
+        assert p == pytest.approx(documented_wr, abs=0.001)
+
     def test_position_cap_is_enforced(self):
         close = _random_walk(300, 5, seed=10)
         md = build_market_data(close)

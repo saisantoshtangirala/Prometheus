@@ -113,7 +113,11 @@ def _evaluate_policy(q: np.ndarray, states: np.ndarray, fwd: np.ndarray,
         actions = np.argmax(q[s[:, 0], s[:, 1], s[:, 2]], axis=-1)
         pos = ACTION_POSITION[actions] * cfg.max_position
         turnover = np.abs(pos - prev).sum()
-        daily[t] = float((pos * fwd[t]).sum() - turnover * cfg.cost_bps / 10_000.0)
+        # cost_bps is the full ROUND TRIP (see ga_engine.simulate for the
+        # measurement); a trip is two turnover units, so the per-unit
+        # charge is cost_bps/2. This mirrors the same fix there - this
+        # function carried an identical double-count.
+        daily[t] = float((pos * fwd[t]).sum() - turnover * cfg.cost_bps / 2.0 / 10_000.0)
         prev = pos
     sd = float(daily.std())
     return float(daily.mean() / sd * np.sqrt(252)) if sd > 1e-12 else 0.0
