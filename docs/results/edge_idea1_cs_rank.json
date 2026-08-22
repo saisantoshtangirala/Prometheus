@@ -1,0 +1,54 @@
+{
+  "idea": "cross_sectional_rank",
+  "idea_id": 1,
+  "run_at": "2026-08-22T10:34:26.546190+00:00",
+  "n_ideas_tried_including_this": 1,
+  "alpha_effective": 0.05,
+  "any_survive": true,
+  "targets": {
+    "direction_1d": {
+      "p": 0.8292682926829268,
+      "survives": false,
+      "underpowered": false,
+      "oos": 0.05039796894254248,
+      "null_mean": 0.052327512887190133,
+      "null_sd": 0.002072630598818064,
+      "percentile": 17.5,
+      "n_windows": 24,
+      "n_distinct_picks": 3
+    },
+    "regime_shift_5d": {
+      "p": 0.024390243902439025,
+      "survives": true,
+      "underpowered": false,
+      "oos": 0.33187947130327594,
+      "null_mean": 0.3207045839107496,
+      "null_sd": 0.003565948871801731,
+      "percentile": 100.0,
+      "n_windows": 24,
+      "n_distinct_picks": 1
+    },
+    "rel_strength_1d": {
+      "p": 0.8292682926829268,
+      "survives": false,
+      "underpowered": false,
+      "oos": 0.05039796894254248,
+      "null_mean": 0.052327512887190133,
+      "null_sd": 0.002072630598818064,
+      "percentile": 17.5,
+      "n_windows": 24,
+      "n_distinct_picks": 3
+    },
+    "vol_5d": {
+      "p": 0.04878048780487805,
+      "survives": true,
+      "underpowered": false,
+      "oos": 0.3634854375707672,
+      "null_mean": 0.35513150275032307,
+      "null_sd": 0.0038301907631395414,
+      "percentile": 97.5,
+      "n_windows": 24,
+      "n_distinct_picks": 1
+    }
+  }
+}
