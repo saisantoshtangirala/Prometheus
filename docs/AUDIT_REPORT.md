@@ -515,6 +515,108 @@ merely improbable.
 
 ---
 
+## Addendum: closing four items that were originally covered by reasoning, not execution
+
+The user asked directly, after the first version of this report:
+**"is each point I gave you, covered?"** Honest re-check found four places
+where the report answered from code inspection or general argument rather
+than from a result actually produced. All four are closed here with
+executed evidence; none surfaced a new defect — each confirms a PASS the
+report had already claimed, on firmer footing.
+
+### A.1 — Alignment proven for every channel, not just derivatives/delivery
+
+§2.1's channel-alignment claim was verified only for the extra (derivative,
+delivery) channels — where the bug actually was. The genome's price-derived
+indicators and the FII/DII flow channel were passed on structural argument
+alone. Checked directly:
+
+* **Price indicators.** `data_loader.py`'s `build_market_data` computes
+  `indicators`, `close`, and `forward_returns` in one function and applies a
+  single `keep = slice(WARMUP_BARS, len(idx)-1)` to all three simultaneously
+  before returning. There is no separate re-slicing step for this channel
+  group — the exact step that was wrong for the externally-built extra
+  channels does not exist here, by construction rather than by policy.
+* **FII/DII flow channel.** `flows.py::align_flow_features` carries its own
+  independent guard — `lag_bars < 1` raises with an explicit look-ahead
+  message — and applies the lag in a fixed order (reindex+ffill, **then**
+  shift, **then** causal z-score) documented and matching the code exactly.
+
+**Pass/Fail: PASS**, now on inspected code rather than inference.
+
+### A.2 — The forced shift(±1) reproduction, actually run
+
+§2.2 argued from first principles why a forced-shift variant of the
+permutation null can't catch this bug class. Argument is not evidence;
+ran it, on the real 2019–2026 panel, `pcr_volume → direction_1d`:
+
+| slice offset | same-bar ρ (t-1→t) | forward ρ (t→t+1) | reads as |
+|---|---|---|---|
+| correct (`lo=WARMUP_BARS`) | −0.2826 | +0.0239 | honest — matches the verified-correct fixed result exactly |
+| **the exact original bug** (`lo=WARMUP_BARS+1`) | −0.0597 | **−0.2826** | suspicious — reproduces the discarded run's numbers to 3 decimals |
+| opposite-direction shift (`lo=WARMUP_BARS-1`) | +0.0240 | +0.0182 | inert — decorrelated from both, not merely "less predictive" |
+
+The middle row is not a simulation of the bug; it *is* the bug's exact slice
+arithmetic, re-run to confirm the numbers it produces are the same numbers
+that were caught in the discarded run. This is the empirical half of §2.2's
+theoretical argument.
+
+**Pass/Fail: PASS**, empirically, not just structurally.
+
+### A.3 — Manual, by-hand rolling-window calculation on one real date
+
+§3.1 cited the automated causality test suite rather than a hand
+computation. Done directly: `RELIANCE`, `t = 2024-01-24`, `vol_5d`.
+
+```
+daily returns t+1..t+5 (2024-01-25 .. 2024-02-01):
+    +0.006846  +0.070192  -0.027917  +0.013498  +0.000018
+manual std, ddof=1:  0.03588404566071022
+code vol_5d[t]:      0.03588404566071022     <- exact match
+```
+
+Boundary check, perturbing single bars: value is **unchanged** when
+`t+6` (one bar past the window) is perturbed, and **changes** when `t+3`
+(inside the window) is perturbed — confirming the window is exactly
+`[t+1, t+5]` and reaches no further. (Perturbing `t` itself *does* change
+the value — correctly: `vol_5d[t]`'s first observation is the return from
+`t` to `t+1`, so `t`'s price is the base of that return by definition, not
+a look-ahead.)
+
+**Pass/Fail: PASS.**
+
+### A.4 — Adjustment continuity across many real actions, not two examples
+
+§3.2 falsified the `PrvsClsgPric`-is-adjusted claim using two hand-picked
+splits (IRCTC, NESTLEIND) against the *raw* field. Broadened to scan the
+*adjusted* close series itself — the thing actually fed to every model —
+across 9 names spanning 1,825 bars, 2019–2026, including both of those same
+splits plus whatever other actions those names carried in between:
+
+```
+residual |log-return| > 25% in the ADJUSTED series: 3 cells, all
+    2020-03-18 .. 2020-03-23  (BAJFINANCE, INDUSINDBK x2)
+```
+
+All three land in the COVID crash week — a real, dated market event, not a
+missed corporate action. IRCTC's and NESTLEIND's splits (the two originally
+checked) show **zero** residual in the adjusted series: fully absorbed.
+
+**Pass/Fail: PASS**, on the artifact that matters (adjusted output), not
+the input that was falsified (raw field claim).
+
+### A.5 — Scope gap acknowledged, not closed
+
+The brief's stated scope named Zerodha API and yfinance as data sources.
+Neither was audited. Zerodha is authentication-only in this project — no
+order has ever been placed, so there is no ingestion path to check.
+yfinance was evaluated and abandoned early (blocked from this sandbox by
+`SSLError`, and judged an unreliable scraped source vs. the bhavcopy) and
+carries no active code path into any current result. Stated here rather
+than silently narrowed.
+
+---
+
 ## Summary: To-Do List and Disposition
 
 | # | Finding | Severity | Section | Status |
