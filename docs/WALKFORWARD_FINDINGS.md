@@ -268,3 +268,117 @@ edge by three methods), the cost arithmetic (break-even win rate above
 what measured correlations support), and this walk-forward with its
 control. The direction they point is away from tuning the search and
 toward the data itself.
+
+---
+
+# The 2019–2026 extension: `atm_iv → vol_5d` does not survive
+
+## What this run was for
+
+One result in this project was never resolved. The information audit
+found `atm_iv` (implied volatility from the F&O bhavcopy) predicting
+`vol_5d` (realised forward volatility) at **p = 0.065**, 97th percentile
+of its null cloud, with a *negative* overfitting gap and 5/5 unanimous
+window picks. Everything about it looked like an effect limited by
+statistical power rather than by size: ~16 windows over ~2.5 years of
+UDiFF-era data, against a floor of `1/(n+1)` on the empirical p-value.
+
+The stated fix was more history. That required backfilling the legacy
+(pre-2024) NSE archive — a different file format for both equity and
+F&O — to reach ~7.6 years and roughly 30 windows.
+
+## The panel
+
+| | |
+|---|---|
+| Equity sessions cached | 1,886 (2019-01-01 → 2026-08-21) |
+| F&O sessions cached | 1,884 |
+| Corrupt files | 0 |
+| Universe | top 100 by turnover **as of 2019-01-01** |
+| Panel | 1,825 bars × 100 tickers, 93.9% of cells finite |
+| Windows | 24 (up from ~16) |
+| Null draws | 30 block permutations, 21-bar blocks |
+
+The universe is point-in-time and the panel is *ragged*: names that
+delisted are absent after their last trade rather than dropped from the
+study or carried forward as flat lines. JETAIRWAYS ends after 60 bars,
+DHFL after 542, HDFC after 1,059 — which lands on July 2023, its actual
+merger date.
+
+## The result
+
+| target | selected | OOS (real) | null mean | null 95% | pct | p |
+|---|---|---|---|---|---|---|
+| `vol_5d` | `atm_iv` 24/24 | +0.3467 | +0.3587 | [0.3380, 0.3798] | 17 | 0.839 |
+| `regime_shift_5d` | `atm_iv` 24/24 | +0.3238 | +0.3353 | [0.3169, 0.3558] | 10 | 0.903 |
+| `direction_1d` | 10 distinct | +0.0412 | +0.0367 | [0.0291, 0.0454] | 77 | 0.258 |
+| `rel_strength_1d` | 7 distinct | +0.0366 | +0.0288 | [0.0213, 0.0362] | 97 | 0.065 |
+
+**`atm_iv → vol_5d` is inside the null cloud, and below the null mean.**
+More history did not rescue p = 0.065; it removed it. The honest reading
+is that the earlier result was a small-sample artifact of ~16 windows,
+not an effect waiting for power.
+
+The selection is still unanimous — `atm_iv` is chosen in 24/24 windows
+for both volatility targets — which is worth separating from the
+conclusion. `atm_iv` genuinely *is* the best available predictor of
+realised volatility. It is simply not better than what the same
+machinery extracts from a permuted series, because implied and realised
+volatility share a contemporaneous level that block permutation
+preserves. Being reliably the best of a set is not the same as carrying
+information, and this is what distinguishes the two.
+
+`rel_strength_1d` at p = 0.065 is inside the cloud and should not be
+read as a near-miss: its picks are unstable (7 distinct features across
+24 windows), which is the signature of selection noise rather than a
+signal being tracked.
+
+## Why the first run of this had to be thrown away
+
+The first execution reported `pcr_volume → direction_1d` **above** the
+null cloud at p = 0.032, 24/24 windows — a directional edge.
+
+It was a one-bar look-ahead. `build_market_data` keeps
+`slice(WARMUP_BARS, len-1)` — 60 bars off the front and one off the back
+— and the extra channels were trimmed by length arithmetic
+(`trim = len(ex) - md.n_bars` = 61), putting the whole trim on the front.
+Every derivative and delivery channel sat one bar early, so `feature[t]`
+held day `t+1`'s data.
+
+    pcr_volume vs same-bar return (t-1 → t)   rho = -0.2826
+    pcr_volume vs FORWARD return (t → t+1)    rho = +0.0239
+
+The entire effect was contemporaneous: high put volume accompanies down
+days, and dating it one bar early turns that everyday fact into a
+forecast.
+
+**Two tells were visible in the output before the bug was found**, and
+both are now tests:
+
+* A feature five times more correlated with the future than with the
+  present is not a predictor, it is a calendar error. Genuine predictors
+  are *weaker* on the future.
+* The directional null cloud sat at **+0.283** rather than near zero. A
+  null that far from zero means the statistic is measuring something
+  mechanical. After the fix the same clouds sit at +0.0367 and +0.0288 —
+  which is what a directional null is supposed to look like, and is the
+  clearest single confirmation that the fix is correct.
+
+The null cloud could not have caught this on its own. Extra channels ride
+the same permutation as prices by design, so a same-row relationship
+survives every draw intact. The control is structurally blind to
+misalignment — which is why alignment needs its own test rather than
+trust in the null.
+
+## Where this leaves the project
+
+Four independent lines now agree that there is no directional edge in
+this data at this horizon: the information audit, the cost arithmetic
+(break-even needs ρ ≈ 0.31 against ρ ≈ 0.046 measured), the GA
+walk-forward against its null cloud, and now the target walk-forward on
+7.6 years with a point-in-time universe and an honestly ragged panel.
+
+The volatility result, which was the last open question, closes with
+them. Nothing here says volatility is unpredictable — `atm_iv` tracks it
+well. It says this pipeline extracts no *incremental* forecast beyond
+what the same procedure finds in permuted data.
