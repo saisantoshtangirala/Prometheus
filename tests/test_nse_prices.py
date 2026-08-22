@@ -363,3 +363,51 @@ class TestETFsAndDVRsAreNotEquity:
                "03-JAN-2019,10,INF732E01037\n")
         df = _parse_bhav(zipped(csv), ["RELIANCE", "LIQUIDBEES"])
         assert set(df["TckrSymb"]) == {"RELIANCE"}
+
+
+class TestNegativeVolumeIsRejected:
+    """AUDIT GAP: nothing checked for negative volume before this. A
+    trade count cannot be negative - it can only be a parse defect or a
+    corrupted feed row. Left unmasked it would enter volume-weighted
+    features (avg_trade_size, Amihud illiquidity, Kyle's lambda) as a
+    negative denominator, producing a sign-flipped and unbounded
+    statistic rather than a visibly wrong one."""
+
+    def test_negative_volume_is_masked_to_nan(self, monkeypatch):
+        import nightevolver.nse_prices as P
+
+        idx = pd.date_range("2024-01-02", periods=3, freq="B")
+        days = {}
+        for i, d in enumerate(idx):
+            vol = -500 if i == 1 else 1000
+            days[d] = pd.DataFrame({
+                "TckrSymb": ["X", "Y"], "SctySrs": ["EQ", "EQ"],
+                "OpnPric": [100.0, 50.0], "HghPric": [101.0, 51.0],
+                "LwPric": [99.0, 49.0], "ClsPric": [100.0, 50.0],
+                "PrvsClsgPric": [100.0, 50.0], "TtlTradgVol": [vol, 1000],
+                "FinInstrmTp": ["STK", "STK"],
+            })
+
+        close, high, low, vol = P.build_adjusted_frames(
+            days, ["X", "Y"], corporate_actions={"X": [], "Y": []},
+            require_actions=False, min_coverage=0.0, min_breadth=0.0)
+        assert not (vol["X"] < 0).any(), "a negative volume reached output"
+
+    def test_a_legitimately_zero_volume_session_is_kept(self, monkeypatch):
+        """Zero (a halted or no-trade session) must survive - only
+        NEGATIVE values are a defect."""
+        import nightevolver.nse_prices as P
+
+        idx = pd.date_range("2024-01-02", periods=2, freq="B")
+        days = {d: pd.DataFrame({
+            "TckrSymb": ["X", "Y"], "SctySrs": ["EQ", "EQ"],
+            "OpnPric": [100.0, 50.0], "HghPric": [100.0, 50.0],
+            "LwPric": [100.0, 50.0], "ClsPric": [100.0, 50.0],
+            "PrvsClsgPric": [100.0, 50.0], "TtlTradgVol": [0, 500],
+            "FinInstrmTp": ["STK", "STK"],
+        }) for d in idx}
+
+        close, high, low, vol = P.build_adjusted_frames(
+            days, ["X", "Y"], corporate_actions={"X": [], "Y": []},
+            require_actions=False, min_coverage=0.0, min_breadth=0.0)
+        assert (vol["X"] == 0).all()

@@ -347,6 +347,20 @@ def build_adjusted_frames(days: Dict[pd.Timestamp, pd.DataFrame],
             raw_vol.at[d, tk] = row["TtlTradgVol"]
             raw_prev.at[d, tk] = row["PrvsClsgPric"]
 
+    # NEGATIVE VOLUME IS A PARSE OR FEED DEFECT, NEVER A REAL SESSION - a
+    # trade count cannot be negative. Nothing checked this before; audit
+    # found the gap. Masked to NaN here (not zero, which would read as a
+    # real halted-with-no-trades session) so it flows through the same
+    # span/breadth logic as every other kind of missing data, rather than
+    # silently entering volume-weighted features (avg_trade_size, Amihud
+    # illiquidity, Kyle's lambda) as a negative denominator.
+    bad_vol = raw_vol < 0
+    if bad_vol.to_numpy().any():
+        n_bad = int(bad_vol.to_numpy().sum())
+        logger.warning("[prices] %d negative-volume cell(s) masked to NaN "
+                       "- a trade count cannot be negative", n_bad)
+        raw_vol = raw_vol.mask(bad_vol)
+
     # Corporate-action-corrected returns. PrvsClsgPric is the RAW prior
     # close, NOT an adjusted one - verified against RELIANCE's 1:1 bonus
     # (2024-10-28: prev=2655.70, close=1334.35, -49.76%). See
