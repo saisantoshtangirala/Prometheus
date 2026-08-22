@@ -212,8 +212,54 @@ def parse_args():
                         "delivery channels. The audit found atm_iv -> vol_5d "
                         "at incremental rho +0.27; this asks whether a SEARCH "
                         "can find it in advance and beat the null cloud.")
+    p.add_argument("--min-coverage", type=float, default=0.90,
+                   help="drop a symbol below this fraction of live bars. "
+                        "The default silently removes the names that "
+                        "delisted - JETAIRWAYS(6%), DHFL(32%), HDFC(59%) - "
+                        "which is survivorship bias reintroduced as a "
+                        "cleaning step. Pass 0.05 to keep them; the panel "
+                        "goes ragged and the validity masks handle it.")
+    p.add_argument("--min-breadth", type=float, default=0.60,
+                   help="keep a date when this fraction of symbols is live")
+    p.add_argument("--checkpoint", default=None, metavar="PATH",
+                   help="cache each completed draw here and reuse it on a "
+                        "rerun. A 31-draw run exceeds the wall-clock limit "
+                        "of this environment, and losing an hour of "
+                        "permutations to a timeout is avoidable.")
     p.add_argument("--out", default="docs/results/target_null_cloud.json")
     return p.parse_args()
+
+
+def draw_key(perm_seed) -> str:
+    return "real" if perm_seed is None else f"null_{perm_seed}"
+
+
+def load_checkpoint(path):
+    """Completed draws, keyed by permutation seed. {} when absent."""
+    if not path or not Path(path).exists():
+        return {}
+    try:
+        return json.loads(Path(path).read_text())
+    except (json.JSONDecodeError, OSError):
+        logger.warning("checkpoint at %s unreadable - starting fresh", path)
+        return {}
+
+
+def save_checkpoint(path, done) -> None:
+    """Written after EVERY draw, not at the end - the point is to survive
+    a kill, and a checkpoint flushed only on completion survives nothing.
+    Written to a temp file and renamed so a kill mid-write cannot leave a
+    truncated file that the next run then discards."""
+    if not path:
+        return
+    try:
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(p.suffix + ".tmp")
+        tmp.write_text(json.dumps(done, default=str))
+        tmp.replace(p)
+    except OSError as e:
+        logger.warning("could not write checkpoint: %s", e)
 
 
 def main() -> int:
@@ -221,7 +267,9 @@ def main() -> int:
     a.tickers = resolve_universe(a.tickers, a.universe,
                                  a.universe_as_of or a.start)
     md0 = fetch_nse_prices(a.tickers, a.start, use_cache=True,
-                           require_actions=True)
+                           require_actions=True,
+                           min_coverage=a.min_coverage,
+                           min_breadth=a.min_breadth)
     close = pd.DataFrame(md0.close, index=pd.DatetimeIndex(md0.dates),
                          columns=list(md0.tickers))
     logger.info("source: %d bars x %d tickers", len(close), close.shape[1])
@@ -231,11 +279,56 @@ def main() -> int:
         from nightevolver.delivery import fetch_delivery_features
         from nightevolver.derivatives import fetch_derivative_features
         from run_new_data_audit import align
-        frames = {}
-        frames.update(fetch_derivative_features(list(close.columns), a.start))
-        frames.update(fetch_delivery_features(list(close.columns), a.start))
-        keep = {n: align(f, close.index, list(close.columns))
-                for n, f in frames.items()}
+
+        # THE FEATURE BUILD IS CACHED SEPARATELY FROM THE DRAWS. Parsing
+        # ~1,900 F&O bhavcopies for 100 names takes longer than this
+        # environment's wall-clock limit on its own, so without this the
+        # run can never reach a single permutation - it times out in the
+        # same place every time and the draw checkpoint never fills.
+        cache = Path(a.checkpoint).with_suffix(".features.npz") \
+            if a.checkpoint else None
+        keep = None
+        if cache is not None and cache.exists():
+            try:
+                z = np.load(cache, allow_pickle=False)
+                names = [str(n) for n in z["__names__"]]
+                want = (len(close.index), close.shape[1])
+                # Validated on the ARRAY SHAPE, not on a recorded row
+                # count. A cache built for a different universe or date
+                # range must not be silently accepted - every channel
+                # would then be misaligned against the price panel by a
+                # constant offset, which shifts a feature relative to its
+                # target without changing its shape. That is a
+                # look-ahead if it shifts the wrong way, and nothing
+                # downstream would report it.
+                bad = [n for n in names if z[n].shape != want]
+                if bad:
+                    logger.warning("feature cache is [%s] but the panel is "
+                                   "%s - rebuilding (%d channel(s) mismatched)",
+                                   z[bad[0]].shape, want, len(bad))
+                else:
+                    keep = {n: z[n].astype(float) for n in names}
+                    logger.info("feature cache: %d channels reused from %s",
+                                len(keep), cache)
+            except (OSError, KeyError, ValueError) as e:
+                logger.warning("feature cache unusable (%s) - rebuilding", e)
+
+        if keep is None:
+            frames = {}
+            frames.update(fetch_derivative_features(list(close.columns), a.start))
+            frames.update(fetch_delivery_features(list(close.columns), a.start))
+            keep = {n: align(f, close.index, list(close.columns))
+                    for n, f in frames.items()}
+            if cache is not None:
+                try:
+                    cache.parent.mkdir(parents=True, exist_ok=True)
+                    np.savez_compressed(
+                        cache, __names__=np.array(sorted(keep)),
+                        __dates__=np.array([str(d) for d in close.index]),
+                        __ncols__=np.array(close.shape[1]), **keep)
+                    logger.info("feature cache written: %s", cache)
+                except OSError as e:
+                    logger.warning("could not write feature cache: %s", e)
         keep = {n: v for n, v in keep.items()
                 if float(np.isfinite(v).mean()) >= 0.05}
         if keep:
@@ -253,17 +346,29 @@ def main() -> int:
         for i in range(a.n)]
     logger.info("%d jobs (1 real + %d null) on %d workers", len(jobs), a.n, a.workers)
 
-    real, nulls = None, []
-    with ProcessPoolExecutor(max_workers=a.workers) as ex:
-        futs = [ex.submit(_one_draw, j) for j in jobs]
-        for i, f in enumerate(as_completed(futs), 1):
-            r = f.result()
-            (nulls.append(r) if r["perm_seed"] is not None
-             else globals().__setitem__("_r", r))
-            if r["perm_seed"] is None:
-                real = r
-            if i % 5 == 0 or i == len(jobs):
-                logger.info("  %d/%d done", i, len(jobs))
+    # RESUMABLE. Each draw is independent and keyed by its permutation
+    # seed, so a completed one never needs recomputing. Without this a
+    # timeout at draw 28 of 31 costs every draw.
+    done = load_checkpoint(a.checkpoint)
+    if done:
+        logger.info("checkpoint: %d draw(s) already computed", len(done))
+    todo = [j for j in jobs if draw_key(j[3]) not in done]
+    logger.info("%d jobs (1 real + %d null) on %d workers - %d still to run",
+                len(jobs), a.n, a.workers, len(todo))
+
+    if todo:
+        with ProcessPoolExecutor(max_workers=a.workers) as ex:
+            futs = [ex.submit(_one_draw, j) for j in todo]
+            for i, f in enumerate(as_completed(futs), 1):
+                r = f.result()
+                done[draw_key(r["perm_seed"])] = r
+                save_checkpoint(a.checkpoint, done)
+                if i % 2 == 0 or i == len(todo):
+                    logger.info("  %d/%d done this run (%d/%d total)",
+                                i, len(todo), len(done), len(jobs))
+
+    real = done.get(draw_key(None))
+    nulls = [v for k, v in sorted(done.items()) if k != draw_key(None)]
 
     if real is None or not nulls:
         logger.error("missing real or null results")

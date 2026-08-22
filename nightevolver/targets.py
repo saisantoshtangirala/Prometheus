@@ -141,6 +141,14 @@ def vol_5d(close: np.ndarray, horizon: int = 5) -> Target:
 
     Expect this to be highly predictable and read the module docstring
     before celebrating: vol is autocorrelated, so this is the cheap one.
+
+    VALIDITY IS PER ASSET, NOT PER DATE. `np.isfinite(window).all()`
+    tests the whole [horizon, A] slice, so on a ragged panel ONE name
+    with a gap invalidates that date for every other name. Measured
+    after delisted names stopped being forward-filled: vol_5d went to
+    0.0% valid across a 1,764 x 100 panel - the target vanished
+    entirely, and a walk-forward on it simply reported no windows, which
+    reads as "no signal" rather than "no data".
     """
     rets = np.full_like(close, np.nan, dtype=np.float64)
     rets[1:] = close[1:] / close[:-1] - 1.0
@@ -149,8 +157,11 @@ def vol_5d(close: np.ndarray, horizon: int = 5) -> Target:
     out = np.full((T, A), np.nan)
     for t in range(T - horizon):
         window = rets[t + 1:t + 1 + horizon]
-        if np.isfinite(window).all():
-            out[t] = window.std(axis=0, ddof=1) if horizon > 1 else 0.0
+        ok = np.isfinite(window).all(axis=0)          # per asset
+        if not ok.any():
+            continue
+        vals = window.std(axis=0, ddof=1) if horizon > 1 else np.zeros(A)
+        out[t] = np.where(ok, vals, np.nan)
     valid = np.isfinite(out)
     return Target("vol_5d", np.nan_to_num(out), valid,
                   kind="continuous", autocorr_baseline=True)
@@ -178,11 +189,14 @@ def regime_shift_5d(close: np.ndarray, horizon: int = 5) -> Target:
     for t in range(T - horizon):
         fut = rets[t + 1:t + 1 + horizon]
         past = rets[max(0, t + 1 - horizon):t + 1]
-        if len(past) < horizon or not np.isfinite(fut).all() or not np.isfinite(past).all():
+        if len(past) < horizon:
+            continue
+        ok = np.isfinite(fut).all(axis=0) & np.isfinite(past).all(axis=0)
+        if not ok.any():
             continue
         fv = fut.std(axis=0, ddof=1)
         pv = past.std(axis=0, ddof=1)
-        out[t] = np.log((fv + eps) / (pv + eps))
+        out[t] = np.where(ok, np.log((fv + eps) / (pv + eps)), np.nan)
     valid = np.isfinite(out)
     return Target("regime_shift_5d", np.nan_to_num(out), valid,
                   kind="continuous", autocorr_baseline=False)
@@ -223,8 +237,10 @@ def persistence_baseline(target: Target, close: np.ndarray,
     if target.name == "vol_5d":
         for t in range(T):
             past = rets[max(0, t + 1 - horizon):t + 1]
-            if len(past) == horizon and np.isfinite(past).all():
-                out[t] = past.std(axis=0, ddof=1)
+            if len(past) != horizon:
+                continue
+            ok = np.isfinite(past).all(axis=0)        # per asset
+            out[t] = np.where(ok, past.std(axis=0, ddof=1), np.nan)
     elif target.name == "regime_shift_5d":
         # log(TRAILING VOL), not a ratio of past vols.
         #
@@ -248,8 +264,10 @@ def persistence_baseline(target: Target, close: np.ndarray,
         # actually worth asking about.
         for t in range(T):
             a = rets[max(0, t + 1 - horizon):t + 1]
-            if len(a) == horizon and np.isfinite(a).all():
-                out[t] = np.log(a.std(axis=0, ddof=1) + 1e-8)
+            if len(a) != horizon:
+                continue
+            ok = np.isfinite(a).all(axis=0)           # per asset
+            out[t] = np.where(ok, np.log(a.std(axis=0, ddof=1) + 1e-8), np.nan)
     else:
         # Directional targets: yesterday's return as today's forecast.
         out[1:] = rets[1:]

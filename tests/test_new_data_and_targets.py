@@ -396,3 +396,73 @@ def test_audit_summary_states_the_null_result_plainly():
     text = res.summary()
     assert "NOTHING survives" in text
     assert "new inputs" in text
+
+
+class TestTargetValidityIsPerAssetNotPerDate:
+    """THE TARGET THAT VANISHED.
+
+    vol_5d and regime_shift_5d gated each date on
+    `np.isfinite(window).all()`, which tests the whole [horizon, A] slice
+    across EVERY asset. On a dense panel that is harmless. On a ragged
+    one - which is what an honest panel looks like once delisted names
+    stop being forward-filled - a single name with a gap invalidates that
+    date for all the others.
+
+    Measured on the 2019 top-100, 1,764 x 100:
+
+        direction_1d      valid 93.6%
+        rel_strength_1d   valid 93.6%
+        vol_5d            valid  0.0%
+        regime_shift_5d   valid  0.0%
+
+    The walk-forward did not crash. It reported no windows for those two
+    targets and carried on, which reads as "no signal" and is in fact
+    "no data" - the most expensive kind of silent failure here, since
+    atm_iv -> vol_5d is the one live result in the project.
+    """
+
+    def _ragged(self, T=300, A=5, seed=7):
+        rng = np.random.RandomState(seed)
+        close = 100 * np.cumprod(1 + rng.normal(0, 0.012, (T, A)), axis=0)
+        close[150:, 0] = np.nan          # one name delists mid-panel
+        return close
+
+    def test_one_dead_name_does_not_invalidate_the_others(self):
+        close = self._ragged()
+        for name, t in build_targets(close, horizon=5).items():
+            live = t.valid[:, 1:]        # every name except the dead one
+            assert live.mean() > 0.90, (
+                f"{name} valid on only {live.mean():.1%} of live cells - "
+                "validity is being computed per DATE, not per ASSET")
+
+    def test_the_dead_name_itself_is_invalid_after_death(self):
+        """The other half: it must not be quietly filled either."""
+        close = self._ragged()
+        for name, t in build_targets(close, horizon=5).items():
+            assert not t.valid[160:, 0].any(), \
+                f"{name} is valid for a name that stopped trading"
+
+    def test_vol_5d_values_match_a_dense_panel_where_both_are_defined(self):
+        """Per-asset gating must not change any number that was already
+        correct - only widen where it applies."""
+        close = self._ragged()
+        dense = close[:, 1:]             # same names, no ragged column
+        rag = build_targets(close, horizon=5)["vol_5d"]
+        den = build_targets(dense, horizon=5)["vol_5d"]
+        both = rag.valid[:, 1:] & den.valid
+        assert both.sum() > 1000
+        assert np.allclose(rag.values[:, 1:][both], den.values[both])
+
+    def test_the_persistence_baseline_is_also_per_asset(self):
+        """persistence_baseline carried the same pattern in two more
+        places. A baseline that is NaN everywhere makes every
+        incremental score fall back to raw, silently undoing the
+        partialling that vol targets depend on."""
+        close = self._ragged()
+        targets = build_targets(close, horizon=5)
+        for name in ("vol_5d", "regime_shift_5d"):
+            base = persistence_baseline(targets[name], close, horizon=5)
+            live = np.isfinite(base[:, 1:]) & (base[:, 1:] != 0.0)
+            assert live.mean() > 0.80, (
+                f"{name} baseline is empty on {1 - live.mean():.1%} of live "
+                "cells - the per-date gate is still there")
