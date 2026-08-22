@@ -60,7 +60,7 @@ from scipy import stats
 sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent))
 
-from nightevolver.data_loader import build_market_data           # noqa: E402
+from nightevolver.data_loader import WARMUP_BARS, build_market_data  # noqa: E402
 from nightevolver.genome import INDICATOR_NAMES                  # noqa: E402
 from nightevolver.nse_prices import fetch_nse_prices             # noqa: E402
 from nightevolver.targets import (                               # noqa: E402
@@ -140,10 +140,29 @@ def _one_draw(args):
         if perm_seed is not None:
             order = block_permutation_order(len(ex), block, perm_seed)
             ex = ex[order]
-        # build_market_data trims warmup bars off the front and the last
-        # bar off the back; align the extras to what survived.
-        trim = len(ex) - md.n_bars
-        ex = ex[trim:trim + md.n_bars] if trim >= 0 else None
+        # ALIGN BY THE ACTUAL SLICE, NOT BY LENGTH ARITHMETIC.
+        #
+        # build_market_data keeps slice(WARMUP_BARS, len-1): 60 bars off
+        # the FRONT and one off the BACK. The old code computed
+        # trim = len(ex) - md.n_bars = 61 and took ex[61:61+n], which
+        # removes 61 from the front and none from the back - putting the
+        # whole trim on one side and shifting every extra channel one bar
+        # EARLY against the prices. Feature[t] then held day t+1's data.
+        #
+        # That is a look-ahead, and it produced a result: pcr_volume
+        # scored |incremental rho| = 0.28 against next-day direction and
+        # cleared the null cloud at p = 0.032. Measured against the
+        # unshifted series it is contemporaneous, not predictive -
+        #
+        #     pcr_volume vs same-bar return (t-1 -> t)   rho = -0.0597
+        #     pcr_volume vs FORWARD return (t -> t+1)    rho = -0.2826
+        #
+        # a feature five times more related to the future than to the
+        # present is not a forecast, it is a calendar error. High put
+        # volume accompanies down days; dated one bar early, that
+        # everyday fact becomes an edge.
+        lo = WARMUP_BARS
+        ex = ex[lo:lo + md.n_bars]
         if ex is not None and len(ex) == md.n_bars:
             pool = np.concatenate([md.indicators, ex], axis=-1)
             names = names + list(extra_names)
