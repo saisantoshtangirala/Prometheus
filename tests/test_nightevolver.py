@@ -704,3 +704,80 @@ class TestLongOnlyConstraint:
         assert (raw < 0).any(), "test data produced no bearish scores"
         stats = simulate(md, strat, long_only=True)
         assert np.isfinite(stats.sharpe)
+
+
+class TestRaggedPanels:
+    """DELISTED NAMES MUST BE ABSENT, NOT FLAT.
+
+    nse_prices used to forward-fill a dead name into a flat price line,
+    which made every column always present and let build_market_data get
+    away with dropna(how="any"). Measured on the 2019 top-100 before the
+    fix: DHFL carried 1,824 finite returns of which 71.0% were exactly
+    zero, pinned at 7.56 long after liquidation. A volatility study does
+    not merely tolerate that, it SELECTS it - a zero-volatility
+    instrument is the extreme of the thing being ranked.
+
+    With the fill confined to each name's live span, requiring every
+    column to be present deletes every date on which any name has died:
+    the same panel collapsed from 1,886 bars to 60. Completeness as a
+    cleaning step is survivorship bias with a different name.
+    """
+
+    def _panel_with_a_death(self, n=300, a=4, die_at=150, seed=11):
+        close = _random_walk(n, a, seed=seed)
+        close.iloc[die_at:, 1] = np.nan          # name 1 delists mid-panel
+        return close, die_at
+
+    def test_a_death_does_not_delete_the_other_names_history(self):
+        close, die_at = self._panel_with_a_death()
+        md = build_market_data(close)
+        assert md.n_bars > 200, (
+            f"one delisting truncated the panel to {md.n_bars} bars - "
+            "the 'any' row filter is back")
+
+    def test_the_dead_name_is_nan_after_death_not_flat(self):
+        close, die_at = self._panel_with_a_death()
+        md = build_market_data(close)
+        col = md.close[:, 1]
+        tail = col[-20:]
+        assert not np.isfinite(tail).any(), \
+            "a delisted name is still carrying prices"
+
+    def test_the_dead_name_contributes_no_zero_returns(self):
+        """The specific artefact: a flat line reads as a long run of
+        exactly-zero returns, which is not data."""
+        close, _ = self._panel_with_a_death()
+        md = build_market_data(close)
+        r = np.diff(np.log(np.where(md.close > 0, md.close, np.nan)), axis=0)
+        dead = r[:, 1]
+        fin = np.isfinite(dead)
+        zeros = int((np.abs(dead[fin]) < 1e-12).sum())
+        assert zeros == 0, f"{zeros} fabricated zero returns for a dead name"
+
+    def test_high_low_volume_are_masked_with_the_close(self):
+        """ffill on the intraday legs would reintroduce the flat line in
+        high/low even after close was fixed."""
+        close, _ = self._panel_with_a_death()
+        md = build_market_data(close)
+        for name, arr in (("high", md.high), ("low", md.low),
+                          ("volume", md.volume)):
+            assert not np.isfinite(arr[-20:, 1]).any(), \
+                f"{name} outlived the close for a delisted name"
+
+    def test_a_name_absent_from_the_start_is_still_usable_later(self):
+        """The mirror case: a late listing must not poison its own later
+        history, nor everyone else's earlier history."""
+        close = _random_walk(300, 4, seed=12)
+        close.iloc[:120, 2] = np.nan
+        md = build_market_data(close)
+        assert md.n_bars > 150
+        assert np.isfinite(md.close[-20:, 2]).all()
+
+    def test_an_entirely_empty_column_still_raises(self):
+        """The guard that dropna(how='any') used to provide incidentally
+        now has to be explicit - a column with no data at all would
+        otherwise become a constant-zero asset after nan_to_num."""
+        close = _random_walk(300, 4, seed=13)
+        close.iloc[:, 1] = np.nan
+        with pytest.raises(ValueError, match="entirely NaN"):
+            build_market_data(close)

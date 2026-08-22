@@ -314,6 +314,7 @@ def build_adjusted_frames(days: Dict[pd.Timestamp, pd.DataFrame],
                           corporate_actions=None,
                           require_actions: bool = True,
                           min_coverage: float = 0.90,
+                          min_breadth: float = 0.60,
                           ) -> Tuple[pd.DataFrame, pd.DataFrame,
                                      pd.DataFrame, pd.DataFrame]:
     """Return (close, high, low, volume) with a corporate-action-adjusted
@@ -358,17 +359,46 @@ def build_adjusted_frames(days: Dict[pd.Timestamp, pd.DataFrame],
     rets, masked = adjust_returns(raw_close, raw_prev, actions,
                                   require_actions=require_actions)
 
-    # Masked bars (demergers, unexplained jumps) become flat rather than
-    # being dropped, so the calendar stays aligned with the flow data.
-    # They are flat because the correct value is UNKNOWN - not because
-    # nothing happened.
-    rets = rets.fillna(0.0)
-    adj_close = 100.0 * (1.0 + rets).cumprod()
+    # THE LIVE SPAN: first real trade to last real trade, per name.
+    #
+    # `rets.fillna(0.0)` used to be applied to the whole frame, on the
+    # argument that a masked bar should stay flat to keep the calendar
+    # aligned. That is right for a gap INSIDE a live series and wrong
+    # everywhere else, because a name that delists simply stops having
+    # rows - and filling those with zero returns manufactures a flat,
+    # perfectly tradeable asset that persists to the end of the panel.
+    #
+    # Measured on the 2019 top-100 before the fix:
+    #
+    #   DHFL        1,824 finite returns, 71.0% exactly zero, flat at 7.56
+    #   RELCAPITAL  1,824 finite returns, 67.4% exactly zero, flat at 9.37
+    #   HDFC        1,824 finite returns, 42.0% exactly zero (merged 2023)
+    #   RELIANCE    1,824 finite returns,  0.2% exactly zero
+    #
+    # DHFL went into liquidation. It was in the panel as a zero-volatility
+    # instrument for three quarters of the history - the same defect as
+    # the LIQUIDBEES ETF above, arrived at from the opposite direction,
+    # and far more dangerous because a vol study will select it.
+    #
+    # The 0.90 coverage filter hid this rather than fixing it: it dropped
+    # the dead names, which is survivorship bias - exactly what
+    # top_liquid_symbols(as_of=...) exists to avoid.
+    alive = raw_close.notna()
+    started = alive.cummax()                          # from first trade on
+    ending = alive[::-1].cummax()[::-1]                # until last trade
+    span = started & ending
 
-    # Rescale intraday levels onto the adjusted close's scale.
+    # Inside the span a gap is "unknown, assume flat". Outside it the
+    # instrument does not exist and must stay absent.
+    adj_close = 100.0 * (1.0 + rets.where(span).fillna(0.0)).cumprod()
+    adj_close = adj_close.where(span)
+
+    # Rescale intraday levels onto the adjusted close's scale. ffill/bfill
+    # is confined to the span for the same reason.
     scale = (adj_close / raw_close.replace(0.0, np.nan)).ffill().bfill()
-    adj_high = raw_high * scale
-    adj_low = raw_low * scale
+    adj_high = (raw_high * scale).where(span)
+    adj_low = (raw_low * scale).where(span)
+    raw_vol = raw_vol.where(span)
 
     # Drop THIN SYMBOLS BEFORE dropping dates. The row filter below
     # requires every column to be present, so with a large universe a
@@ -389,11 +419,22 @@ def build_adjusted_frames(days: Dict[pd.Timestamp, pd.DataFrame],
     if adj_close.shape[1] == 0:
         raise RuntimeError("every symbol fell below the coverage threshold")
 
-    keep = adj_close.notna().all(axis=1)
-    logger.info("[prices] %d/%d symbols kept, %d/%d dates complete",
-                adj_close.shape[1], len(cols), int(keep.sum()), len(keep))
-    return (adj_close[keep], adj_high[keep], adj_low[keep],
-            raw_vol[keep].fillna(0.0))
+    # A DATE SURVIVES ON BREADTH, NOT ON COMPLETENESS. Requiring every
+    # column to be present was viable only because the zero-fill made
+    # every column always present. On an honestly ragged panel it would
+    # delete every date on which any name had delisted - which, with one
+    # early failure like JETAIRWAYS, is the entire history.
+    breadth = adj_close.notna().sum(axis=1)
+    keep = breadth >= max(2, int(np.ceil(min_breadth * adj_close.shape[1])))
+    n_alive = adj_close.notna().sum(axis=1)
+    logger.info("[prices] %d/%d symbols kept, %d/%d dates pass breadth "
+                "(names live per date: min %d, median %d, max %d)",
+                adj_close.shape[1], len(cols), int(keep.sum()), len(keep),
+                int(n_alive.min()), int(n_alive.median()), int(n_alive.max()))
+    if not keep.any():
+        raise RuntimeError(
+            f"no date has at least {min_breadth:.0%} of symbols live")
+    return (adj_close[keep], adj_high[keep], adj_low[keep], raw_vol[keep])
 
 
 def top_liquid_symbols(as_of: str, n: int = 50, use_cache: bool = True,
@@ -450,7 +491,8 @@ def top_liquid_symbols(as_of: str, n: int = 50, use_cache: bool = True,
 def fetch_nse_prices(tickers: Sequence[str], start: str, end: Optional[str] = None,
                      max_workers: int = 6, use_cache: bool = True,
                      require_actions: bool = True, with_flows: bool = False,
-                     min_coverage: float = 0.90):
+                     min_coverage: float = 0.90,
+                     min_breadth: float = 0.60):
     """Convenience: bhavcopy -> MarketData, bypassing yfinance entirely.
 
     `tickers` are NSE symbols WITHOUT the .NS suffix (RELIANCE, not
@@ -465,7 +507,8 @@ def fetch_nse_prices(tickers: Sequence[str], start: str, end: Optional[str] = No
     if not days:
         raise RuntimeError("no bhavcopy sessions retrieved")
     close, high, low, vol = build_adjusted_frames(
-        days, syms, require_actions=require_actions, min_coverage=min_coverage)
+        days, syms, require_actions=require_actions,
+        min_coverage=min_coverage, min_breadth=min_breadth)
     logger.info("[prices] %d bars x %d tickers (%s .. %s)", len(close),
                 close.shape[1], close.index[0].date(), close.index[-1].date())
 

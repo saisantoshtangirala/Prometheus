@@ -258,7 +258,39 @@ def build_market_data(close: pd.DataFrame, high: Optional[pd.DataFrame] = None,
                        "masked to NaN before any derived quantity is computed",
                        n_bad)
 
-    close = close.dropna(how="any")
+    # RAGGED PANELS ARE THE HONEST SHAPE, so a row survives if ANY name
+    # traded, not if EVERY name did.
+    #
+    # dropna(how="any") was viable only while nse_prices forward-filled
+    # delisted names into flat price lines, which made every column
+    # always present. Once that fill was confined to each name's live
+    # span - so DHFL is absent after liquidation rather than pinned at
+    # 7.56 forever - "any" deleted every date on which any name had
+    # died: a 2019 top-100 collapsed from 1,886 bars to 60.
+    #
+    # Requiring completeness is survivorship bias expressed as a data
+    # cleaning step. The alternative is not to fabricate the missing
+    # names but to carry NaN and let the validity masks do their job:
+    # targets.py already computes `valid = np.isfinite(...)` BEFORE
+    # nan_to_num, and the walk-forward's scoring masks on that, so a dead
+    # name's cells are excluded from every statistic rather than entering
+    # as zeros.
+    # A column with no data at all is still a defect, and dropping rows
+    # by "all" no longer catches it the way "any" incidentally did. It
+    # has to be rejected on its own terms: kept, its indicators would be
+    # nan_to_num'd to 0.0 for every bar, giving the search a perfectly
+    # constant asset to select - the LIQUIDBEES failure mode arrived at
+    # from a different direction.
+    dead = [c for c in close.columns if not close[c].notna().any()]
+    if dead:
+        raise ValueError(
+            f"no usable price rows for {dead}: the column is entirely NaN. "
+            "An all-NaN column silently emptied the whole panel here before "
+            "this check existed, returning a MarketData with 0 bars rather "
+            "than failing - so downstream code computed statistics on empty "
+            "arrays. Check per-symbol coverage before calling this.")
+
+    close = close.dropna(how="all")
     if close.empty or close.shape[1] == 0:
         raise ValueError(
             "no usable price rows after dropping NaNs. An all-NaN column "
@@ -273,9 +305,14 @@ def build_market_data(close: pd.DataFrame, high: Optional[pd.DataFrame] = None,
         low = close
     if volume is None:
         volume = pd.DataFrame(1.0, index=idx, columns=close.columns)
-    high = high.reindex(idx).ffill().fillna(close)
-    low = low.reindex(idx).ffill().fillna(close)
-    volume = volume.reindex(idx).ffill().fillna(1.0)
+    # ffill is confined to bars where the name is actually live. Without
+    # the mask it would carry a dead name's last high/low/volume forward
+    # to the end of the panel - reintroducing, in the intraday legs, the
+    # exact flat-line artefact just removed from the close.
+    live = close.notna()
+    high = high.reindex(idx).ffill().fillna(close).where(live)
+    low = low.reindex(idx).ffill().fillna(close).where(live)
+    volume = volume.reindex(idx).ffill().fillna(1.0).where(live)
 
     indicators = compute_indicators(close, high, low, volume)
 
