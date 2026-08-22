@@ -1,0 +1,20 @@
+{
+  "idea": "sector_relative_pairs",
+  "idea_id": 5,
+  "n_pairs": 253,
+  "n_ideas_tried_including_this": 4,
+  "alpha_effective": 0.0125,
+  "any_survive": false,
+  "targets": {
+    "pair_reversion": {
+      "p": 0.09933774834437085,
+      "survives": false,
+      "underpowered": false,
+      "oos": 0.05094232099924948,
+      "null_mean": 0.03630566669397874,
+      "null_sd": 0.010202915463735782,
+      "percentile": 90.66666666666666,
+      "n_windows": 8
+    }
+  }
+}
